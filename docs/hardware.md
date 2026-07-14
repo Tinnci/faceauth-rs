@@ -14,3 +14,7 @@ device and has been verified with full-size frame capture.
 
 Device node numbers are not stable and must not appear in persisted policy.
 
+The camera configuration stores explicit USB VID/PID, serial, and physical-path
+selectors for each modality. At startup each selector must resolve to exactly one
+capture-capable V4L2 node. Metadata-only nodes are ignored; missing, ambiguous, or
+same-node IR/RGB selections fail closed.
