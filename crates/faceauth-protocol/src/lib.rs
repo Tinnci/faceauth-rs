@@ -160,8 +160,9 @@ pub enum AuthenticationPurpose {
 
 /// Authentication request context supplied by a trusted local caller.
 ///
-/// The daemon must derive peer UID, PID, and executable identity from Unix peer credentials. It
-/// must not treat this serialized context as proof of caller identity.
+/// The daemon derives numeric peer identity from Unix credentials and verifies the caller
+/// executable through separate pidfd-bound evidence. It must not treat this serialized context as
+/// proof of caller identity.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {

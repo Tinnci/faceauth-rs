@@ -16,14 +16,15 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 1. `faceauth-core`: policy, evidence, and decision types without desktop code.
 2. `faceauth-protocol`: versioned messages that contain no raw images or embeddings.
 3. `faceauth-transport`: peer-credentialed, length-bounded local socket framing.
-4. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
-5. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
-6. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
+4. `faceauth-authz`: exact service, purpose, UID, and executable authorization.
+5. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
+6. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
+7. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
-7. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
+8. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
-8. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
-9. KDE KCM and lock-screen status UI: optional clients over stable APIs.
+9. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
+10. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
 The authentication transport contract is described in [ipc.md](ipc.md). Caller
 numeric peer identity comes from Unix peer credentials, not serialized request

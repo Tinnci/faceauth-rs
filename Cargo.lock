@@ -362,6 +362,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "faceauth-authz"
+version = "0.1.0"
+dependencies = [
+ "faceauth-protocol",
+ "faceauth-transport",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "faceauth-camera"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,16 @@
+[package]
+name = "faceauth-authz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+faceauth-protocol = { path = "../faceauth-protocol", version = "0.1.0" }
+faceauth-transport = { path = "../faceauth-transport", version = "0.1.0" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

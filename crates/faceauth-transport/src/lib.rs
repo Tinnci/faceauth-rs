@@ -2,12 +2,16 @@
 
 use std::{
     io::{self, Read, Write},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     os::unix::net::UnixStream,
     time::Duration,
 };
 
 use faceauth_protocol::{Envelope, ProtocolError};
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::sys::socket::{
+    getsockopt,
+    sockopt::{PeerCredentials, PeerPidfd},
+};
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -65,6 +69,7 @@ pub struct PeerIdentity {
 pub struct PeerStream {
     stream: UnixStream,
     peer: PeerIdentity,
+    peer_pidfd: OwnedFd,
     config: TransportConfig,
 }
 
@@ -78,11 +83,14 @@ impl PeerStream {
         config.validate()?;
         let credentials = getsockopt(&stream, PeerCredentials)?;
         let pid = u32::try_from(credentials.pid()).map_err(|_| TransportError::InvalidPeer)?;
+        let peer_pidfd =
+            getsockopt(&stream, PeerPidfd).map_err(TransportError::PeerPidfdUnavailable)?;
         stream.set_read_timeout(Some(config.io_timeout))?;
         stream.set_write_timeout(Some(config.io_timeout))?;
         Ok(Self {
             stream,
             peer: PeerIdentity { pid, uid: credentials.uid(), gid: credentials.gid() },
+            peer_pidfd,
             config,
         })
     }
@@ -91,6 +99,12 @@ impl PeerStream {
     #[must_use]
     pub const fn peer(&self) -> PeerIdentity {
         self.peer
+    }
+
+    /// Borrow the kernel pidfd pinning the peer process against PID reuse.
+    #[must_use]
+    pub fn peer_pidfd(&self) -> BorrowedFd<'_> {
+        self.peer_pidfd.as_fd()
     }
 
     /// Read, decode, and version-check one envelope.
@@ -180,6 +194,9 @@ pub enum TransportError {
     /// `SO_PEERCRED` lookup failed.
     #[error("unable to read Unix peer credentials: {0}")]
     PeerCredentials(#[from] nix::errno::Errno),
+    /// The kernel could not provide a pidfd for the connected peer.
+    #[error("unable to pin Unix peer process with SO_PEERPIDFD: {0}")]
+    PeerPidfdUnavailable(nix::errno::Errno),
     /// JSON did not match the closed protocol schema.
     #[error("invalid local protocol encoding: {0}")]
     Json(#[from] serde_json::Error),

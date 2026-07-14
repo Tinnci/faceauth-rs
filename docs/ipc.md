@@ -7,7 +7,8 @@ transport with explicit peer-credential checks.
 
 ## Trust rules
 
-- The transport captures caller UID, GID, and PID from Linux `SO_PEERCRED`
+- The transport captures caller UID, GID, and PID from Linux `SO_PEERCRED` and
+  pins the process with `SO_PEERPIDFD`
   before reading caller-controlled bytes. Serialized fields never prove caller
   identity. Executable identity requires a separate pidfd-backed authorization
   step and is not implied by the numeric PID alone.
@@ -31,6 +32,23 @@ transport with explicit peer-credential checks.
 `SO_PEERCRED` establishes connection identity, not authorization. The daemon must
 still verify the allowed service/purpose pair, target UID relationship, executable
 policy, transaction capacity, and enrollment state before starting camera work.
+
+## Authorization policy
+
+`faceauth-authz` accepts at most 64 exact service/purpose rules and 32 executable
+fingerprints per rule. There are no wildcard services or caller-provided policy
+strings. Each rule chooses one caller relationship: UID 0 only, target UID only,
+or UID 0/target UID. Sudo rules are always UID 0 only.
+
+Executable evidence is resolved through the socket peer pidfd, checked before and
+after opening `/proc/<pid>/exe`, and reduced to filesystem device and inode. The
+opened file must be a regular executable owned by root and not writable by group
+or others. Missing evidence, PID mismatch, process exit, permission weakness, or
+an absent fingerprint fails before cameras, templates, or models are accessed.
+
+Package upgrades normally replace an executable inode and therefore invalidate
+the old fingerprint. Updating the root-controlled authorization policy is an
+explicit deployment action, not an automatic path-based trust decision.
 
 ## PAM staging
 

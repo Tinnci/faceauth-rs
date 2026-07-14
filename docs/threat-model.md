@@ -23,6 +23,8 @@
 - Passive presentation-attack detection is combined with a randomized active challenge.
 - Authentication is bounded by monotonic deadlines and request-specific nonces.
 - Peer credentials and requested UID must agree with trusted caller policy.
+- Authentication entry points require exact service/purpose rules and a
+  pidfd-bound, root-owned executable allowlist match.
 - The PAM bridge fails closed and never reports success on daemon errors.
 - Password authentication remains available and independently testable.
 - Enrollment requires an existing credential and cannot overwrite another UID silently.
@@ -37,4 +39,3 @@
 - remote biometric authentication;
 - replacing passwords, FIDO2 keys, or full-disk encryption credentials;
 - claiming presentation-attack certification without an independent test corpus.
-

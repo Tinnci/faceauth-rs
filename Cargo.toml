@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/faceauth-authz",
     "crates/faceauth-camera",
     "crates/faceauth-capture",
     "crates/faceauth-cli",
