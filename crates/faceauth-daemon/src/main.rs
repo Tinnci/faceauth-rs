@@ -1,10 +1,11 @@
 //! Read-only diagnostics and the future privileged face-authentication daemon entry point.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use faceauth_camera::CameraDevice;
+use faceauth_storage::TpmKeyProvider;
 use serde::Serialize;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -20,6 +21,12 @@ struct Cli {
 enum Command {
     /// Print read-only hardware and readiness diagnostics.
     Doctor,
+    /// Exercise TPM sealing and unsealing without enrolling a face.
+    StorageDoctor {
+        /// Root-only path for the TPM public/private sealed-key blob.
+        #[arg(long, default_value = "/var/lib/faceauth/machine-key.tpm")]
+        blob: PathBuf,
+    },
     /// Refuse to start the production service until the transport is implemented.
     Serve,
 }
@@ -50,6 +57,12 @@ enum HpdRole {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StorageKeyPolicy {
+    TpmPreferredFileFallbackExplicit,
+}
+
+#[derive(Debug, Serialize)]
 struct DoctorReport {
     version: &'static str,
     production_status: ProductionStatus,
@@ -57,6 +70,7 @@ struct DoctorReport {
     tpm2_resource_manager: DeviceStatus,
     password_fallback: PasswordFallbackPolicy,
     hpd_role: HpdRole,
+    storage_key_policy: StorageKeyPolicy,
 }
 
 fn main() -> Result<()> {
@@ -83,12 +97,18 @@ fn main() -> Result<()> {
                 },
                 password_fallback: PasswordFallbackPolicy::Mandatory,
                 hpd_role: HpdRole::HintOnly,
+                storage_key_policy: StorageKeyPolicy::TpmPreferredFileFallbackExplicit,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::StorageDoctor { blob } => {
+            let provider = TpmKeyProvider::new(&blob);
+            provider.self_test()?;
+            println!("TPM sealed-key self-test passed for {}", blob.display());
+        }
         Command::Serve => {
             info!(
-                "service start refused: authenticated IPC and template storage are not implemented"
+                "service start refused: authenticated IPC, capture, inference, and liveness are incomplete"
             );
             anyhow::bail!("faceauth-daemon is not production-ready")
         }

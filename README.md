@@ -29,8 +29,8 @@ identity or liveness evidence.
 - Face authentication never removes the password path.
 
 See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
-[IPC boundary](docs/ipc.md), [model policy](docs/model-policy.md), and
-[research](docs/research.md).
+[IPC boundary](docs/ipc.md), [model policy](docs/model-policy.md),
+[template storage](docs/storage.md), and [research](docs/research.md).
 
 ## Development
 

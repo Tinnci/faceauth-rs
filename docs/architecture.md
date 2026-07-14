@@ -52,6 +52,8 @@ an authenticated cipher using a machine key protected by TPM 2.0 when available.
 A root-only file-key fallback is permitted only with a visible diagnostic warning.
 Template files are owned by root, keyed by numeric UID, versioned, and replaced
 atomically. Decrypted embeddings are zeroized after use.
+Implementation details and the current machine-bound TPM policy are documented
+in [storage.md](storage.md).
 
 ## KDE and PAM
 

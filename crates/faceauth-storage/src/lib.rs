@@ -1,0 +1,549 @@
+//! Encrypted, root-owned face-template storage primitives.
+//!
+//! This crate deliberately does not decide whether a key is backed by a TPM. The daemon selects
+//! a [`KeyProvider`] and must surface its [`KeyStrength`] to administrators before enrollment.
+
+#[cfg(feature = "tpm")]
+mod tpm;
+
+#[cfg(feature = "tpm")]
+pub use tpm::TpmKeyProvider;
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
+
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+const MAGIC: &[u8; 4] = b"FAT1";
+const FORMAT_VERSION: u16 = 1;
+const NONCE_LENGTH: usize = 24;
+const HEADER_LENGTH: usize = MAGIC.len() + std::mem::size_of::<u16>() + NONCE_LENGTH;
+const MAX_CIPHERTEXT_LENGTH: usize = 1024 * 1024;
+const MAX_EMBEDDING_DIMENSION: usize = 4096;
+const KEY_LENGTH: usize = 32;
+
+/// Strength of the key protection selected by the daemon.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyStrength {
+    /// Key is sealed or otherwise released by a TPM-backed implementation.
+    TpmBound,
+    /// Key is stored in a root-readable file with owner-only permissions.
+    RootOnlyFile,
+}
+
+/// Secret key held only for the duration of one storage operation.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SecretKey([u8; KEY_LENGTH]);
+
+impl SecretKey {
+    /// Construct a key from exactly 32 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError::InvalidLength`] when the input does not contain exactly 32 bytes.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, KeyError> {
+        let key = bytes
+            .try_into()
+            .map_err(|_| KeyError::InvalidLength { expected: KEY_LENGTH, actual: bytes.len() })?;
+        Ok(Self(key))
+    }
+
+    const fn as_bytes(&self) -> &[u8; KEY_LENGTH] {
+        &self.0
+    }
+
+    fn same_secret(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+    }
+}
+
+/// Key source used by encrypted template storage.
+pub trait KeyProvider {
+    /// Load the machine key for storage operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError`] when the key cannot be loaded or its protection is unsafe.
+    fn load_key(&self) -> Result<SecretKey, KeyError>;
+
+    /// Report the protection strength to diagnostics and enrollment policy.
+    fn strength(&self) -> KeyStrength;
+}
+
+/// Explicit root-only file-key fallback for development and systems without a TPM backend.
+#[derive(Clone, Debug)]
+pub struct FileKeyProvider {
+    path: PathBuf,
+}
+
+impl FileKeyProvider {
+    /// Use a specific key path. The parent directory must already be administrator-controlled.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Return the configured key path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl KeyProvider for FileKeyProvider {
+    fn load_key(&self) -> Result<SecretKey, KeyError> {
+        reject_symlink_key(&self.path)?;
+        match OpenOptions::new().read(true).open(&self.path) {
+            Ok(file) => read_key_file(file, &self.path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.create_key(),
+            Err(error) => Err(KeyError::Io(error)),
+        }
+    }
+
+    fn strength(&self) -> KeyStrength {
+        KeyStrength::RootOnlyFile
+    }
+}
+
+impl FileKeyProvider {
+    fn create_key(&self) -> Result<SecretKey, KeyError> {
+        let mut bytes = [0_u8; KEY_LENGTH];
+        getrandom::fill(&mut bytes).map_err(|error| KeyError::Random(error.to_string()))?;
+        let mut file =
+            match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    bytes.zeroize();
+                    return self.load_key();
+                }
+                Err(error) => {
+                    bytes.zeroize();
+                    return Err(KeyError::Io(error));
+                }
+            };
+        let result: Result<SecretKey, KeyError> = (|| {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            SecretKey::from_slice(&bytes)
+        })();
+        bytes.zeroize();
+        result
+    }
+}
+
+fn read_key_file(mut file: File, path: &Path) -> Result<SecretKey, KeyError> {
+    let mode = file.metadata()?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(KeyError::UnsafePermissions { path: path.to_owned(), mode: mode & 0o777 });
+    }
+    let mut bytes = Vec::with_capacity(KEY_LENGTH);
+    file.read_to_end(&mut bytes)?;
+    SecretKey::from_slice(&bytes)
+}
+
+/// One encrypted template payload. Raw camera frames are intentionally not represented here.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateRecord {
+    /// Record schema version.
+    pub schema_version: u16,
+    /// Account UID this record belongs to.
+    pub uid: u32,
+    /// Lowercase SHA-256 digest of the embedding model and preprocessing contract.
+    pub model_sha256: String,
+    /// Derived face embedding; never a raw image.
+    pub embedding: Vec<f32>,
+}
+
+impl TemplateRecord {
+    /// Validate record bounds and finite numeric data before encryption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidRecord`] when the schema, model digest, dimension, or
+    /// embedding values are invalid.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.schema_version != FORMAT_VERSION
+            || self.model_sha256.len() != 64
+            || !self.model_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || self.model_sha256.bytes().any(|byte| byte.is_ascii_uppercase())
+            || self.embedding.is_empty()
+            || self.embedding.len() > MAX_EMBEDDING_DIMENSION
+            || self.embedding.iter().any(|value| !value.is_finite())
+        {
+            return Err(StorageError::InvalidRecord("template bounds or digest are invalid"));
+        }
+        Ok(())
+    }
+}
+
+/// Encrypted template store using one administrator-selected key provider.
+#[derive(Debug)]
+pub struct EncryptedTemplateStore<K> {
+    directory: PathBuf,
+    key_provider: K,
+}
+
+impl<K> EncryptedTemplateStore<K>
+where
+    K: KeyProvider,
+{
+    /// Create a store rooted at an administrator-controlled directory.
+    #[must_use]
+    pub fn new(directory: impl Into<PathBuf>, key_provider: K) -> Self {
+        Self { directory: directory.into(), key_provider }
+    }
+
+    /// Report the selected key protection strength.
+    #[must_use]
+    pub fn key_strength(&self) -> KeyStrength {
+        self.key_provider.strength()
+    }
+
+    /// Save a record using authenticated encryption and atomic replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when validation, key loading, encryption, or the atomic write
+    /// fails.
+    pub fn save(&self, record: &TemplateRecord) -> Result<(), StorageError> {
+        record.validate()?;
+        let key = self.key_provider.load_key()?;
+        fs::create_dir_all(&self.directory)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(record)?);
+        let nonce = random_nonce()?;
+        let aad = associated_data(record.uid);
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption key"))?;
+        let nonce = XNonce::try_from(nonce.as_slice())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption nonce"))?;
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: &plaintext, aad: &aad })
+            .map_err(|_| StorageError::AuthenticationFailed)?;
+        let mut encoded = Vec::with_capacity(HEADER_LENGTH + ciphertext.len());
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        atomic_write(&self.path_for(record.uid), &encoded, &self.directory)
+    }
+
+    /// Load and authenticate a record for one UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the file is malformed, authentication fails, the record is
+    /// invalid, or the record belongs to another UID.
+    pub fn load(&self, uid: u32) -> Result<TemplateRecord, StorageError> {
+        let path = self.path_for(uid);
+        reject_symlink_storage(&path)?;
+        let mut file = File::open(&path)?;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(StorageError::UnsafePermissions { path, mode: mode & 0o777 });
+        }
+        let mut encoded = Vec::new();
+        file.read_to_end(&mut encoded)?;
+        if encoded.len() < HEADER_LENGTH || encoded.len() > HEADER_LENGTH + MAX_CIPHERTEXT_LENGTH {
+            return Err(StorageError::InvalidRecord("encrypted template size is invalid"));
+        }
+        if &encoded[..MAGIC.len()] != MAGIC {
+            return Err(StorageError::InvalidRecord("encrypted template magic is invalid"));
+        }
+        let version_offset = MAGIC.len();
+        let version = u16::from_le_bytes([encoded[version_offset], encoded[version_offset + 1]]);
+        if version != FORMAT_VERSION {
+            return Err(StorageError::InvalidRecord("encrypted template version is unsupported"));
+        }
+        let nonce_start = version_offset + std::mem::size_of::<u16>();
+        let nonce_end = nonce_start + NONCE_LENGTH;
+        let nonce: [u8; NONCE_LENGTH] = encoded[nonce_start..nonce_end]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRecord("encrypted template nonce is invalid"))?;
+        let key = self.key_provider.load_key()?;
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption key"))?;
+        let nonce = XNonce::try_from(nonce.as_slice())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption nonce"))?;
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(&nonce, Payload { msg: &encoded[nonce_end..], aad: &associated_data(uid) })
+                .map_err(|_| StorageError::AuthenticationFailed)?,
+        );
+        let record: TemplateRecord = serde_json::from_slice(&plaintext)?;
+        record.validate()?;
+        if record.uid != uid {
+            return Err(StorageError::InvalidRecord("template UID does not match its path"));
+        }
+        Ok(record)
+    }
+
+    fn path_for(&self, uid: u32) -> PathBuf {
+        self.directory.join(format!("{uid}.template"))
+    }
+}
+
+fn random_nonce() -> Result<[u8; NONCE_LENGTH], StorageError> {
+    let mut nonce = [0_u8; NONCE_LENGTH];
+    getrandom::fill(&mut nonce).map_err(|error| StorageError::Random(error.to_string()))?;
+    Ok(nonce)
+}
+
+fn associated_data(uid: u32) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(MAGIC.len() + 2 + 4);
+    aad.extend_from_slice(MAGIC);
+    aad.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    aad.extend_from_slice(&uid.to_le_bytes());
+    aad
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], directory: &Path) -> Result<(), StorageError> {
+    let temporary = directory.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        let directory_file = File::open(directory)?;
+        directory_file.sync_all()?;
+        Ok::<(), io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(StorageError::Io)
+}
+
+fn reject_symlink_key(path: &Path) -> Result<(), KeyError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(KeyError::Symlink { path: path.to_owned() })
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(KeyError::Io(error)),
+    }
+}
+
+fn reject_symlink_storage(path: &Path) -> Result<(), StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(StorageError::Symlink { path: path.to_owned() })
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
+/// Key loading failure.
+#[derive(Debug, Error)]
+pub enum KeyError {
+    /// The key file did not contain exactly 32 bytes.
+    #[error("key length {actual} is not {expected} bytes")]
+    InvalidLength {
+        /// Required key length.
+        expected: usize,
+        /// Actual key length.
+        actual: usize,
+    },
+    /// A configured key or blob path is invalid.
+    #[error("invalid key path {0}")]
+    InvalidPath(PathBuf),
+    /// The persisted TPM public/private blob is malformed.
+    #[error("invalid TPM sealed-key blob")]
+    InvalidBlob,
+    /// TPM context or command failed.
+    #[error("TPM operation failed: {0}")]
+    Tpm(String),
+    /// The key file has group or other permissions.
+    #[error("key file {path} has unsafe permissions {mode:o}")]
+    UnsafePermissions {
+        /// Key path.
+        path: PathBuf,
+        /// Unix permission bits.
+        mode: u32,
+    },
+    /// The key path is a symbolic link.
+    #[error("key path {path} must not be a symbolic link")]
+    Symlink {
+        /// Key path.
+        path: PathBuf,
+    },
+    /// The operating system random source failed.
+    #[error("random source failed: {0}")]
+    Random(String),
+    /// File operation failed.
+    #[error("key file operation failed: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Storage or authenticated-encryption failure.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    /// Key provider failed.
+    #[error(transparent)]
+    Key(#[from] KeyError),
+    /// A record or encrypted container is invalid.
+    #[error("invalid template record: {0}")]
+    InvalidRecord(&'static str),
+    /// JSON encoding or decoding failed.
+    #[error("template serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    /// Authenticated encryption rejected ciphertext or failed to encrypt.
+    #[error("template authentication failed")]
+    AuthenticationFailed,
+    /// The template path is a symbolic link.
+    #[error("template path {path} must not be a symbolic link")]
+    Symlink {
+        /// Template path.
+        path: PathBuf,
+    },
+    /// The template file has group or other permissions.
+    #[error("template file {path} has unsafe permissions {mode:o}")]
+    UnsafePermissions {
+        /// Template path.
+        path: PathBuf,
+        /// Unix permission bits.
+        mode: u32,
+    },
+    /// Random nonce generation failed.
+    #[error("random source failed: {0}")]
+    Random(String),
+    /// File operation failed.
+    #[error("template storage operation failed: {0}")]
+    Io(#[from] io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestKeyProvider([u8; KEY_LENGTH]);
+
+    impl KeyProvider for TestKeyProvider {
+        fn load_key(&self) -> Result<SecretKey, KeyError> {
+            SecretKey::from_slice(&self.0)
+        }
+
+        fn strength(&self) -> KeyStrength {
+            KeyStrength::TpmBound
+        }
+    }
+
+    fn record(uid: u32) -> TemplateRecord {
+        TemplateRecord {
+            schema_version: FORMAT_VERSION,
+            uid,
+            model_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            embedding: vec![0.1, -0.2, 0.3],
+        }
+    }
+
+    fn temporary_directory() -> Result<PathBuf, StorageError> {
+        let directory = std::env::temp_dir().join(format!("faceauth-storage-{}", Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        Ok(directory)
+    }
+
+    #[test]
+    fn encrypted_records_round_trip_without_raw_frames() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store =
+            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        let expected = record(1000);
+        store.save(&expected)?;
+        let actual = store.load(1000)?;
+
+        assert_eq!(actual, expected);
+        assert_eq!(store.key_strength(), KeyStrength::TpmBound);
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn tampering_fails_authenticated_decryption() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store =
+            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        store.save(&record(1000))?;
+        let path = directory.join("1000.template");
+        let mut bytes = fs::read(&path)?;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(path, bytes)?;
+
+        assert!(matches!(store.load(1000), Err(StorageError::AuthenticationFailed)));
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn file_key_provider_creates_owner_only_key() -> Result<(), KeyError> {
+        let directory = std::env::temp_dir().join(format!("faceauth-key-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).map_err(KeyError::Io)?;
+        let path = directory.join("machine.key");
+        let provider = FileKeyProvider::new(&path);
+        let first = provider.load_key()?;
+        let second = provider.load_key()?;
+
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        assert_eq!(provider.strength(), KeyStrength::RootOnlyFile);
+        let mode = fs::metadata(path).map_err(KeyError::Io)?.permissions().mode();
+        assert_eq!(mode & 0o077, 0);
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn template_symlink_is_rejected() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store =
+            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        store.save(&record(1000))?;
+        let target = directory.join("real.template");
+        fs::rename(directory.join("1000.template"), &target)?;
+        std::os::unix::fs::symlink(&target, directory.join("1000.template"))?;
+
+        assert!(matches!(store.load(1000), Err(StorageError::Symlink { .. })));
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn template_group_permissions_are_rejected() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store =
+            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        store.save(&record(1000))?;
+        let path = directory.join("1000.template");
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o640);
+        fs::set_permissions(&path, permissions)?;
+
+        assert!(matches!(store.load(1000), Err(StorageError::UnsafePermissions { .. })));
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+}
