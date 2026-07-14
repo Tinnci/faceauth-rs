@@ -7,7 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum encoded PAM or desktop service-name length.
 pub const MAX_SERVICE_NAME_LENGTH: usize = 64;
@@ -243,6 +243,26 @@ pub enum RejectionCode {
     ServiceUnavailable,
 }
 
+/// Localized clients map these closed progress codes to user-visible text or icons.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgressCode {
+    /// Move one face into the calibrated capture region.
+    PositionFace,
+    /// Hold a centered, eyes-open pose while baseline evidence is collected.
+    HoldStill,
+    /// Close and reopen both eyes.
+    Blink,
+    /// Turn toward the user's left.
+    TurnLeft,
+    /// Turn toward the user's right.
+    TurnRight,
+    /// Return to a centered, eyes-open pose.
+    ReturnToCenter,
+    /// Required evidence has been captured and bounded inference is running.
+    Processing,
+}
+
 /// Response returned by the daemon.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -251,6 +271,13 @@ pub enum Response {
     Started {
         /// Identifier of the accepted transaction.
         transaction_id: TransactionId,
+    },
+    /// Non-terminal UI progress that carries no frame, landmark, score, or template data.
+    Progress {
+        /// Identifier of the active transaction.
+        transaction_id: TransactionId,
+        /// Stable prompt code for PAM conversations or a lock-screen OSD.
+        progress: ProgressCode,
     },
     /// Authentication completed.
     Completed {
@@ -337,5 +364,21 @@ mod tests {
         assert!(DecisionCode::Accepted.is_accepted());
         assert!(!DecisionCode::InternalError.is_accepted());
         assert!(!DecisionCode::FaceMismatch.is_accepted());
+    }
+
+    #[test]
+    fn progress_is_transaction_bound_and_contains_no_measurements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transaction_id = TransactionId::generate();
+        let envelope =
+            Envelope::current(Response::Progress { transaction_id, progress: ProgressCode::Blink });
+        let encoded = serde_json::to_string(&envelope)?;
+        let decoded: Envelope<Response> = serde_json::from_str(&encoded)?;
+
+        assert_eq!(decoded, envelope);
+        assert!(!encoded.contains("eye"));
+        assert!(!encoded.contains("yaw"));
+        assert!(!encoded.contains("score"));
+        Ok(())
     }
 }
