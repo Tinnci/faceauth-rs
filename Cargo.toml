@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/faceauth-camera",
     "crates/faceauth-cli",
     "crates/faceauth-core",
     "crates/faceauth-daemon",
@@ -22,6 +23,7 @@ serde_json = "1.0.149"
 thiserror = "2.0.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+udev = "0.9.3"
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
 
 [workspace.lints.rust]
@@ -35,4 +37,3 @@ nursery = { level = "warn", priority = -1 }
 expect_used = "deny"
 panic = "deny"
 unwrap_used = "deny"
-

@@ -29,7 +29,7 @@ identity or liveness evidence.
 - Face authentication never removes the password path.
 
 See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
-and [research](docs/research.md).
+[IPC boundary](docs/ipc.md), and [research](docs/research.md).
 
 ## Development
 
@@ -51,4 +51,3 @@ cargo run -p faceauth-cli -- policy
 ## License
 
 Licensed under either Apache-2.0 or MIT, at your option.
-

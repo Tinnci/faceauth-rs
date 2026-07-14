@@ -1,9 +1,10 @@
 //! Read-only diagnostics and the future privileged face-authentication daemon entry point.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use faceauth_camera::CameraDevice;
 use serde::Serialize;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -21,12 +22,6 @@ enum Command {
     Doctor,
     /// Refuse to start the production service until the transport is implemented.
     Serve,
-}
-
-#[derive(Debug, Serialize)]
-struct CameraDevice {
-    device: String,
-    name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,7 +72,10 @@ fn main() -> Result<()> {
             let report = DoctorReport {
                 version: env!("CARGO_PKG_VERSION"),
                 production_status: ProductionStatus::ScaffoldOnly,
-                cameras: discover_cameras(),
+                cameras: faceauth_camera::discover()?
+                    .into_iter()
+                    .filter(|camera| camera.capture_capable)
+                    .collect(),
                 tpm2_resource_manager: if Path::new("/dev/tpmrm0").exists() {
                     DeviceStatus::Available
                 } else {
@@ -96,21 +94,4 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn discover_cameras() -> Vec<CameraDevice> {
-    let root = Path::new("/sys/class/video4linux");
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut cameras = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let node = entry.file_name().to_string_lossy().into_owned();
-            let name = fs::read_to_string(entry.path().join("name")).ok()?;
-            Some(CameraDevice { device: format!("/dev/{node}"), name: name.trim().to_owned() })
-        })
-        .collect::<Vec<_>>();
-    cameras.sort_by(|left, right| left.device.cmp(&right.device));
-    cameras
 }

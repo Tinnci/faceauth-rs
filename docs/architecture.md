@@ -22,6 +22,9 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 5. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
 6. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
+The authentication transport contract is described in [ipc.md](ipc.md). Caller
+identity always comes from Unix peer credentials, not serialized request fields.
+
 ## Camera pipeline
 
 The preferred observation pairs one 640x360 IR frame with one 640x360 visible
@@ -62,4 +65,3 @@ camera approval is unsafe.
 to presence changes to prewarm the daemon after stable return. It must ignore HPD
 for the final decision. A future generic inhibitor interface can expose
 `capture-active` so HPD avoids locking or showing conflicting OSD during enrollment.
-
