@@ -42,6 +42,8 @@ Use ONNX Runtime through Rust bindings for face detection, landmarks, embeddings
 and presentation-attack detection. Model files require explicit license,
 provenance, hash, input normalization, and benchmark records before inclusion.
 The project will not implement a face-recognition network from scratch.
+The model admission and evaluation requirements are defined in
+[model-policy.md](model-policy.md).
 
 ## Template storage
 
