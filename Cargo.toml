@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/faceauth-camera",
+    "crates/faceauth-capture",
     "crates/faceauth-cli",
     "crates/faceauth-core",
     "crates/faceauth-daemon",
@@ -32,6 +33,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 tss-esapi = "7.7.0"
 udev = "0.9.3"
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
+v4l = "0.14.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [workspace.lints.rust]

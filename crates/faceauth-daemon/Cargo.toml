@@ -10,6 +10,8 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 faceauth-camera = { path = "../faceauth-camera", version = "0.1.0" }
+faceauth-capture = { path = "../faceauth-capture", version = "0.1.0" }
+faceauth-core = { path = "../faceauth-core", version = "0.1.0" }
 faceauth-storage = { path = "../faceauth-storage", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
