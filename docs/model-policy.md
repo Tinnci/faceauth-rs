@@ -35,3 +35,8 @@ Models remain data, never executable plugins. ONNX Runtime sessions must use a
 restricted operator set where practical, fixed tensor bounds, bounded execution
 time, and no network access. Updating any model invalidates previous calibration
 and requires an explicit template compatibility decision.
+
+Landmark output used by active liveness is an input to the independently tested
+challenge state machine, not a terminal authentication decision. Eye-openness
+and yaw thresholds must be explicitly configured from calibration evidence; the
+active-liveness crate intentionally provides no production defaults.
