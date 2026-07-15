@@ -350,6 +350,20 @@ impl OnnxSession {
         preprocess_image(&self.manifest.input, image)
     }
 
+    /// Convert an image while checking cancellation before allocation and before each output row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::Cancelled`] when requested, or the same validation errors as
+    /// [`Self::preprocess`].
+    pub fn preprocess_cancellable(
+        &self,
+        image: ImageView<'_>,
+        should_cancel: impl FnMut() -> bool,
+    ) -> Result<InputTensor, InferenceError> {
+        preprocess_image_cancellable(&self.manifest.input, image, should_cancel)
+    }
+
     /// Execute one already validated tensor and copy all exact float32 outputs into zeroizing
     /// buffers before returning.
     ///
@@ -524,6 +538,14 @@ fn preprocess_image(
     contract: &InputContract,
     image: ImageView<'_>,
 ) -> Result<InputTensor, InferenceError> {
+    preprocess_image_cancellable(contract, image, || false)
+}
+
+fn preprocess_image_cancellable(
+    contract: &InputContract,
+    image: ImageView<'_>,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<InputTensor, InferenceError> {
     let channels = usize::from(contract.channels);
     if contract.width == 0
         || contract.height == 0
@@ -560,6 +582,8 @@ fn preprocess_image(
         return Err(InferenceError::SourceImageInvalid);
     }
 
+    check_cancelled(&mut should_cancel)?;
+
     let dimensions = contract.dimensions();
     let element_count = tensor_element_count(&dimensions)?;
     let mut values = Zeroizing::new(vec![0.0_f32; element_count]);
@@ -569,6 +593,7 @@ fn preprocess_image(
         ResizeFilter::BilinearHalfPixel => {}
     }
     for target_y in 0..target_height {
+        check_cancelled(&mut should_cancel)?;
         let (y0, y1, wy) = interpolation_axis(target_y, target_height, image.height);
         for target_x in 0..target_width {
             let (x0, x1, wx) = interpolation_axis(target_x, target_width, image.width);
@@ -609,6 +634,10 @@ fn preprocess_image(
         }
     }
     Ok(InputTensor { dimensions, values })
+}
+
+fn check_cancelled(should_cancel: &mut impl FnMut() -> bool) -> Result<(), InferenceError> {
+    if should_cancel() { Err(InferenceError::Cancelled) } else { Ok(()) }
 }
 
 fn interpolation_axis(target: u32, target_extent: u32, source_extent: u32) -> (u32, u32, f32) {
@@ -837,6 +866,9 @@ pub enum InferenceError {
     /// Runtime resource configuration is invalid.
     #[error("invalid ONNX Runtime configuration")]
     InvalidConfig,
+    /// The owning authentication transaction requested cancellation.
+    #[error("inference preprocessing was cancelled")]
+    Cancelled,
     /// Runtime or model path is not a regular file.
     #[error("inference file is not regular: {path}")]
     NotRegularFile {
@@ -931,6 +963,8 @@ pub enum InferenceError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use faceauth_model::{
         ChannelNormalization, MODEL_MANIFEST_SCHEMA_VERSION, OutputContract, ResizeFilter,
@@ -1071,6 +1105,53 @@ mod tests {
         assert_eq!(tensor.dimensions(), &[1, 1, 1, 1]);
         assert!((tensor.values()[0] - (111.75 / 255.0)).abs() < 1.0e-6);
         Ok(())
+    }
+
+    #[test]
+    fn cancellable_preprocessing_matches_regular_output() -> Result<(), InferenceError> {
+        let contract = input_contract(2, 2, TensorLayout::Nchw, ColorSpace::Grayscale);
+        let image = ImageView {
+            width: 2,
+            height: 2,
+            format: ImageFormat::Gray8,
+            bytes: &[0, 64, 128, 255],
+        };
+        let regular = preprocess_image(&contract, image)?;
+        let cancellable = preprocess_image_cancellable(&contract, image, || false)?;
+        assert_eq!(regular.dimensions(), cancellable.dimensions());
+        assert_eq!(regular.values(), cancellable.values());
+        Ok(())
+    }
+
+    #[test]
+    fn preprocessing_cancellation_stops_before_the_next_output_row() {
+        let contract = input_contract(4, 4, TensorLayout::Nchw, ColorSpace::Grayscale);
+        let bytes = [127_u8; 16];
+        let checks = Cell::new(0_u8);
+        let result = preprocess_image_cancellable(
+            &contract,
+            ImageView { width: 4, height: 4, format: ImageFormat::Gray8, bytes: &bytes },
+            || {
+                let next = checks.get().saturating_add(1);
+                checks.set(next);
+                next >= 3
+            },
+        );
+        assert!(matches!(result, Err(InferenceError::Cancelled)));
+        assert_eq!(checks.get(), 3);
+    }
+
+    #[test]
+    fn preprocessing_can_cancel_before_tensor_allocation() {
+        let contract = input_contract(1, 1, TensorLayout::Nchw, ColorSpace::Grayscale);
+        assert!(matches!(
+            preprocess_image_cancellable(
+                &contract,
+                ImageView { width: 1, height: 1, format: ImageFormat::Gray8, bytes: &[0] },
+                || true,
+            ),
+            Err(InferenceError::Cancelled)
+        ));
     }
 
     #[test]

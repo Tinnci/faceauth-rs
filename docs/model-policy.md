@@ -63,6 +63,14 @@ order, and affine normalization. Input and copied output float buffers are
 zeroized on drop, and non-finite runtime outputs fail closed. MJPEG must be decoded
 by a separately bounded decoder before this boundary and is not accepted directly.
 
+The authentication worker uses cancellable preprocessing. After validating the
+source contract, it checks cancellation before tensor allocation and before each
+output row of resize/color conversion. Cancellation drops the partially populated
+zeroizing tensor. A false cancellation callback produces byte-for-byte identical
+float output to the regular deterministic path. ONNX graph execution remains
+bounded separately by per-run `RunOptions` termination and the hard watchdog;
+worker cancellation must be checked again before starting a graph call.
+
 The embedding adapter rejects degenerate vectors and L2-normalizes accepted model
 outputs before enrollment or comparison. Cosine similarity is mapped from
 `[-1, 1]` to `[0, 1]` for the core policy. Persisted templates are accepted only

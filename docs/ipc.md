@@ -89,6 +89,9 @@ check the token at bounded operation boundaries and must not synthesize terminal
 The capture pairing API accepts a generic cancellation callback rather than a
 session type. The daemon maps the private token to that callback, preserving the
 crate boundary while stopping before subsequent IR/visible replacement reads.
+Inference preprocessing follows the same pattern and checks before allocating its
+float tensor and before every output row; partially produced tensors zeroize on
+drop.
 
 Completion consumes the slot and produces exactly one terminal response.
 `Cancelled` and `TimedOut` are manager-owned results and cannot be injected by
