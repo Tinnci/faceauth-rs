@@ -1248,6 +1248,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7b497d21a8b6fbb4b5a544f8fadb77e801a09ae0add9e411d31c6f89e3c1e90"
 
 [[package]]
+name = "pam-faceauth"
+version = "0.1.0"
+dependencies = [
+ "faceauth-protocol",
+ "faceauth-transport",
+ "libc",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

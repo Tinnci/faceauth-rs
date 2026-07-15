@@ -1,0 +1,5 @@
+# Dedicated development-only PAM service. Do not install into login, sudo, SDDM,
+# Polkit, or a screen locker. PAM_IGNORE falls through to the password module.
+auth    [success=done ignore=ignore default=bad] pam_faceauth.so
+auth    required                               pam_unix.so
+account required                               pam_unix.so

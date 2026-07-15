@@ -32,7 +32,8 @@ See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 [IPC boundary](docs/ipc.md), [model policy](docs/model-policy.md),
 [template storage](docs/storage.md), [camera capture](docs/capture.md),
 [active liveness](docs/liveness.md), [enrollment](docs/enrollment.md), and
-[presence integration](docs/presence.md), and [research](docs/research.md).
+[presence integration](docs/presence.md), [PAM boundary](docs/pam.md), and
+[research](docs/research.md).
 
 ## Development
 
