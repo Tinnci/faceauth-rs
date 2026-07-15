@@ -86,6 +86,10 @@ before opening another camera frame or loading another template. Workers must
 check the token at bounded operation boundaries and must not synthesize terminal
 `Cancelled` or `TimedOut` decisions themselves.
 
+The capture pairing API accepts a generic cancellation callback rather than a
+session type. The daemon maps the private token to that callback, preserving the
+crate boundary while stopping before subsequent IR/visible replacement reads.
+
 Completion consumes the slot and produces exactly one terminal response.
 `Cancelled` and `TimedOut` are manager-owned results and cannot be injected by
 the inference pipeline. At or after the deadline, progress, completion, or

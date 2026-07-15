@@ -342,13 +342,36 @@ pub fn capture_pair(
     visible: &mut impl FrameSource,
     policy: PairingPolicy,
 ) -> Result<PairedFrames, CaptureError> {
+    capture_pair_cancellable(infrared, visible, policy, || false)
+}
+
+/// Capture a bounded IR/RGB pair while checking an external cancellation signal between blocking
+/// frame operations.
+///
+/// The callback is intentionally generic so this crate remains independent from authentication
+/// session types. Each individual device read is still bounded by the configured frame timeout.
+/// Already-captured frame buffers are zeroized when cancellation returns an error.
+///
+/// # Errors
+///
+/// Returns [`CaptureError::Cancelled`] when `should_cancel` requests termination, or the same
+/// capture and pairing errors as [`capture_pair`].
+pub fn capture_pair_cancellable(
+    infrared: &mut impl FrameSource,
+    visible: &mut impl FrameSource,
+    policy: PairingPolicy,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<PairedFrames, CaptureError> {
     policy.validate()?;
+    check_cancelled(&mut should_cancel)?;
     let mut infrared_frame = infrared.next_frame()?;
+    check_cancelled(&mut should_cancel)?;
     let mut visible_frame = visible.next_frame()?;
     ensure_modality(&infrared_frame, CaptureModality::Infrared)?;
     ensure_modality(&visible_frame, CaptureModality::Visible)?;
 
     for replacement in 0..=policy.max_replacements {
+        check_cancelled(&mut should_cancel)?;
         let skew = infrared_frame
             .summary
             .timestamp_micros
@@ -359,6 +382,7 @@ pub fn capture_pair(
         if replacement == policy.max_replacements {
             return Err(CaptureError::PairingBudgetExhausted { last_skew_micros: skew });
         }
+        check_cancelled(&mut should_cancel)?;
         if infrared_frame.summary.timestamp_micros < visible_frame.summary.timestamp_micros {
             infrared_frame = infrared.next_frame()?;
             ensure_modality(&infrared_frame, CaptureModality::Infrared)?;
@@ -368,6 +392,10 @@ pub fn capture_pair(
         }
     }
     Err(CaptureError::InvalidSpec)
+}
+
+fn check_cancelled(should_cancel: &mut impl FnMut() -> bool) -> Result<(), CaptureError> {
+    if should_cancel() { Err(CaptureError::Cancelled) } else { Ok(()) }
 }
 
 fn ensure_modality(frame: &CapturedFrame, expected: CaptureModality) -> Result<(), CaptureError> {
@@ -396,6 +424,9 @@ pub enum CaptureError {
     /// Capture or pairing configuration is invalid.
     #[error("invalid capture specification")]
     InvalidSpec,
+    /// The owning authentication transaction requested cancellation.
+    #[error("frame capture was cancelled")]
+    Cancelled,
     /// V4L2 selected a different image format or size.
     #[error("V4L2 did not accept the exact requested format")]
     NegotiatedFormatMismatch,
@@ -450,7 +481,7 @@ pub enum CaptureError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{cell::Cell, collections::VecDeque};
 
     use super::*;
 
@@ -506,6 +537,53 @@ mod tests {
         assert_eq!(pair.timing().infrared_timestamp_micros, 1_200_000);
         assert_eq!(pair.timing().visible_timestamp_micros, Some(1_190_000));
         Ok(())
+    }
+
+    #[test]
+    fn cancellation_before_capture_does_not_read_either_source() {
+        let mut infrared =
+            FakeSource { frames: VecDeque::from([frame(CaptureModality::Infrared, 1_000_000)]) };
+        let mut visible =
+            FakeSource { frames: VecDeque::from([frame(CaptureModality::Visible, 1_000_000)]) };
+        assert!(matches!(
+            capture_pair_cancellable(
+                &mut infrared,
+                &mut visible,
+                PairingPolicy { max_skew_micros: 20_000, max_replacements: 1 },
+                || true,
+            ),
+            Err(CaptureError::Cancelled)
+        ));
+        assert_eq!(infrared.frames.len(), 1);
+        assert_eq!(visible.frames.len(), 1);
+    }
+
+    #[test]
+    fn cancellation_stops_before_another_replacement_frame() {
+        let mut infrared = FakeSource {
+            frames: VecDeque::from([
+                frame(CaptureModality::Infrared, 1_000_000),
+                frame(CaptureModality::Infrared, 2_000_000),
+            ]),
+        };
+        let mut visible =
+            FakeSource { frames: VecDeque::from([frame(CaptureModality::Visible, 1_500_000)]) };
+        let checks = Cell::new(0_u8);
+        assert!(matches!(
+            capture_pair_cancellable(
+                &mut infrared,
+                &mut visible,
+                PairingPolicy { max_skew_micros: 20_000, max_replacements: 2 },
+                || {
+                    let next = checks.get().saturating_add(1);
+                    checks.set(next);
+                    next >= 4
+                },
+            ),
+            Err(CaptureError::Cancelled)
+        ));
+        assert_eq!(infrared.frames.len(), 1);
+        assert!(visible.frames.is_empty());
     }
 
     #[test]

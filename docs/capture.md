@@ -5,6 +5,13 @@ an exact resolution, pixel format, and frame rate; rejects corrupt frames,
 non-monotonic kernel timestamps, empty or oversized payloads, and IR/RGB pairs
 outside the configured skew and replacement budgets.
 
+Authentication uses the cancellable pairing entry point. It accepts only a
+generic callback, keeping capture independent from session and desktop code, and
+checks cancellation before the first read, between the IR and visible reads, and
+before every replacement read. A single in-progress V4L2 read remains bounded by
+the configured frame timeout. Cancellation returns a dedicated error and drops
+all already-captured `Zeroizing` buffers before any further frame is requested.
+
 Frame bytes are copied only into an ephemeral `Zeroizing<Vec<u8>>`. Diagnostics
 serialize metadata but never pixels, decoded images, embeddings, or templates.
 Production preprocessing and inference must borrow these bytes and must not
