@@ -6,15 +6,20 @@ use faceauth_authz::{
 };
 use faceauth_core::{
     AuthPolicy, AuthenticationDecision, AuthenticationEvidence, CapturePair, CheckStatus,
-    ObservationStatus, PolicyError,
+    DecisionReason, ObservationStatus, PolicyError,
 };
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
 use faceauth_inference::{FaceEmbedding, InferenceError, PassiveLivenessScore};
 use faceauth_liveness::ChallengeProgress;
 use faceauth_model::ModelRole;
-use faceauth_protocol::{AuthenticationPurpose, RejectionCode, Request, Response};
+use faceauth_protocol::{
+    AuthenticationPurpose, DecisionCode, RejectionCode, Request, Response, TransactionId,
+};
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
-use faceauth_storage::{StorageError, TEMPLATE_RECORD_SCHEMA_VERSION, TemplateRecord};
+use faceauth_storage::{
+    EncryptedTemplateStore, KeyProvider, StorageError, TEMPLATE_RECORD_SCHEMA_VERSION,
+    TemplateRecord,
+};
 use faceauth_transport::{PeerStream, TransportError};
 use thiserror::Error;
 
@@ -247,6 +252,89 @@ pub enum AuthenticationPipelineError {
     Inference(#[from] InferenceError),
 }
 
+/// Source of authenticated, UID-addressed biometric templates.
+pub trait TemplateSource {
+    /// Load and authenticate the template belonging to `uid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when no usable authenticated record can be produced.
+    fn load_template(&self, uid: u32) -> Result<TemplateRecord, StorageError>;
+}
+
+impl<K> TemplateSource for EncryptedTemplateStore<K>
+where
+    K: KeyProvider,
+{
+    fn load_template(&self, uid: u32) -> Result<TemplateRecord, StorageError> {
+        self.load(uid)
+    }
+}
+
+/// Inputs bound to one admitted authentication transaction completion.
+#[derive(Clone, Copy)]
+pub struct AuthenticationCompletion<'a> {
+    /// Connection identity created by the daemon for the admitted socket.
+    pub connection: ConnectionToken,
+    /// Exact active transaction identifier.
+    pub transaction_id: TransactionId,
+    /// Final authentication policy.
+    pub policy: AuthPolicy,
+    /// Exact calibrated passive PAD contracts.
+    pub passive_pad_policy: &'a PassivePadPolicy,
+    /// Complete ephemeral derived evidence.
+    pub observation: AuthenticationObservation<'a>,
+    /// Current monotonic time used for the terminal deadline check.
+    pub now_micros: u64,
+}
+
+/// Load the exact active UID's encrypted template, evaluate derived evidence, and consume the
+/// connection-bound transaction with one terminal response.
+///
+/// Storage and malformed-evidence failures deliberately collapse to `InternalError`; only valid
+/// biometric policy decisions are exposed. The session manager replaces any result with
+/// `TimedOut` once its monotonic deadline has elapsed.
+///
+/// # Errors
+///
+/// Returns [`SessionError`] when the connection/transaction binding is invalid or no active
+/// transaction exists.
+pub fn complete_authentication<S: TemplateSource>(
+    sessions: &mut SessionManager,
+    templates: &S,
+    completion: AuthenticationCompletion<'_>,
+) -> Result<Response, SessionError> {
+    let target_uid = sessions.target_uid(completion.connection, completion.transaction_id)?;
+    let decision =
+        templates.load_template(target_uid).map_or(DecisionCode::InternalError, |template| {
+            evaluate_authentication(
+                completion.policy,
+                completion.passive_pad_policy,
+                &template,
+                completion.observation,
+            )
+            .map_or(DecisionCode::InternalError, |result| decision_code(result.reason))
+        });
+    sessions.complete(
+        completion.connection,
+        completion.transaction_id,
+        decision,
+        completion.now_micros,
+    )
+}
+
+const fn decision_code(reason: DecisionReason) -> DecisionCode {
+    match reason {
+        DecisionReason::Accepted => DecisionCode::Accepted,
+        DecisionReason::InfraredMissing => DecisionCode::InfraredMissing,
+        DecisionReason::VisibleMissing => DecisionCode::VisibleMissing,
+        DecisionReason::InsufficientQuality => DecisionCode::InsufficientQuality,
+        DecisionReason::PassiveLivenessFailed => DecisionCode::PassiveLivenessFailed,
+        DecisionReason::ActiveChallengeFailed => DecisionCode::ActiveChallengeFailed,
+        DecisionReason::FaceMismatch => DecisionCode::FaceMismatch,
+    }
+}
+
 /// Decodes and admits requests through executable verification, authorization, and session state.
 pub struct BoundaryService {
     authorization: AuthorizationPolicy,
@@ -359,7 +447,7 @@ pub enum BoundaryError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixStream;
+    use std::{cell::Cell, os::unix::net::UnixStream};
 
     use faceauth_authz::{
         AuthorizationGrant, AuthorizationRule, CallerRelation, ExecutableFingerprint,
@@ -415,6 +503,36 @@ mod tests {
                 visible,
             )?,
         ])
+    }
+
+    struct TestTemplateSource {
+        record: Option<TemplateRecord>,
+        requested_uid: Cell<Option<u32>>,
+    }
+
+    impl TemplateSource for TestTemplateSource {
+        fn load_template(&self, uid: u32) -> Result<TemplateRecord, StorageError> {
+            self.requested_uid.set(Some(uid));
+            self.record.clone().ok_or(StorageError::InvalidRecord("test template unavailable"))
+        }
+    }
+
+    fn active_session(
+        target_uid: u32,
+    ) -> Result<(SessionManager, ConnectionToken, TransactionId), Box<dyn std::error::Error>> {
+        let mut sessions = SessionManager::new(SessionConfig::default())?;
+        let connection = ConnectionToken::generate()?;
+        let transaction_id = TransactionId::generate();
+        let grant = AuthorizationGrant {
+            transaction_id,
+            peer: faceauth_transport::PeerIdentity { pid: 123, uid: 0, gid: 0 },
+            target_uid,
+            service: ServiceName::parse("faceauth-test")?,
+            purpose: AuthenticationPurpose::Test,
+            executable: ExecutableFingerprint { device: 1, inode: 1 },
+        };
+        let _ = sessions.start(grant, connection, 1_000_000)?;
+        Ok((sessions, connection, transaction_id))
     }
 
     #[test]
@@ -542,6 +660,120 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(AuthenticationPipelineError::PassivePadEvidenceInvalid)));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_loads_only_the_session_authorized_uid() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let embedding = test_embedding(0xaa)?;
+        let source = TestTemplateSource {
+            record: Some(template_from_embedding(4242, &embedding)),
+            requested_uid: Cell::new(None),
+        };
+        let scores = pad_scores(0.99, 0.99)?;
+        let (mut sessions, connection, transaction_id) = active_session(4242)?;
+        let response = complete_authentication(
+            &mut sessions,
+            &source,
+            AuthenticationCompletion {
+                connection,
+                transaction_id,
+                policy: AuthPolicy::default(),
+                passive_pad_policy: &pad_policy(),
+                observation: AuthenticationObservation {
+                    timing: CapturePair {
+                        infrared_timestamp_micros: 2_000_000,
+                        visible_timestamp_micros: Some(2_010_000),
+                    },
+                    quality: 0.9,
+                    embedding: &embedding,
+                    passive_liveness: &scores,
+                    active_challenge: ChallengeProgress::Passed,
+                },
+                now_micros: 3_000_000,
+            },
+        )?;
+        assert_eq!(source.requested_uid.get(), Some(4242));
+        assert_eq!(
+            response,
+            Response::Completed { transaction_id, decision: DecisionCode::Accepted }
+        );
+        assert!(!sessions.is_busy());
+        Ok(())
+    }
+
+    #[test]
+    fn storage_failure_consumes_session_as_internal_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let embedding = test_embedding(0xaa)?;
+        let source = TestTemplateSource { record: None, requested_uid: Cell::new(None) };
+        let scores = pad_scores(0.99, 0.99)?;
+        let (mut sessions, connection, transaction_id) = active_session(1000)?;
+        let response = complete_authentication(
+            &mut sessions,
+            &source,
+            AuthenticationCompletion {
+                connection,
+                transaction_id,
+                policy: AuthPolicy::default(),
+                passive_pad_policy: &pad_policy(),
+                observation: AuthenticationObservation {
+                    timing: CapturePair {
+                        infrared_timestamp_micros: 2_000_000,
+                        visible_timestamp_micros: Some(2_010_000),
+                    },
+                    quality: 0.9,
+                    embedding: &embedding,
+                    passive_liveness: &scores,
+                    active_challenge: ChallengeProgress::Passed,
+                },
+                now_micros: 3_000_000,
+            },
+        )?;
+        assert_eq!(
+            response,
+            Response::Completed { transaction_id, decision: DecisionCode::InternalError }
+        );
+        assert!(!sessions.is_busy());
+        Ok(())
+    }
+
+    #[test]
+    fn session_deadline_overrides_a_valid_biometric_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let embedding = test_embedding(0xaa)?;
+        let source = TestTemplateSource {
+            record: Some(template_from_embedding(1000, &embedding)),
+            requested_uid: Cell::new(None),
+        };
+        let scores = pad_scores(0.99, 0.99)?;
+        let (mut sessions, connection, transaction_id) = active_session(1000)?;
+        let response = complete_authentication(
+            &mut sessions,
+            &source,
+            AuthenticationCompletion {
+                connection,
+                transaction_id,
+                policy: AuthPolicy::default(),
+                passive_pad_policy: &pad_policy(),
+                observation: AuthenticationObservation {
+                    timing: CapturePair {
+                        infrared_timestamp_micros: 2_000_000,
+                        visible_timestamp_micros: Some(2_010_000),
+                    },
+                    quality: 0.9,
+                    embedding: &embedding,
+                    passive_liveness: &scores,
+                    active_challenge: ChallengeProgress::Passed,
+                },
+                now_micros: 16_000_000,
+            },
+        )?;
+        assert_eq!(
+            response,
+            Response::Completed { transaction_id, decision: DecisionCode::TimedOut }
+        );
         Ok(())
     }
 

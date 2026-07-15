@@ -76,6 +76,15 @@ cancellation produces `TimedOut`. An expired transaction is not silently replace
 by a new request: the daemon event loop must call `expire()`, deliver or audit the
 timeout terminal result, and only then admit another transaction.
 
+The completion coordinator derives the template UID only from the already
+authorized, connection-bound session; inference code cannot choose another
+account's template path. It loads the authenticated encrypted record through the
+storage boundary and consumes the session exactly once. Storage corruption,
+missing/unusable templates, incompatible models, and malformed derived evidence
+collapse to `InternalError` at this post-admission boundary and never become
+success. A deadline reached during processing overrides even a valid biometric
+decision with `TimedOut`.
+
 ## PAM staging
 
 The first PAM integration must use a dedicated `faceauth-test` service. It must

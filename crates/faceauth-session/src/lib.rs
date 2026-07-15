@@ -188,6 +188,23 @@ impl SessionManager {
         self.active.is_some()
     }
 
+    /// Return the authorized target UID for the exact active connection and transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when no transaction is active or either binding differs.
+    pub fn target_uid(
+        &self,
+        connection: ConnectionToken,
+        transaction_id: TransactionId,
+    ) -> Result<u32, SessionError> {
+        self.verify_binding(connection, transaction_id)?;
+        self.active
+            .as_ref()
+            .map(|active| active.grant.target_uid)
+            .ok_or(SessionError::NoActiveTransaction)
+    }
+
     fn verify_binding(
         &self,
         connection: ConnectionToken,
@@ -286,6 +303,27 @@ mod tests {
         assert!(matches!(
             manager.complete(connection, transaction_id, DecisionCode::Accepted, 3_000_001),
             Err(SessionError::NoActiveTransaction)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn target_uid_requires_exact_connection_and_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut manager = SessionManager::new(SessionConfig::default())?;
+        let connection = ConnectionToken::generate()?;
+        let other_connection = ConnectionToken::generate()?;
+        let grant = grant()?;
+        let transaction_id = grant.transaction_id;
+        let _ = manager.start(grant, connection, 1_000_000)?;
+        assert_eq!(manager.target_uid(connection, transaction_id)?, 1000);
+        assert!(matches!(
+            manager.target_uid(other_connection, transaction_id),
+            Err(SessionError::WrongConnection)
+        ));
+        assert!(matches!(
+            manager.target_uid(connection, TransactionId::generate()),
+            Err(SessionError::WrongTransaction)
         ));
         Ok(())
     }
