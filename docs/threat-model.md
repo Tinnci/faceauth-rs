@@ -22,6 +22,8 @@
 - IR is mandatory for production policy; visible light is paired by default.
 - Passive presentation-attack detection is combined with a randomized active challenge.
 - Authentication is bounded by monotonic deadlines and request-specific nonces.
+- Transaction IDs and daemon-internal connection tokens prevent cross-connection
+  cancellation, terminal replay, and silent replacement of expired work.
 - Peer credentials and requested UID must agree with trusted caller policy.
 - Authentication entry points require exact service/purpose rules and a
   pidfd-bound, root-owned executable allowlist match.

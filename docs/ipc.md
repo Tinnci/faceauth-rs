@@ -50,6 +50,26 @@ Package upgrades normally replace an executable inode and therefore invalidate
 the old fingerprint. Updating the root-controlled authorization policy is an
 explicit deployment action, not an automatic path-based trust decision.
 
+## Transaction lifecycle
+
+`faceauth-session` initially exposes one global transaction slot because the
+daemon owns one calibrated IR/RGB pair. Starting requires a completed
+authorization grant whose transaction ID is copied from the decoded request.
+The session is additionally bound to an unpredictable daemon-internal connection
+token that is never serialized.
+
+Progress, completion, and cancellation require both the exact transaction ID and
+the originating connection token. A wrong connection or ID cannot alter or reap
+the active transaction. The monotonic deadline is fixed at start and cannot be
+extended by wire input.
+
+Completion consumes the slot and produces exactly one terminal response.
+`Cancelled` and `TimedOut` are manager-owned results and cannot be injected by
+the inference pipeline. At or after the deadline, progress, completion, or
+cancellation produces `TimedOut`. An expired transaction is not silently replaced
+by a new request: the daemon event loop must call `expire()`, deliver or audit the
+timeout terminal result, and only then admit another transaction.
+
 ## PAM staging
 
 The first PAM integration must use a dedicated `faceauth-test` service. It must

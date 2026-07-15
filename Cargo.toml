@@ -9,6 +9,7 @@ members = [
     "crates/faceauth-liveness",
     "crates/faceauth-model",
     "crates/faceauth-protocol",
+    "crates/faceauth-session",
     "crates/faceauth-storage",
     "crates/faceauth-transport",
 ]

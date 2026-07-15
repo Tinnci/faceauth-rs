@@ -456,6 +456,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "faceauth-session"
+version = "0.1.0"
+dependencies = [
+ "faceauth-authz",
+ "faceauth-protocol",
+ "faceauth-transport",
+ "getrandom",
+ "thiserror",
+]
+
+[[package]]
 name = "faceauth-storage"
 version = "0.1.0"
 dependencies = [

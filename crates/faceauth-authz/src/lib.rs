@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
 };
 
-use faceauth_protocol::{AuthenticationPurpose, RequestContext, ServiceName};
+use faceauth_protocol::{AuthenticationPurpose, RequestContext, ServiceName, TransactionId};
 use faceauth_transport::PeerIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -219,6 +219,7 @@ impl AuthorizationPolicy {
             return Err(AuthorizationError::ExecutableNotAllowed);
         }
         Ok(AuthorizationGrant {
+            transaction_id: request.transaction_id,
             peer,
             target_uid: request.target_uid,
             service: request.service.clone(),
@@ -231,6 +232,8 @@ impl AuthorizationPolicy {
 /// Immutable authorization result bound to the request and kernel peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationGrant {
+    /// Random request identifier bound during authorization.
+    pub transaction_id: TransactionId,
     /// Kernel connection identity.
     pub peer: PeerIdentity,
     /// Account whose enrolled template may be accessed.
@@ -392,7 +395,8 @@ mod tests {
         let policy = AuthorizationPolicy::new(vec![rule()?])?;
         let request = request()?;
 
-        assert!(policy.authorize(peer(0), Some(executable(ALLOWED)), &request).is_ok());
+        let root_grant = policy.authorize(peer(0), Some(executable(ALLOWED)), &request)?;
+        assert_eq!(root_grant.transaction_id, request.transaction_id);
         assert!(policy.authorize(peer(1000), Some(executable(ALLOWED)), &request).is_ok());
         Ok(())
     }
