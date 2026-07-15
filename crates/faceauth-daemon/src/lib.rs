@@ -16,10 +16,10 @@ use faceauth_inference::{
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
 };
+use faceauth_management::AuthorizedEnrollment;
 use faceauth_model::ModelRole;
 use faceauth_protocol::{
-    AuthenticationPurpose, DecisionCode, ProgressCode, RejectionCode, Request, Response,
-    TransactionId,
+    DecisionCode, ProgressCode, RejectionCode, Request, Response, TransactionId,
 };
 use faceauth_session::{CancellationToken, ConnectionToken, SessionError, SessionManager};
 use faceauth_storage::{
@@ -28,8 +28,6 @@ use faceauth_storage::{
 };
 use faceauth_transport::{PeerStream, TransportError};
 use thiserror::Error;
-
-const ENROLLMENT_SERVICE: &str = "faceauth-enroll";
 
 /// Start enrollment only from an exact root broker grant dedicated to Polkit enrollment.
 ///
@@ -42,13 +40,9 @@ pub fn begin_authorized_enrollment(
     config: EnrollmentConfig,
     now_micros: u64,
 ) -> Result<EnrollmentSession, EnrollmentBoundaryError> {
-    if grant.peer.uid != 0
-        || grant.service.as_str() != ENROLLMENT_SERVICE
-        || grant.purpose != AuthenticationPurpose::Polkit
-    {
-        return Err(EnrollmentBoundaryError::UnauthorizedGrant);
-    }
-    Ok(EnrollmentSession::start(config, grant.target_uid, now_micros)?)
+    let authorization = AuthorizedEnrollment::from_grant(grant)
+        .map_err(|_| EnrollmentBoundaryError::UnauthorizedGrant)?;
+    Ok(EnrollmentSession::start(config, authorization.target_uid(), now_micros)?)
 }
 
 /// Enrollment authorization or transaction setup failure.
@@ -651,7 +645,7 @@ mod tests {
     #[test]
     fn enrollment_requires_exact_root_polkit_broker_grant() -> Result<(), Box<dyn std::error::Error>>
     {
-        let service = ServiceName::parse(ENROLLMENT_SERVICE)?;
+        let service = ServiceName::parse(faceauth_management::ENROLLMENT_SERVICE)?;
         let grant = AuthorizationGrant {
             transaction_id: TransactionId::generate(),
             peer: faceauth_transport::PeerIdentity { pid: 10, uid: 0, gid: 0 },

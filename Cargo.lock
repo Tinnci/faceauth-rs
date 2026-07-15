@@ -670,6 +670,7 @@ dependencies = [
  "faceauth-enrollment",
  "faceauth-inference",
  "faceauth-liveness",
+ "faceauth-management",
  "faceauth-model",
  "faceauth-presence",
  "faceauth-protocol",
@@ -712,6 +713,18 @@ dependencies = [
  "getrandom 0.4.3",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "faceauth-management"
+version = "0.1.0"
+dependencies = [
+ "faceauth-authz",
+ "faceauth-protocol",
+ "faceauth-transport",
+ "serde",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

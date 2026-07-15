@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<node name="/org/faceauth/Manager1">
+  <interface name="org.faceauth.Manager1">
+    <method name="GetVersion">
+      <arg name="schema_version" type="q" direction="out"/>
+    </method>
+    <method name="GetEnrollmentState">
+      <arg name="target_uid" type="u" direction="in"/>
+      <arg name="enrolled" type="b" direction="out"/>
+    </method>
+    <method name="BeginEnrollment">
+      <arg name="target_uid" type="u" direction="in"/>
+      <arg name="operation_id" type="s" direction="out"/>
+    </method>
+    <method name="CancelEnrollment">
+      <arg name="target_uid" type="u" direction="in"/>
+      <arg name="operation_id" type="s" direction="in"/>
+    </method>
+    <signal name="EnrollmentProgress">
+      <arg name="operation_id" type="s"/>
+      <arg name="progress" type="s"/>
+    </signal>
+    <signal name="EnrollmentCompleted">
+      <arg name="operation_id" type="s"/>
+      <arg name="result" type="s"/>
+    </signal>
+  </interface>
+</node>

@@ -33,7 +33,8 @@ See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 [template storage](docs/storage.md), [camera capture](docs/capture.md),
 [active liveness](docs/liveness.md), [enrollment](docs/enrollment.md), and
 [presence integration](docs/presence.md), [PAM boundary](docs/pam.md), and
-[deployment artifacts](docs/deployment.md), and [research](docs/research.md).
+[management contract](docs/management.md), [deployment artifacts](docs/deployment.md), and
+[research](docs/research.md).
 
 ## Development
 
