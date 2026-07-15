@@ -35,6 +35,12 @@ They never receive raw frames or landmark values and cannot report challenge
 success back to the daemon. Cancellation and password fallback remain available
 throughout the bounded transaction.
 
+The state machine also exposes a session-independent cancellable observation
+method. It checks the callback before validating or mutating state, so a cancelled
+worker does not consume a frame sequence, advance a challenge phase, or retain
+landmark-derived state. The daemon can map its private transaction token to this
+callback without making the liveness crate depend on daemon/session types.
+
 Active challenges raise replay cost but do not establish presentation-attack
 resistance by themselves. Print, screen, video, mask, injection, and virtual
 camera attacks still require passive PAD, device trust policy, and independent

@@ -92,6 +92,8 @@ crate boundary while stopping before subsequent IR/visible replacement reads.
 Inference preprocessing follows the same pattern and checks before allocating its
 float tensor and before every output row; partially produced tensors zeroize on
 drop.
+The active-liveness state machine checks before each observation and leaves its
+phase and sequence state unchanged when cancellation is requested.
 
 Completion consumes the slot and produces exactly one terminal response.
 `Cancelled` and `TimedOut` are manager-owned results and cannot be injected by

@@ -218,6 +218,26 @@ impl ChallengeSession {
         &mut self,
         observation: ChallengeObservation,
     ) -> Result<ChallengeProgress, ChallengeError> {
+        self.observe_cancellable(observation, || false)
+    }
+
+    /// Process one fresh observation only if the owning worker remains active.
+    ///
+    /// The callback is generic so the state machine remains independent from daemon session types.
+    /// Cancellation is checked before validating or mutating challenge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChallengeError::Cancelled`] without consuming the observation when requested, or
+    /// the same state-machine errors as [`Self::observe`].
+    pub fn observe_cancellable(
+        &mut self,
+        observation: ChallengeObservation,
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<ChallengeProgress, ChallengeError> {
+        if should_cancel() {
+            return Err(ChallengeError::Cancelled);
+        }
         if self.phase == Phase::Passed {
             return Err(ChallengeError::AlreadyCompleted);
         }
@@ -270,6 +290,9 @@ pub enum ChallengeError {
     /// Configuration is malformed, contradictory, or outside hard bounds.
     #[error("invalid active-challenge configuration")]
     InvalidConfig,
+    /// The owning authentication transaction requested cancellation.
+    #[error("active challenge was cancelled")]
+    Cancelled,
     /// The monotonic deadline overflowed.
     #[error("active-challenge deadline overflowed")]
     DeadlineOverflow,
@@ -358,6 +381,39 @@ mod tests {
             session.observe(observation(1_300_000, 3, 0.8, 0.0))?,
             ChallengeProgress::Passed
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cancellable_observe_matches_regular_state_transition() -> Result<(), ChallengeError> {
+        let mut regular =
+            ChallengeSession::with_action(config(), 1_000_000, ChallengeAction::Blink)?;
+        let mut cancellable =
+            ChallengeSession::with_action(config(), 1_000_000, ChallengeAction::Blink)?;
+        let baseline = observation(1_100_000, 1, 0.9, 0.0);
+        assert_eq!(
+            regular.observe(baseline)?,
+            cancellable.observe_cancellable(baseline, || false)?
+        );
+        assert_eq!(regular.progress(), cancellable.progress());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_does_not_consume_or_advance_an_observation() -> Result<(), ChallengeError> {
+        let mut session =
+            ChallengeSession::with_action(config(), 1_000_000, ChallengeAction::Blink)?;
+        assert_eq!(
+            session.observe(observation(1_100_000, 1, 0.9, 0.0))?,
+            ChallengeProgress::ActionRequired(ChallengeAction::Blink)
+        );
+        let blink = observation(1_200_000, 2, 0.1, 0.0);
+        assert!(matches!(
+            session.observe_cancellable(blink, || true),
+            Err(ChallengeError::Cancelled)
+        ));
+        assert_eq!(session.progress(), ChallengeProgress::ActionRequired(ChallengeAction::Blink));
+        assert_eq!(session.observe(blink)?, ChallengeProgress::RecoveryRequired);
         Ok(())
     }
 
