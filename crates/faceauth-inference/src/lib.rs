@@ -10,7 +10,7 @@ use std::{
 };
 
 use faceauth_model::{
-    ColorSpace, InputContract, ModelManifest, ResizeFilter,
+    ColorSpace, InputContract, ModelManifest, ModelRole, OutputSemantic, ResizeFilter,
     TensorElementType as ManifestElementType, TensorLayout,
 };
 use ort::{
@@ -73,6 +73,7 @@ impl RuntimeConfig {
 pub struct OnnxSession {
     session: Session,
     manifest: ModelManifest,
+    compatibility_sha256: String,
     max_run_millis: u32,
 }
 
@@ -129,6 +130,124 @@ pub struct OutputTensor {
     values: Zeroizing<Vec<f32>>,
 }
 
+/// L2-normalized face embedding bound to one complete model compatibility contract.
+pub struct FaceEmbedding {
+    compatibility_sha256: String,
+    values: Zeroizing<Vec<f32>>,
+}
+
+impl FaceEmbedding {
+    /// Reconstruct a comparison embedding from an already validated encrypted template.
+    ///
+    /// The values must already be L2-normalized; this function does not silently renormalize
+    /// persisted data because that could hide corruption or a migration mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::EmbeddingInvalid`] for an invalid digest, dimension, numeric
+    /// value, or unit norm.
+    pub fn from_normalized_template(
+        compatibility_sha256: &str,
+        values: &[f32],
+    ) -> Result<Self, InferenceError> {
+        if compatibility_sha256.len() != 64
+            || !compatibility_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || compatibility_sha256.bytes().any(|byte| byte.is_ascii_uppercase())
+            || !(32..=4096).contains(&values.len())
+            || values.iter().any(|value| !value.is_finite())
+        {
+            return Err(InferenceError::EmbeddingInvalid);
+        }
+        let copied = Zeroizing::new(values.to_vec());
+        let squared_norm = copied.iter().try_fold(0.0_f32, |sum, value| {
+            let next = value.mul_add(*value, sum);
+            next.is_finite().then_some(next).ok_or(InferenceError::EmbeddingInvalid)
+        })?;
+        if (squared_norm.sqrt() - 1.0).abs() > 1.0e-3 {
+            return Err(InferenceError::EmbeddingInvalid);
+        }
+        Ok(Self { compatibility_sha256: compatibility_sha256.to_owned(), values: copied })
+    }
+
+    /// Complete model and preprocessing compatibility digest.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
+    /// Borrow the normalized embedding for encrypted template persistence.
+    #[must_use]
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    /// Compute mapped cosine similarity in the inclusive range 0..=1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::EmbeddingIncompatible`] when dimensions or compatibility
+    /// identities differ, or [`InferenceError::EmbeddingInvalid`] for invalid arithmetic.
+    pub fn similarity(&self, other: &Self) -> Result<f32, InferenceError> {
+        if self.compatibility_sha256 != other.compatibility_sha256
+            || self.values.len() != other.values.len()
+        {
+            return Err(InferenceError::EmbeddingIncompatible);
+        }
+        let cosine = self
+            .values
+            .iter()
+            .zip(other.values.iter())
+            .try_fold(0.0_f32, |sum, (left, right)| {
+                let next = left.mul_add(*right, sum);
+                next.is_finite().then_some(next).ok_or(InferenceError::EmbeddingInvalid)
+            })?
+            .clamp(-1.0, 1.0);
+        let mapped = cosine.mul_add(0.5, 0.5);
+        mapped.is_finite().then_some(mapped).ok_or(InferenceError::EmbeddingInvalid)
+    }
+}
+
+/// Scalar live probability bound to one passive-PAD model and preprocessing contract.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PassiveLivenessScore {
+    role: ModelRole,
+    compatibility_sha256: String,
+    probability: f32,
+}
+
+impl PassiveLivenessScore {
+    /// Passive liveness model role that produced this score.
+    #[must_use]
+    pub const fn role(&self) -> ModelRole {
+        self.role
+    }
+
+    /// Complete model and preprocessing compatibility digest.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
+    /// Calibrated live probability in 0..=1.
+    #[must_use]
+    pub const fn probability(&self) -> f32 {
+        self.probability
+    }
+
+    /// Apply an explicitly calibrated inclusive threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::InvalidProbabilityThreshold`] for a non-finite or out-of-range
+    /// threshold.
+    pub fn passes(&self, minimum: f32) -> Result<bool, InferenceError> {
+        if !minimum.is_finite() || !(0.0..=1.0).contains(&minimum) {
+            return Err(InferenceError::InvalidProbabilityThreshold);
+        }
+        Ok(self.probability >= minimum)
+    }
+}
+
 impl OutputTensor {
     /// Exact manifest output name.
     #[must_use]
@@ -182,7 +301,12 @@ impl OnnxSession {
             .map_err(ort::Error::from)?;
         let session = builder.commit_from_file(&canonical_model)?;
         validate_session_contract(manifest, &session)?;
-        Ok(Self { session, manifest: manifest.clone(), max_run_millis: config.max_run_millis })
+        Ok(Self {
+            session,
+            manifest: manifest.clone(),
+            compatibility_sha256: manifest.compatibility_sha256()?,
+            max_run_millis: config.max_run_millis,
+        })
     }
 
     /// Convert a tightly packed 8-bit image into the exact manifest tensor.
@@ -257,6 +381,115 @@ impl OnnxSession {
             });
         }
         Ok(copied)
+    }
+
+    /// Convert the semantic embedding output into a normalized, compatibility-bound template.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] when the loaded role, output identity, dimensions, values, or
+    /// vector norm are invalid.
+    pub fn extract_embedding(
+        &self,
+        outputs: &[OutputTensor],
+    ) -> Result<FaceEmbedding, InferenceError> {
+        extract_embedding_output(&self.manifest, &self.compatibility_sha256, outputs)
+    }
+
+    /// Convert a semantic passive-PAD output into a compatibility-bound live probability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] when the loaded role, output identity, shape, or probability is
+    /// invalid.
+    pub fn extract_passive_liveness(
+        &self,
+        outputs: &[OutputTensor],
+    ) -> Result<PassiveLivenessScore, InferenceError> {
+        extract_passive_liveness_output(&self.manifest, &self.compatibility_sha256, outputs)
+    }
+}
+
+fn extract_embedding_output(
+    manifest: &ModelManifest,
+    compatibility_sha256: &str,
+    outputs: &[OutputTensor],
+) -> Result<FaceEmbedding, InferenceError> {
+    if manifest.role != ModelRole::FaceEmbedding {
+        return Err(InferenceError::ModelRoleMismatch);
+    }
+    let contract = semantic_output(manifest, OutputSemantic::Embedding)?;
+    let output = exact_output(outputs, &contract.name, &contract.dimensions)?;
+    if !(32..=4096).contains(&output.values.len()) {
+        return Err(InferenceError::EmbeddingInvalid);
+    }
+    let squared_norm = output.values.iter().try_fold(0.0_f32, |sum, value| {
+        let next = value.mul_add(*value, sum);
+        next.is_finite().then_some(next).ok_or(InferenceError::EmbeddingInvalid)
+    })?;
+    let norm = squared_norm.sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        return Err(InferenceError::EmbeddingInvalid);
+    }
+    let values =
+        Zeroizing::new(output.values.iter().map(|value| value / norm).collect::<Vec<f32>>());
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(InferenceError::EmbeddingInvalid);
+    }
+    Ok(FaceEmbedding { compatibility_sha256: compatibility_sha256.to_owned(), values })
+}
+
+fn extract_passive_liveness_output(
+    manifest: &ModelManifest,
+    compatibility_sha256: &str,
+    outputs: &[OutputTensor],
+) -> Result<PassiveLivenessScore, InferenceError> {
+    if !matches!(
+        manifest.role,
+        ModelRole::PassiveLivenessInfrared
+            | ModelRole::PassiveLivenessVisible
+            | ModelRole::PassiveLivenessFusion
+    ) {
+        return Err(InferenceError::ModelRoleMismatch);
+    }
+    let contract = semantic_output(manifest, OutputSemantic::LiveProbability)?;
+    let output = exact_output(outputs, &contract.name, &contract.dimensions)?;
+    let [probability] = output.values.as_slice() else {
+        return Err(InferenceError::PassiveLivenessOutputInvalid);
+    };
+    if !probability.is_finite() || !(0.0..=1.0).contains(probability) {
+        return Err(InferenceError::PassiveLivenessOutputInvalid);
+    }
+    Ok(PassiveLivenessScore {
+        role: manifest.role,
+        compatibility_sha256: compatibility_sha256.to_owned(),
+        probability: *probability,
+    })
+}
+
+fn semantic_output(
+    manifest: &ModelManifest,
+    semantic: OutputSemantic,
+) -> Result<&faceauth_model::OutputContract, InferenceError> {
+    let mut matching = manifest.outputs.iter().filter(|output| output.semantic == semantic);
+    let output = matching.next().ok_or(InferenceError::ModelRoleMismatch)?;
+    if matching.next().is_some() {
+        return Err(InferenceError::ModelRoleMismatch);
+    }
+    Ok(output)
+}
+
+fn exact_output<'a>(
+    outputs: &'a [OutputTensor],
+    name: &str,
+    dimensions: &[u32],
+) -> Result<&'a OutputTensor, InferenceError> {
+    let mut matching = outputs.iter().filter(|output| output.name == name);
+    let output = matching.next().ok_or(InferenceError::OutputTensorInvalid)?;
+    if matching.next().is_some() || output.dimensions != dimensions {
+        Err(InferenceError::OutputTensorInvalid)
+    } else {
+        Ok(output)
     }
 }
 
@@ -643,6 +876,21 @@ pub enum InferenceError {
     /// The inference deadline watchdog terminated unexpectedly.
     #[error("inference watchdog thread terminated unexpectedly")]
     WatchdogPanicked,
+    /// A role-specific adapter was requested from a different model role.
+    #[error("model role does not match the requested biometric adapter")]
+    ModelRoleMismatch,
+    /// Face embedding is empty, excessive, degenerate, or numerically invalid.
+    #[error("face embedding output is invalid")]
+    EmbeddingInvalid,
+    /// Stored and observed embeddings were produced by incompatible contracts.
+    #[error("face embeddings are incompatible")]
+    EmbeddingIncompatible,
+    /// Passive liveness output is not one finite scalar probability in 0..=1.
+    #[error("passive liveness output is invalid")]
+    PassiveLivenessOutputInvalid,
+    /// Passive liveness threshold is not finite or outside 0..=1.
+    #[error("passive liveness threshold must be finite and in 0..=1")]
+    InvalidProbabilityThreshold,
     /// Model manifest or digest verification failed.
     #[error("model admission failed: {0}")]
     Model(#[from] faceauth_model::ModelError),
@@ -657,7 +905,9 @@ pub enum InferenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faceauth_model::{ChannelNormalization, ResizeFilter};
+    use faceauth_model::{
+        ChannelNormalization, MODEL_MANIFEST_SCHEMA_VERSION, OutputContract, ResizeFilter,
+    };
 
     fn input_contract(
         width: u32,
@@ -679,6 +929,29 @@ mod tests {
                 scale: vec![1.0 / 255.0; usize::from(channels)],
                 bias: vec![0.0; usize::from(channels)],
             },
+        }
+    }
+
+    fn model_manifest(
+        role: ModelRole,
+        semantic: OutputSemantic,
+        dimensions: Vec<u32>,
+    ) -> ModelManifest {
+        ModelManifest {
+            schema_version: MODEL_MANIFEST_SCHEMA_VERSION,
+            name: "test-model".to_owned(),
+            version: "1".to_owned(),
+            role,
+            source_url: "https://example.invalid/model".to_owned(),
+            license_spdx: "Apache-2.0".to_owned(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            input: input_contract(1, 1, TensorLayout::Nchw, ColorSpace::Rgb),
+            outputs: vec![OutputContract {
+                name: "output".to_owned(),
+                dimensions,
+                element_type: ManifestElementType::Float32,
+                semantic,
+            }],
         }
     }
 
@@ -814,6 +1087,93 @@ mod tests {
                 ImageView { width: 2, height: 1, format: ImageFormat::Yuyv, bytes: &[0; 3] }
             ),
             Err(InferenceError::SourceImageInvalid)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_adapter_normalizes_and_binds_compatibility() -> Result<(), InferenceError> {
+        let manifest =
+            model_manifest(ModelRole::FaceEmbedding, OutputSemantic::Embedding, vec![1, 32]);
+        let outputs = vec![OutputTensor {
+            name: "output".to_owned(),
+            dimensions: vec![1, 32],
+            values: Zeroizing::new(vec![1.0; 32]),
+        }];
+        let first = extract_embedding_output(&manifest, "compatibility-a", &outputs)?;
+        let second = extract_embedding_output(&manifest, "compatibility-a", &outputs)?;
+        assert!(
+            (first.values().iter().map(|value| value * value).sum::<f32>() - 1.0).abs() < 1.0e-5
+        );
+        assert!((first.similarity(&second)? - 1.0).abs() < 1.0e-6);
+
+        let incompatible = extract_embedding_output(&manifest, "compatibility-b", &outputs)?;
+        assert!(matches!(
+            first.similarity(&incompatible),
+            Err(InferenceError::EmbeddingIncompatible)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_adapter_rejects_degenerate_vectors() {
+        let manifest =
+            model_manifest(ModelRole::FaceEmbedding, OutputSemantic::Embedding, vec![1, 32]);
+        let outputs = vec![OutputTensor {
+            name: "output".to_owned(),
+            dimensions: vec![1, 32],
+            values: Zeroizing::new(vec![0.0; 32]),
+        }];
+        assert!(matches!(
+            extract_embedding_output(&manifest, "compatibility", &outputs),
+            Err(InferenceError::EmbeddingInvalid)
+        ));
+    }
+
+    #[test]
+    fn stored_embedding_requires_unit_norm_and_digest() -> Result<(), InferenceError> {
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut normalized = vec![0.0; 32];
+        normalized[0] = 1.0;
+        let restored = FaceEmbedding::from_normalized_template(digest, &normalized)?;
+        assert_eq!(restored.compatibility_sha256(), digest);
+
+        normalized[0] = 0.5;
+        assert!(matches!(
+            FaceEmbedding::from_normalized_template(digest, &normalized),
+            Err(InferenceError::EmbeddingInvalid)
+        ));
+        assert!(matches!(
+            FaceEmbedding::from_normalized_template("not-a-digest", &[1.0; 32]),
+            Err(InferenceError::EmbeddingInvalid)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn passive_liveness_adapter_requires_scalar_probability() -> Result<(), InferenceError> {
+        let manifest = model_manifest(
+            ModelRole::PassiveLivenessInfrared,
+            OutputSemantic::LiveProbability,
+            vec![1],
+        );
+        let valid = vec![OutputTensor {
+            name: "output".to_owned(),
+            dimensions: vec![1],
+            values: Zeroizing::new(vec![0.8]),
+        }];
+        let score = extract_passive_liveness_output(&manifest, "compatibility", &valid)?;
+        assert!(score.passes(0.75)?);
+        assert!(!score.passes(0.85)?);
+
+        let invalid = vec![OutputTensor {
+            name: "output".to_owned(),
+            dimensions: vec![1],
+            values: Zeroizing::new(vec![1.1]),
+        }];
+        assert!(matches!(
+            extract_passive_liveness_output(&manifest, "compatibility", &invalid),
+            Err(InferenceError::PassiveLivenessOutputInvalid)
         ));
         Ok(())
     }

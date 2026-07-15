@@ -20,8 +20,8 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 5. `faceauth-session`: one-shot connection-bound transaction lifecycle and deadlines.
 6. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
 7. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
-8. `faceauth-model`: bounded schema-v3 provenance, digest, preprocessing, and exact
-   tensor-contract admission.
+8. `faceauth-model`: bounded schema-v4 provenance, digest, preprocessing, semantic
+   output roles, and exact tensor-contract admission.
 9. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
    whose graph I/O must exactly match an admitted manifest.
 10. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
@@ -59,13 +59,24 @@ The runtime is selected by an explicit trusted local path and is never downloade
 by the service. Production artifacts and their containing directories must be
 root-owned and immutable to non-root users. Sessions are CPU-bound and sequential
 with fixed thread, model-size, tensor-rank, and tensor-element ceilings. The graph
-must expose exactly the input and outputs declared by its schema-v3 manifest.
+must expose exactly the input and outputs declared by its schema-v4 manifest.
 The manifest also fixes bilinear half-pixel resizing, channel order, and per-channel
 affine normalization. Tightly packed Gray8/RGB8/BGR8/YUYV sources are converted
 into zeroizing float buffers; copied outputs are shape-checked, finite-only, and
 zeroized on drop. A per-run watchdog requests ONNX Runtime cancellation at a hard
 configured ceiling, while future worker-process isolation will provide a stronger
 kill boundary for runtimes that do not promptly honor termination.
+
+Role adapters are fail-closed. Face embeddings are bounded, finite, non-degenerate,
+L2-normalized, and compared only when their complete manifest compatibility digest
+and dimension match. Passive-PAD adapters accept only a semantic scalar live
+probability; model-specific calibrated thresholds remain outside the generic
+runtime and have no production defaults.
+
+The daemon is the bridge between inference and encrypted storage: enrollment can
+construct a template only from a normalized `FaceEmbedding`, and authentication
+reconstructs an enrolled comparison vector only after the authenticated record's
+schema, unit norm, compatibility digest, and dimension match the active session.
 
 Landmark models provide bounded eye-openness, yaw, and face-count measurements to
 the active-challenge state machine. They do not decide challenge success. The

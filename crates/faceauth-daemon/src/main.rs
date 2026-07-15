@@ -188,7 +188,7 @@ fn main() -> Result<()> {
         }
         Command::Serve => {
             info!(
-                "service start refused: inference, passive PAD, active-liveness integration, and enrollment are incomplete"
+                "service start refused: audited models, calibrated passive PAD orchestration, active-liveness orchestration, and enrollment are incomplete"
             );
             anyhow::bail!("faceauth-daemon is not production-ready")
         }

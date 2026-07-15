@@ -1,7 +1,7 @@
 # Model acceptance policy
 
 No model weights are bundled or downloaded merely because they are technically
-compatible with ONNX Runtime. Every artifact must have a schema-v3 reviewed
+compatible with ONNX Runtime. Every artifact must have a schema-v4 reviewed
 manifest with an HTTPS provenance URL, valid SPDX license expression, exact
 SHA-256 digest, pipeline role, and exact static input and output contracts.
 
@@ -9,8 +9,10 @@ The initial runtime admits exactly one fixed-shape float32 input and a bounded,
 non-empty list of fixed-shape float32 outputs. Tensor names, ranks, dimensions,
 and element counts are bounded. Dynamic dimensions, unexpected graph inputs or
 outputs, duplicate outputs, and name/type/shape mismatches fail closed.
-Schema v3 additionally binds the resize filter and finite per-channel affine
-normalization (`pixel * scale + bias`) to the model and its calibration record.
+Schema v4 binds the resize filter, finite per-channel affine normalization
+(`pixel * scale + bias`), and security-relevant output semantics to the model and
+its calibration record. Embedding roles require exactly one bounded embedding
+output; passive-PAD roles require exactly one scalar live-probability output.
 
 ## Intended pipeline
 
@@ -60,6 +62,14 @@ or YUYV bytes. It uses schema-bound bilinear half-pixel resizing, explicit chann
 order, and affine normalization. Input and copied output float buffers are
 zeroized on drop, and non-finite runtime outputs fail closed. MJPEG must be decoded
 by a separately bounded decoder before this boundary and is not accepted directly.
+
+The embedding adapter rejects degenerate vectors and L2-normalizes accepted model
+outputs before enrollment or comparison. Cosine similarity is mapped from
+`[-1, 1]` to `[0, 1]` for the core policy. Persisted templates are accepted only
+when already unit-normalized and when their complete manifest compatibility digest
+and dimension exactly match the active embedding session. Passive-PAD values are
+not inferred from arbitrary tensors: only a schema-tagged scalar probability in
+`[0, 1]` is admitted, and thresholds must come from explicit calibration.
 
 Landmark output used by active liveness is an input to the independently tested
 challenge state machine, not a terminal authentication decision. Eye-openness

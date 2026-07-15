@@ -26,7 +26,10 @@ use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"FAT1";
-const FORMAT_VERSION: u16 = 1;
+/// Current encrypted template record schema and container version.
+pub const TEMPLATE_RECORD_SCHEMA_VERSION: u16 = 2;
+
+const FORMAT_VERSION: u16 = TEMPLATE_RECORD_SCHEMA_VERSION;
 const NONCE_LENGTH: usize = 24;
 const HEADER_LENGTH: usize = MAGIC.len() + std::mem::size_of::<u16>() + NONCE_LENGTH;
 const MAX_CIPHERTEXT_LENGTH: usize = 1024 * 1024;
@@ -165,8 +168,8 @@ pub struct TemplateRecord {
     pub schema_version: u16,
     /// Account UID this record belongs to.
     pub uid: u32,
-    /// Lowercase SHA-256 digest of the embedding model and preprocessing contract.
-    pub model_sha256: String,
+    /// Lowercase SHA-256 compatibility digest of the complete embedding manifest.
+    pub model_compatibility_sha256: String,
     /// Derived face embedding; never a raw image.
     pub embedding: Vec<f32>,
 }
@@ -180,14 +183,41 @@ impl TemplateRecord {
     /// embedding values are invalid.
     pub fn validate(&self) -> Result<(), StorageError> {
         if self.schema_version != FORMAT_VERSION
-            || self.model_sha256.len() != 64
-            || !self.model_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || self.model_sha256.bytes().any(|byte| byte.is_ascii_uppercase())
+            || self.model_compatibility_sha256.len() != 64
+            || !self.model_compatibility_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || self.model_compatibility_sha256.bytes().any(|byte| byte.is_ascii_uppercase())
             || self.embedding.is_empty()
             || self.embedding.len() > MAX_EMBEDDING_DIMENSION
             || self.embedding.iter().any(|value| !value.is_finite())
         {
             return Err(StorageError::InvalidRecord("template bounds or digest are invalid"));
+        }
+        let squared_norm = self.embedding.iter().try_fold(0.0_f32, |sum, value| {
+            let next = value.mul_add(*value, sum);
+            next.is_finite().then_some(next)
+        });
+        if squared_norm.is_none_or(|value| (value.sqrt() - 1.0).abs() > 1.0e-3) {
+            return Err(StorageError::InvalidRecord("template embedding is not normalized"));
+        }
+        Ok(())
+    }
+
+    /// Require this template to match an active embedding manifest and dimension.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IncompatibleTemplate`] when the compatibility digest or embedding
+    /// dimension differs.
+    pub fn require_compatibility(
+        &self,
+        compatibility_sha256: &str,
+        dimension: usize,
+    ) -> Result<(), StorageError> {
+        self.validate()?;
+        if self.model_compatibility_sha256 != compatibility_sha256
+            || self.embedding.len() != dimension
+        {
+            return Err(StorageError::IncompatibleTemplate);
         }
         Ok(())
     }
@@ -407,6 +437,9 @@ pub enum StorageError {
     /// A record or encrypted container is invalid.
     #[error("invalid template record: {0}")]
     InvalidRecord(&'static str),
+    /// Template was produced by a different model contract or embedding dimension.
+    #[error("template is incompatible with the active embedding model contract")]
+    IncompatibleTemplate,
     /// JSON encoding or decoding failed.
     #[error("template serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -455,9 +488,9 @@ mod tests {
         TemplateRecord {
             schema_version: FORMAT_VERSION,
             uid,
-            model_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_owned(),
-            embedding: vec![0.1, -0.2, 0.3],
+            model_compatibility_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            embedding: vec![1.0, 0.0, 0.0],
         }
     }
 
@@ -545,5 +578,30 @@ mod tests {
         assert!(matches!(store.load(1000), Err(StorageError::UnsafePermissions { .. })));
         let _ = fs::remove_dir_all(directory);
         Ok(())
+    }
+
+    #[test]
+    fn template_requires_exact_model_contract_and_dimension() -> Result<(), StorageError> {
+        let template = record(1000);
+        template.require_compatibility(&template.model_compatibility_sha256, 3)?;
+        assert!(matches!(
+            template.require_compatibility(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                3
+            ),
+            Err(StorageError::IncompatibleTemplate)
+        ));
+        assert!(matches!(
+            template.require_compatibility(&template.model_compatibility_sha256, 512),
+            Err(StorageError::IncompatibleTemplate)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn non_normalized_templates_are_rejected() {
+        let mut template = record(1000);
+        template.embedding = vec![0.5, 0.0, 0.0];
+        assert!(matches!(template.validate(), Err(StorageError::InvalidRecord(_))));
     }
 }

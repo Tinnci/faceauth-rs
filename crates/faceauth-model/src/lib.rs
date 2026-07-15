@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 3;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 4;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -147,6 +147,20 @@ pub struct OutputContract {
     pub dimensions: Vec<u32>,
     /// Required tensor element type.
     pub element_type: TensorElementType,
+    /// Machine-checked meaning consumed by a role-specific adapter.
+    pub semantic: OutputSemantic,
+}
+
+/// Security-relevant meaning of one model output.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputSemantic {
+    /// Face embedding vector used only by the embedding adapter.
+    Embedding,
+    /// Scalar probability that the observation is live, in the inclusive range 0..=1.
+    LiveProbability,
+    /// Bounded output retained for a future reviewed role-specific adapter.
+    Auxiliary,
 }
 
 /// Auditable metadata required before a model can enter the inference pipeline.
@@ -252,7 +266,25 @@ impl ModelManifest {
                 return Err(ModelError::DuplicateOutputName { name: output.name.clone() });
             }
         }
+        validate_output_semantics(self.role, &self.outputs)?;
         Ok(())
+    }
+
+    /// Compute the compatibility identity for templates and calibrated thresholds.
+    ///
+    /// The digest covers the complete validated manifest, including the ONNX hash, role,
+    /// preprocessing, exact graph contract, and output semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError`] when the manifest is invalid or cannot be serialized.
+    pub fn compatibility_sha256(&self) -> Result<String, ModelError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(self)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"faceauth-model-compatibility-v1\0");
+        hasher.update(encoded);
+        Ok(hex_lower(&hasher.finalize()))
     }
 
     /// Verify a model file against this manifest.
@@ -346,6 +378,9 @@ pub enum ModelError {
         /// Repeated output name.
         name: String,
     },
+    /// Output semantic tags do not match the assigned model role.
+    #[error("model output semantics do not match its role")]
+    OutputSemanticMismatch,
     /// The model path did not resolve to a regular file.
     #[error("model artifact is not a regular file")]
     NotRegularFile,
@@ -360,6 +395,9 @@ pub enum ModelError {
     /// The model artifact could not be opened or read.
     #[error("unable to read model artifact: {0}")]
     Io(#[from] io::Error),
+    /// Manifest compatibility serialization failed.
+    #[error("unable to serialize model compatibility contract: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 fn validate_label(field: &'static str, value: &str) -> Result<(), ModelError> {
@@ -393,6 +431,45 @@ fn validate_dimensions(dimensions: &[u32]) -> Result<(), ModelError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_output_semantics(
+    role: ModelRole,
+    outputs: &[OutputContract],
+) -> Result<(), ModelError> {
+    let embedding_outputs =
+        outputs.iter().filter(|output| output.semantic == OutputSemantic::Embedding).count();
+    let live_outputs =
+        outputs.iter().filter(|output| output.semantic == OutputSemantic::LiveProbability).count();
+    match role {
+        ModelRole::FaceEmbedding if embedding_outputs == 1 && live_outputs == 0 => {}
+        ModelRole::PassiveLivenessInfrared
+        | ModelRole::PassiveLivenessVisible
+        | ModelRole::PassiveLivenessFusion
+            if live_outputs == 1 && embedding_outputs == 0 => {}
+        ModelRole::FaceDetector | ModelRole::FaceLandmarks
+            if embedding_outputs == 0 && live_outputs == 0 => {}
+        _ => return Err(ModelError::OutputSemanticMismatch),
+    }
+    for output in outputs {
+        match output.semantic {
+            OutputSemantic::Embedding => {
+                let elements = dimension_product(&output.dimensions)?;
+                let valid_shape = matches!(output.dimensions.as_slice(), [dimension] if *dimension >= 32 && *dimension <= 4096)
+                    || matches!(output.dimensions.as_slice(), [1, dimension] if *dimension >= 32 && *dimension <= 4096);
+                if !valid_shape || !(32..=4096).contains(&elements) {
+                    return Err(ModelError::OutputSemanticMismatch);
+                }
+            }
+            OutputSemantic::LiveProbability => {
+                if dimension_product(&output.dimensions)? != 1 {
+                    return Err(ModelError::OutputSemanticMismatch);
+                }
+            }
+            OutputSemantic::Auxiliary => {}
+        }
+    }
+    Ok(())
 }
 
 fn dimension_product(dimensions: &[u32]) -> Result<u64, ModelError> {
@@ -448,6 +525,7 @@ mod tests {
                 name: "boxes".to_owned(),
                 dimensions: vec![1, 100, 4],
                 element_type: TensorElementType::Float32,
+                semantic: OutputSemantic::Auxiliary,
             }],
         }
     }
@@ -505,6 +583,7 @@ mod tests {
                 name: format!("output-{index}"),
                 dimensions: vec![u32::try_from(MAX_TENSOR_ELEMENTS / 2 + 1).unwrap_or(u32::MAX)],
                 element_type: TensorElementType::Float32,
+                semantic: OutputSemantic::Auxiliary,
             })
             .collect();
         assert!(matches!(excessive_total.validate(), Err(ModelError::InvalidTensorDimensions)));
@@ -534,5 +613,36 @@ mod tests {
         let mut zero_scale = manifest();
         zero_scale.input.normalization.scale[0] = 0.0;
         assert!(matches!(zero_scale.validate(), Err(ModelError::InvalidNormalization)));
+    }
+
+    #[test]
+    fn role_requires_matching_output_semantics() {
+        let mut embedding = manifest();
+        embedding.role = ModelRole::FaceEmbedding;
+        assert!(matches!(embedding.validate(), Err(ModelError::OutputSemanticMismatch)));
+        embedding.outputs[0].semantic = OutputSemantic::Embedding;
+        embedding.outputs[0].dimensions = vec![1, 128];
+        assert!(embedding.validate().is_ok());
+
+        let mut passive = manifest();
+        passive.role = ModelRole::PassiveLivenessInfrared;
+        passive.outputs[0].semantic = OutputSemantic::LiveProbability;
+        passive.outputs[0].dimensions = vec![1];
+        assert!(passive.validate().is_ok());
+    }
+
+    #[test]
+    fn compatibility_digest_covers_preprocessing_and_semantics() -> Result<(), ModelError> {
+        let original = manifest();
+        let original_digest = original.compatibility_sha256()?;
+
+        let mut changed_normalization = original.clone();
+        changed_normalization.input.normalization.bias[0] = 1.0;
+        assert_ne!(changed_normalization.compatibility_sha256()?, original_digest);
+
+        let mut changed_output = original;
+        changed_output.outputs[0].name = "different".to_owned();
+        assert_ne!(changed_output.compatibility_sha256()?, original_digest);
+        Ok(())
     }
 }

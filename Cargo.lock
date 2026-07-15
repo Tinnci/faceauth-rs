@@ -419,6 +419,7 @@ dependencies = [
  "faceauth-camera",
  "faceauth-capture",
  "faceauth-core",
+ "faceauth-inference",
  "faceauth-protocol",
  "faceauth-session",
  "faceauth-storage",
@@ -455,6 +456,7 @@ name = "faceauth-model"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sha2",
  "spdx",
  "thiserror",

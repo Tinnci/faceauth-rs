@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Policy => println!("{}", serde_json::to_string_pretty(&AuthPolicy::default())?),
         Command::Enroll => anyhow::bail!(
-            "enrollment is disabled until encrypted template storage and liveness are implemented"
+            "enrollment is disabled until an audited model suite, calibrated PAD, and the authorized enrollment transaction are integrated"
         ),
     }
     Ok(())

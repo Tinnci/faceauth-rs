@@ -11,8 +11,15 @@ visible-light frames are not representable in the stored template schema.
 - Files are written with mode `0600`, synced, and atomically renamed.
 - Symbolic links and group/other-readable template or key files are rejected.
 - Secret keys, decrypted JSON, and embedding vectors are zeroized on drop.
-- Record dimensions, finite floating-point values, model hashes, and file sizes
-  are bounded before use.
+- Record dimensions, finite floating-point values, unit embedding norm, complete
+  model-manifest compatibility digests, and file sizes are bounded before use.
+
+Template format version 2 stores a compatibility SHA-256 over the validated
+embedding manifest, not merely the ONNX file hash. This binds the role, model hash,
+input preprocessing, exact tensor contracts, and semantic output tag. Loading for
+comparison additionally requires the active digest and embedding dimension to
+match exactly; incompatible templates fail closed and must be explicitly
+re-enrolled rather than silently migrated or renormalized.
 
 ## TPM backend
 

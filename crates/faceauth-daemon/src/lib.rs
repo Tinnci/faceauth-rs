@@ -3,10 +3,54 @@
 use faceauth_authz::{
     AuthorizationError, AuthorizationPolicy, ExecutableError, VerifiedExecutable,
 };
+use faceauth_inference::{FaceEmbedding, InferenceError};
 use faceauth_protocol::{RejectionCode, Request, Response};
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
+use faceauth_storage::{StorageError, TEMPLATE_RECORD_SCHEMA_VERSION, TemplateRecord};
 use faceauth_transport::{PeerStream, TransportError};
 use thiserror::Error;
+
+/// Build the only persistable enrollment payload from a normalized derived embedding.
+///
+/// Raw images are not accepted or represented by this boundary.
+#[must_use]
+pub fn template_from_embedding(uid: u32, embedding: &FaceEmbedding) -> TemplateRecord {
+    TemplateRecord {
+        schema_version: TEMPLATE_RECORD_SCHEMA_VERSION,
+        uid,
+        model_compatibility_sha256: embedding.compatibility_sha256().to_owned(),
+        embedding: embedding.values().to_vec(),
+    }
+}
+
+/// Compare an observed embedding against one authenticated encrypted template record.
+///
+/// # Errors
+///
+/// Returns [`BiometricComparisonError`] when the template is malformed, incompatible with the
+/// active model contract, or cannot be reconstructed as a normalized embedding.
+pub fn compare_template(
+    template: &TemplateRecord,
+    observed: &FaceEmbedding,
+) -> Result<f32, BiometricComparisonError> {
+    template.require_compatibility(observed.compatibility_sha256(), observed.values().len())?;
+    let enrolled = FaceEmbedding::from_normalized_template(
+        &template.model_compatibility_sha256,
+        &template.embedding,
+    )?;
+    Ok(observed.similarity(&enrolled)?)
+}
+
+/// Failure while bridging encrypted templates into role-bound inference evidence.
+#[derive(Debug, Error)]
+pub enum BiometricComparisonError {
+    /// Encrypted template validation or compatibility check failed.
+    #[error("template comparison storage check failed: {0}")]
+    Storage(#[from] StorageError),
+    /// Embedding reconstruction or similarity calculation failed.
+    #[error("template comparison inference check failed: {0}")]
+    Inference(#[from] InferenceError),
+}
 
 /// Decodes and admits requests through executable verification, authorization, and session state.
 pub struct BoundaryService {
@@ -132,6 +176,36 @@ mod tests {
     use faceauth_transport::TransportConfig;
 
     use super::*;
+
+    fn test_embedding(digest_byte: u8) -> Result<FaceEmbedding, InferenceError> {
+        let digest = format!("{digest_byte:02x}").repeat(32);
+        let mut values = vec![0.0; 32];
+        values[0] = 1.0;
+        FaceEmbedding::from_normalized_template(&digest, &values)
+    }
+
+    #[test]
+    fn enrollment_template_round_trips_into_compatible_comparison()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let observed = test_embedding(0xaa)?;
+        let template = template_from_embedding(1000, &observed);
+        template.validate()?;
+        assert_eq!(template.uid, 1000);
+        assert!((compare_template(&template, &observed)? - 1.0).abs() < 1.0e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn comparison_rejects_a_different_manifest_digest() -> Result<(), Box<dyn std::error::Error>> {
+        let enrolled = test_embedding(0xaa)?;
+        let observed = test_embedding(0xbb)?;
+        let template = template_from_embedding(1000, &enrolled);
+        assert!(matches!(
+            compare_template(&template, &observed),
+            Err(BiometricComparisonError::Storage(StorageError::IncompatibleTemplate))
+        ));
+        Ok(())
+    }
 
     #[test]
     fn untrusted_development_executable_fails_before_session_start()
