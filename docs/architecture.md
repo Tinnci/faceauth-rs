@@ -20,7 +20,7 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 5. `faceauth-session`: one-shot connection-bound transaction lifecycle and deadlines.
 6. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
 7. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
-8. `faceauth-model`: bounded schema-v2 provenance, digest, preprocessing, and exact
+8. `faceauth-model`: bounded schema-v3 provenance, digest, preprocessing, and exact
    tensor-contract admission.
 9. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
    whose graph I/O must exactly match an admitted manifest.
@@ -59,7 +59,13 @@ The runtime is selected by an explicit trusted local path and is never downloade
 by the service. Production artifacts and their containing directories must be
 root-owned and immutable to non-root users. Sessions are CPU-bound and sequential
 with fixed thread, model-size, tensor-rank, and tensor-element ceilings. The graph
-must expose exactly the input and outputs declared by its schema-v2 manifest.
+must expose exactly the input and outputs declared by its schema-v3 manifest.
+The manifest also fixes bilinear half-pixel resizing, channel order, and per-channel
+affine normalization. Tightly packed Gray8/RGB8/BGR8/YUYV sources are converted
+into zeroizing float buffers; copied outputs are shape-checked, finite-only, and
+zeroized on drop. A per-run watchdog requests ONNX Runtime cancellation at a hard
+configured ceiling, while future worker-process isolation will provide a stronger
+kill boundary for runtimes that do not promptly honor termination.
 
 Landmark models provide bounded eye-openness, yaw, and face-count measurements to
 the active-challenge state machine. They do not decide challenge success. The

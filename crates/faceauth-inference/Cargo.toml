@@ -10,6 +10,7 @@ repository.workspace = true
 faceauth-model = { path = "../faceauth-model", version = "0.1.0" }
 ort.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

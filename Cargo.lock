@@ -437,6 +437,7 @@ dependencies = [
  "faceauth-model",
  "ort",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

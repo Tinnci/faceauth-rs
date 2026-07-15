@@ -9,6 +9,10 @@ Frame bytes are copied only into an ephemeral `Zeroizing<Vec<u8>>`. Diagnostics
 serialize metadata but never pixels, decoded images, embeddings, or templates.
 Production preprocessing and inference must borrow these bytes and must not
 persist them.
+The inference boundary directly accepts tightly packed GREY and YUYV observations;
+it performs schema-bound bilinear resizing, color conversion, and normalization
+into a separate zeroizing float tensor. MJPEG remains diagnostics-only until a
+separately memory/time-bounded decoder is admitted.
 
 ## Stable camera selection
 

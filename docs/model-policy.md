@@ -1,7 +1,7 @@
 # Model acceptance policy
 
 No model weights are bundled or downloaded merely because they are technically
-compatible with ONNX Runtime. Every artifact must have a schema-v2 reviewed
+compatible with ONNX Runtime. Every artifact must have a schema-v3 reviewed
 manifest with an HTTPS provenance URL, valid SPDX license expression, exact
 SHA-256 digest, pipeline role, and exact static input and output contracts.
 
@@ -9,6 +9,8 @@ The initial runtime admits exactly one fixed-shape float32 input and a bounded,
 non-empty list of fixed-shape float32 outputs. Tensor names, ranks, dimensions,
 and element counts are bounded. Dynamic dimensions, unexpected graph inputs or
 outputs, duplicate outputs, and name/type/shape mismatches fail closed.
+Schema v3 additionally binds the resize filter and finite per-channel affine
+normalization (`pixel * scale + bias`) to the model and its calibration record.
 
 ## Intended pipeline
 
@@ -47,9 +49,17 @@ every containing directory must be root-owned and not group/world writable. The
 model is canonicalized, permission-checked, size-bounded, and hash-verified before
 session creation. CPU sessions use sequential graph execution, one inter-op
 thread, a bounded intra-op thread count, memory-pattern planning, and ONNX Runtime
-optimization level 2. Runtime and model packaging remains a distribution/admin
+optimization level 2. Every call uses a bounded watchdog that requests ONNX Runtime
+termination at its configured deadline; stronger hard isolation remains future
+worker-process work. Runtime and model packaging remains a distribution/admin
 responsibility; the source tree intentionally contains no model weights or copied
 ONNX Runtime binary.
+
+Preprocessing accepts only tightly packed, dimension-bounded Gray8, RGB8, BGR8,
+or YUYV bytes. It uses schema-bound bilinear half-pixel resizing, explicit channel
+order, and affine normalization. Input and copied output float buffers are
+zeroized on drop, and non-finite runtime outputs fail closed. MJPEG must be decoded
+by a separately bounded decoder before this boundary and is not accepted directly.
 
 Landmark output used by active liveness is an input to the independently tested
 challenge state machine, not a terminal authentication decision. Eye-openness

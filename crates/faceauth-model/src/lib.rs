@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 2;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 3;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -30,6 +30,9 @@ pub const MAX_TENSOR_RANK: usize = 8;
 
 /// Maximum number of elements in one input or output tensor.
 pub const MAX_TENSOR_ELEMENTS: u64 = 64 * 1024 * 1024;
+
+/// Maximum aggregate elements across all declared output tensors.
+pub const MAX_TOTAL_OUTPUT_ELEMENTS: u64 = 64 * 1024 * 1024;
 
 /// Role a model serves in the biometric pipeline.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -79,8 +82,28 @@ pub enum TensorElementType {
     Float32,
 }
 
+/// Deterministic image resize operation admitted by the preprocessing boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResizeFilter {
+    /// Bilinear interpolation with half-pixel center coordinates and clamped edges.
+    BilinearHalfPixel,
+}
+
+/// Per-channel affine conversion from an 8-bit pixel to a model tensor value.
+///
+/// For channel `c`, preprocessing computes `pixel * scale[c] + bias[c]`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelNormalization {
+    /// Finite, non-zero multiplier for each input channel.
+    pub scale: Vec<f32>,
+    /// Finite offset for each input channel.
+    pub bias: Vec<f32>,
+}
+
 /// Static input tensor contract recorded with a model.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputContract {
     /// Exact ONNX graph input name.
@@ -97,6 +120,10 @@ pub struct InputContract {
     pub color_space: ColorSpace,
     /// Required tensor element type.
     pub element_type: TensorElementType,
+    /// Exact resize algorithm used when source dimensions differ.
+    pub resize_filter: ResizeFilter,
+    /// Exact per-channel conversion from 8-bit pixels to float32.
+    pub normalization: ChannelNormalization,
 }
 
 impl InputContract {
@@ -123,7 +150,7 @@ pub struct OutputContract {
 }
 
 /// Auditable metadata required before a model can enter the inference pipeline.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelManifest {
     /// Manifest schema version.
@@ -193,13 +220,34 @@ impl ModelManifest {
                 actual: self.input.channels,
             });
         }
+        let channel_count = usize::from(self.input.channels);
+        if self.input.normalization.scale.len() != channel_count
+            || self.input.normalization.bias.len() != channel_count
+            || self
+                .input
+                .normalization
+                .scale
+                .iter()
+                .any(|value| !value.is_finite() || *value == 0.0)
+            || self.input.normalization.bias.iter().any(|value| !value.is_finite())
+        {
+            return Err(ModelError::InvalidNormalization);
+        }
         validate_dimensions(&self.input.dimensions())?;
         if self.outputs.is_empty() || self.outputs.len() > MAX_OUTPUT_TENSORS {
             return Err(ModelError::InvalidOutputCount { actual: self.outputs.len() });
         }
+        let mut total_output_elements = 0_u64;
         for (index, output) in self.outputs.iter().enumerate() {
             validate_tensor_name(&output.name)?;
             validate_dimensions(&output.dimensions)?;
+            let output_elements = dimension_product(&output.dimensions)?;
+            total_output_elements = total_output_elements
+                .checked_add(output_elements)
+                .ok_or(ModelError::InvalidTensorDimensions)?;
+            if total_output_elements > MAX_TOTAL_OUTPUT_ELEMENTS {
+                return Err(ModelError::InvalidTensorDimensions);
+            }
             if self.outputs[..index].iter().any(|existing| existing.name == output.name) {
                 return Err(ModelError::DuplicateOutputName { name: output.name.clone() });
             }
@@ -277,6 +325,9 @@ pub enum ModelError {
         /// Manifest channel count.
         actual: u8,
     },
+    /// Normalization vectors must exactly match the channel count and contain finite values.
+    #[error("model input normalization is invalid")]
+    InvalidNormalization,
     /// Tensor name is empty, excessive, or contains unsupported bytes.
     #[error("model tensor name is invalid")]
     InvalidTensorName,
@@ -337,14 +388,18 @@ fn validate_dimensions(dimensions: &[u32]) -> Result<(), ModelError> {
     if dimensions.is_empty() || dimensions.len() > MAX_TENSOR_RANK || dimensions.contains(&0) {
         return Err(ModelError::InvalidTensorDimensions);
     }
-    let elements = dimensions
-        .iter()
-        .try_fold(1_u64, |product, dimension| product.checked_mul(u64::from(*dimension)));
-    if elements.is_none_or(|elements| elements > MAX_TENSOR_ELEMENTS) {
+    if dimension_product(dimensions)? > MAX_TENSOR_ELEMENTS {
         Err(ModelError::InvalidTensorDimensions)
     } else {
         Ok(())
     }
+}
+
+fn dimension_product(dimensions: &[u32]) -> Result<u64, ModelError> {
+    dimensions
+        .iter()
+        .try_fold(1_u64, |product, dimension| product.checked_mul(u64::from(*dimension)))
+        .ok_or(ModelError::InvalidTensorDimensions)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -383,6 +438,11 @@ mod tests {
                 layout: TensorLayout::Nchw,
                 color_space: ColorSpace::Rgb,
                 element_type: TensorElementType::Float32,
+                resize_filter: ResizeFilter::BilinearHalfPixel,
+                normalization: ChannelNormalization {
+                    scale: vec![1.0 / 255.0; 3],
+                    bias: vec![0.0; 3],
+                },
             },
             outputs: vec![OutputContract {
                 name: "boxes".to_owned(),
@@ -438,6 +498,16 @@ mod tests {
         let mut excessive_input = manifest();
         excessive_input.input.width = MAX_INPUT_DIMENSION + 1;
         assert!(matches!(excessive_input.validate(), Err(ModelError::InvalidInputDimensions)));
+
+        let mut excessive_total = manifest();
+        excessive_total.outputs = (0..2)
+            .map(|index| OutputContract {
+                name: format!("output-{index}"),
+                dimensions: vec![u32::try_from(MAX_TENSOR_ELEMENTS / 2 + 1).unwrap_or(u32::MAX)],
+                element_type: TensorElementType::Float32,
+            })
+            .collect();
+        assert!(matches!(excessive_total.validate(), Err(ModelError::InvalidTensorDimensions)));
     }
 
     #[test]
@@ -449,5 +519,20 @@ mod tests {
         let mut invalid_name = manifest();
         invalid_name.input.name = "bad name".to_owned();
         assert!(matches!(invalid_name.validate(), Err(ModelError::InvalidTensorName)));
+    }
+
+    #[test]
+    fn normalization_must_match_channels_and_be_finite() {
+        let mut wrong_count = manifest();
+        wrong_count.input.normalization.scale.pop();
+        assert!(matches!(wrong_count.validate(), Err(ModelError::InvalidNormalization)));
+
+        let mut non_finite = manifest();
+        non_finite.input.normalization.bias[0] = f32::NAN;
+        assert!(matches!(non_finite.validate(), Err(ModelError::InvalidNormalization)));
+
+        let mut zero_scale = manifest();
+        zero_scale.input.normalization.scale[0] = 0.0;
+        assert!(matches!(zero_scale.validate(), Err(ModelError::InvalidNormalization)));
     }
 }
