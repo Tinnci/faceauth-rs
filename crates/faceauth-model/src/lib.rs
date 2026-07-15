@@ -11,13 +11,25 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 1;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 2;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
 
 /// Maximum source URL length.
 pub const MAX_SOURCE_URL_LENGTH: usize = 2048;
+
+/// Maximum image dimension accepted by the static preprocessing contract.
+pub const MAX_INPUT_DIMENSION: u32 = 4096;
+
+/// Maximum number of declared output tensors.
+pub const MAX_OUTPUT_TENSORS: usize = 8;
+
+/// Maximum rank of one declared output tensor.
+pub const MAX_TENSOR_RANK: usize = 8;
+
+/// Maximum number of elements in one input or output tensor.
+pub const MAX_TENSOR_ELEMENTS: u64 = 64 * 1024 * 1024;
 
 /// Role a model serves in the biometric pipeline.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -59,10 +71,20 @@ pub enum ColorSpace {
     Bgr,
 }
 
-/// Static input tensor contract recorded with a model.
+/// Tensor element type admitted by the initial biometric runtime.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TensorElementType {
+    /// IEEE 754 single-precision floating point.
+    Float32,
+}
+
+/// Static input tensor contract recorded with a model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputContract {
+    /// Exact ONNX graph input name.
+    pub name: String,
     /// Input width in pixels.
     pub width: u32,
     /// Input height in pixels.
@@ -73,6 +95,31 @@ pub struct InputContract {
     pub layout: TensorLayout,
     /// Pixel channel interpretation.
     pub color_space: ColorSpace,
+    /// Required tensor element type.
+    pub element_type: TensorElementType,
+}
+
+impl InputContract {
+    /// Return the exact fixed batch-1 tensor shape.
+    #[must_use]
+    pub fn dimensions(&self) -> [u32; 4] {
+        match self.layout {
+            TensorLayout::Nchw => [1, u32::from(self.channels), self.height, self.width],
+            TensorLayout::Nhwc => [1, self.height, self.width, u32::from(self.channels)],
+        }
+    }
+}
+
+/// Exact fixed output tensor contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputContract {
+    /// Exact ONNX graph output name.
+    pub name: String,
+    /// Fixed tensor dimensions; dynamic outputs are not admitted.
+    pub dimensions: Vec<u32>,
+    /// Required tensor element type.
+    pub element_type: TensorElementType,
 }
 
 /// Auditable metadata required before a model can enter the inference pipeline.
@@ -95,6 +142,8 @@ pub struct ModelManifest {
     pub sha256: String,
     /// Static input tensor contract.
     pub input: InputContract,
+    /// Exact bounded output tensors expected from the graph.
+    pub outputs: Vec<OutputContract>,
 }
 
 impl ModelManifest {
@@ -126,7 +175,12 @@ impl ModelManifest {
         {
             return Err(ModelError::InvalidSha256);
         }
-        if self.input.width == 0 || self.input.height == 0 {
+        validate_tensor_name(&self.input.name)?;
+        if self.input.width == 0
+            || self.input.height == 0
+            || self.input.width > MAX_INPUT_DIMENSION
+            || self.input.height > MAX_INPUT_DIMENSION
+        {
             return Err(ModelError::InvalidInputDimensions);
         }
         let expected_channels = match self.input.color_space {
@@ -138,6 +192,17 @@ impl ModelManifest {
                 expected: expected_channels,
                 actual: self.input.channels,
             });
+        }
+        validate_dimensions(&self.input.dimensions())?;
+        if self.outputs.is_empty() || self.outputs.len() > MAX_OUTPUT_TENSORS {
+            return Err(ModelError::InvalidOutputCount { actual: self.outputs.len() });
+        }
+        for (index, output) in self.outputs.iter().enumerate() {
+            validate_tensor_name(&output.name)?;
+            validate_dimensions(&output.dimensions)?;
+            if self.outputs[..index].iter().any(|existing| existing.name == output.name) {
+                return Err(ModelError::DuplicateOutputName { name: output.name.clone() });
+            }
         }
         Ok(())
     }
@@ -201,8 +266,8 @@ pub enum ModelError {
     /// The digest is not 64 lowercase hexadecimal characters.
     #[error("model SHA-256 must be 64 lowercase hexadecimal characters")]
     InvalidSha256,
-    /// Width and height must both be positive.
-    #[error("model input dimensions must be positive")]
+    /// Width and height must be fixed and inside hard bounds.
+    #[error("model input dimensions are invalid or excessive")]
     InvalidInputDimensions,
     /// Channel count does not match the declared color space.
     #[error("model input has {actual} channels; declared color space requires {expected}")]
@@ -211,6 +276,24 @@ pub enum ModelError {
         expected: u8,
         /// Manifest channel count.
         actual: u8,
+    },
+    /// Tensor name is empty, excessive, or contains unsupported bytes.
+    #[error("model tensor name is invalid")]
+    InvalidTensorName,
+    /// Output tensor count must be bounded and non-zero.
+    #[error("model has invalid declared output count {actual}")]
+    InvalidOutputCount {
+        /// Actual declared output count.
+        actual: usize,
+    },
+    /// Tensor rank, dimensions, or element count is invalid.
+    #[error("model tensor dimensions are invalid or excessive")]
+    InvalidTensorDimensions,
+    /// Output names must be unique.
+    #[error("duplicate model output tensor name {name}")]
+    DuplicateOutputName {
+        /// Repeated output name.
+        name: String,
     },
     /// The model path did not resolve to a regular file.
     #[error("model artifact is not a regular file")]
@@ -234,6 +317,31 @@ fn validate_label(field: &'static str, value: &str) -> Result<(), ModelError> {
         || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
     {
         Err(ModelError::InvalidLabel { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_tensor_name(value: &str) -> Result<(), ModelError> {
+    if value.is_empty()
+        || value.len() > MAX_ARTIFACT_LABEL_LENGTH
+        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+-/:".contains(&byte))
+    {
+        Err(ModelError::InvalidTensorName)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_dimensions(dimensions: &[u32]) -> Result<(), ModelError> {
+    if dimensions.is_empty() || dimensions.len() > MAX_TENSOR_RANK || dimensions.contains(&0) {
+        return Err(ModelError::InvalidTensorDimensions);
+    }
+    let elements = dimensions
+        .iter()
+        .try_fold(1_u64, |product, dimension| product.checked_mul(u64::from(*dimension)));
+    if elements.is_none_or(|elements| elements > MAX_TENSOR_ELEMENTS) {
+        Err(ModelError::InvalidTensorDimensions)
     } else {
         Ok(())
     }
@@ -268,12 +376,19 @@ mod tests {
             license_spdx: "Apache-2.0".to_owned(),
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned(),
             input: InputContract {
+                name: "input".to_owned(),
                 width: 640,
                 height: 360,
                 channels: 3,
                 layout: TensorLayout::Nchw,
                 color_space: ColorSpace::Rgb,
+                element_type: TensorElementType::Float32,
             },
+            outputs: vec![OutputContract {
+                name: "boxes".to_owned(),
+                dimensions: vec![1, 100, 4],
+                element_type: TensorElementType::Float32,
+            }],
         }
     }
 
@@ -312,5 +427,27 @@ mod tests {
             manifest.validate(),
             Err(ModelError::InvalidChannelCount { expected: 1, actual: 3 })
         ));
+    }
+
+    #[test]
+    fn dynamic_or_excessive_tensor_contracts_are_rejected() {
+        let mut invalid_output = manifest();
+        invalid_output.outputs[0].dimensions = vec![0, 4];
+        assert!(matches!(invalid_output.validate(), Err(ModelError::InvalidTensorDimensions)));
+
+        let mut excessive_input = manifest();
+        excessive_input.input.width = MAX_INPUT_DIMENSION + 1;
+        assert!(matches!(excessive_input.validate(), Err(ModelError::InvalidInputDimensions)));
+    }
+
+    #[test]
+    fn tensor_names_and_outputs_are_bounded_and_unique() {
+        let mut duplicate_output = manifest();
+        duplicate_output.outputs.push(duplicate_output.outputs[0].clone());
+        assert!(matches!(duplicate_output.validate(), Err(ModelError::DuplicateOutputName { .. })));
+
+        let mut invalid_name = manifest();
+        invalid_name.input.name = "bad name".to_owned();
+        assert!(matches!(invalid_name.validate(), Err(ModelError::InvalidTensorName)));
     }
 }

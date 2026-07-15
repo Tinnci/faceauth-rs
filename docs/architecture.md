@@ -20,12 +20,16 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 5. `faceauth-session`: one-shot connection-bound transaction lifecycle and deadlines.
 6. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
 7. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
-8. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
+8. `faceauth-model`: bounded schema-v2 provenance, digest, preprocessing, and exact
+   tensor-contract admission.
+9. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
+   whose graph I/O must exactly match an admitted manifest.
+10. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
-9. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
+11. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
-10. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
-11. KDE KCM and lock-screen status UI: optional clients over stable APIs.
+12. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
+13. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
 The authentication transport contract is described in [ipc.md](ipc.md). Caller
 numeric peer identity comes from Unix peer credentials, not serialized request
@@ -50,6 +54,12 @@ provenance, hash, input normalization, and benchmark records before inclusion.
 The project will not implement a face-recognition network from scratch.
 The model admission and evaluation requirements are defined in
 [model-policy.md](model-policy.md).
+
+The runtime is selected by an explicit trusted local path and is never downloaded
+by the service. Production artifacts and their containing directories must be
+root-owned and immutable to non-root users. Sessions are CPU-bound and sequential
+with fixed thread, model-size, tensor-rank, and tensor-element ceilings. The graph
+must expose exactly the input and outputs declared by its schema-v2 manifest.
 
 Landmark models provide bounded eye-openness, yaw, and face-count measurements to
 the active-challenge state machine. They do not decide challenge success. The
