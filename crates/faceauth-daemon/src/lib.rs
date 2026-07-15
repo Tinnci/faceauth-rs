@@ -4,8 +4,14 @@ use faceauth_authz::{
     AuthorizationError, AuthorizationGrant, AuthorizationPolicy, ExecutableError,
     VerifiedExecutable,
 };
+use faceauth_core::{
+    AuthPolicy, AuthenticationDecision, AuthenticationEvidence, CapturePair, CheckStatus,
+    ObservationStatus, PolicyError,
+};
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
-use faceauth_inference::{FaceEmbedding, InferenceError};
+use faceauth_inference::{FaceEmbedding, InferenceError, PassiveLivenessScore};
+use faceauth_liveness::ChallengeProgress;
+use faceauth_model::ModelRole;
 use faceauth_protocol::{AuthenticationPurpose, RejectionCode, Request, Response};
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
 use faceauth_storage::{StorageError, TEMPLATE_RECORD_SCHEMA_VERSION, TemplateRecord};
@@ -84,6 +90,160 @@ pub enum BiometricComparisonError {
     Storage(#[from] StorageError),
     /// Embedding reconstruction or similarity calculation failed.
     #[error("template comparison inference check failed: {0}")]
+    Inference(#[from] InferenceError),
+}
+
+/// Exact passive presentation-attack model contracts and calibrated thresholds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PassivePadPolicy {
+    /// Compatibility digest for the reviewed IR PAD model.
+    pub infrared_compatibility_sha256: String,
+    /// Minimum calibrated IR live probability.
+    pub minimum_infrared_probability: f32,
+    /// Compatibility digest for the reviewed visible-light PAD model.
+    pub visible_compatibility_sha256: String,
+    /// Minimum calibrated visible-light live probability.
+    pub minimum_visible_probability: f32,
+    /// Optional required fusion model compatibility digest and minimum live probability.
+    pub fusion: Option<(String, f32)>,
+}
+
+impl PassivePadPolicy {
+    /// Validate all model identities and calibrated probability thresholds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthenticationPipelineError::InvalidPassivePadPolicy`] for malformed model
+    /// digests or non-finite/out-of-range thresholds.
+    pub fn validate(&self) -> Result<(), AuthenticationPipelineError> {
+        let valid = valid_digest(&self.infrared_compatibility_sha256)
+            && valid_probability(self.minimum_infrared_probability)
+            && valid_digest(&self.visible_compatibility_sha256)
+            && valid_probability(self.minimum_visible_probability)
+            && self.fusion.as_ref().is_none_or(|(digest, minimum)| {
+                valid_digest(digest) && valid_probability(*minimum)
+            });
+        if valid { Ok(()) } else { Err(AuthenticationPipelineError::InvalidPassivePadPolicy) }
+    }
+
+    fn accepts(
+        &self,
+        scores: &[PassiveLivenessScore],
+    ) -> Result<bool, AuthenticationPipelineError> {
+        self.validate()?;
+        let infrared = exact_pad_score(
+            scores,
+            ModelRole::PassiveLivenessInfrared,
+            &self.infrared_compatibility_sha256,
+        )?;
+        let visible = exact_pad_score(
+            scores,
+            ModelRole::PassiveLivenessVisible,
+            &self.visible_compatibility_sha256,
+        )?;
+        let fusion_passed = if let Some((digest, minimum)) = &self.fusion {
+            exact_pad_score(scores, ModelRole::PassiveLivenessFusion, digest)?.passes(*minimum)?
+        } else {
+            !scores.iter().any(|score| score.role() == ModelRole::PassiveLivenessFusion)
+        };
+        Ok(infrared.passes(self.minimum_infrared_probability)?
+            && visible.passes(self.minimum_visible_probability)?
+            && fusion_passed)
+    }
+}
+
+/// Ephemeral, derived evidence for one authentication policy evaluation.
+#[derive(Clone, Copy)]
+pub struct AuthenticationObservation<'a> {
+    /// Paired IR/visible monotonic capture timestamps.
+    pub timing: CapturePair,
+    /// Aggregate image/face quality in 0..=1.
+    pub quality: f32,
+    /// Role-bound normalized embedding from the current observation.
+    pub embedding: &'a FaceEmbedding,
+    /// Exact PAD outputs required by [`PassivePadPolicy`].
+    pub passive_liveness: &'a [PassiveLivenessScore],
+    /// Terminal state of the randomized active challenge.
+    pub active_challenge: ChallengeProgress,
+}
+
+/// Evaluate a complete derived biometric evidence set against one encrypted template.
+///
+/// Raw images are not represented by this API. Missing, duplicated, unexpected, incompatible, or
+/// malformed evidence returns an error; valid negative evidence returns a rejected policy decision.
+///
+/// # Errors
+///
+/// Returns [`AuthenticationPipelineError`] when capture timing, template compatibility, PAD model
+/// identity, score structure, or policy evaluation is invalid.
+pub fn evaluate_authentication(
+    policy: AuthPolicy,
+    passive_pad_policy: &PassivePadPolicy,
+    template: &TemplateRecord,
+    observation: AuthenticationObservation<'_>,
+) -> Result<AuthenticationDecision, AuthenticationPipelineError> {
+    policy.capture.accepts(observation.timing)?;
+    let similarity = compare_template(template, observation.embedding)?;
+    let passive_liveness = if passive_pad_policy.accepts(observation.passive_liveness)? {
+        CheckStatus::Passed
+    } else {
+        CheckStatus::Failed
+    };
+    let active_challenge = if observation.active_challenge == ChallengeProgress::Passed {
+        CheckStatus::Passed
+    } else {
+        CheckStatus::Failed
+    };
+    Ok(policy.evaluate(AuthenticationEvidence {
+        similarity,
+        quality: observation.quality,
+        infrared: ObservationStatus::Observed,
+        visible: ObservationStatus::Observed,
+        passive_liveness,
+        active_challenge,
+    })?)
+}
+
+fn exact_pad_score<'a>(
+    scores: &'a [PassiveLivenessScore],
+    role: ModelRole,
+    compatibility_sha256: &str,
+) -> Result<&'a PassiveLivenessScore, AuthenticationPipelineError> {
+    let mut matching = scores.iter().filter(|score| score.role() == role);
+    let score = matching.next().ok_or(AuthenticationPipelineError::PassivePadEvidenceInvalid)?;
+    if matching.next().is_some() || score.compatibility_sha256() != compatibility_sha256 {
+        return Err(AuthenticationPipelineError::PassivePadEvidenceInvalid);
+    }
+    Ok(score)
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !value.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+fn valid_probability(value: f32) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+/// Failure while assembling and evaluating authentication evidence.
+#[derive(Debug, Error)]
+pub enum AuthenticationPipelineError {
+    /// Passive PAD policy contains an invalid digest or threshold.
+    #[error("invalid passive PAD policy")]
+    InvalidPassivePadPolicy,
+    /// Required PAD evidence is missing, duplicated, unexpected, or model-incompatible.
+    #[error("passive PAD evidence does not exactly match the configured model contracts")]
+    PassivePadEvidenceInvalid,
+    /// Capture or final authentication policy rejected malformed evidence.
+    #[error("authentication policy evaluation failed: {0}")]
+    Policy(#[from] PolicyError),
+    /// Template and observed embedding could not be compared.
+    #[error("biometric comparison failed: {0}")]
+    Comparison(#[from] BiometricComparisonError),
+    /// Passive PAD score or calibrated threshold was invalid.
+    #[error("passive PAD inference evidence failed: {0}")]
     Inference(#[from] InferenceError),
 }
 
@@ -229,6 +389,34 @@ mod tests {
         }
     }
 
+    fn pad_policy() -> PassivePadPolicy {
+        PassivePadPolicy {
+            infrared_compatibility_sha256: "11".repeat(32),
+            minimum_infrared_probability: 0.8,
+            visible_compatibility_sha256: "22".repeat(32),
+            minimum_visible_probability: 0.75,
+            fusion: None,
+        }
+    }
+
+    fn pad_scores(
+        infrared: f32,
+        visible: f32,
+    ) -> Result<Vec<PassiveLivenessScore>, InferenceError> {
+        Ok(vec![
+            PassiveLivenessScore::from_validated_output(
+                ModelRole::PassiveLivenessInfrared,
+                &"11".repeat(32),
+                infrared,
+            )?,
+            PassiveLivenessScore::from_validated_output(
+                ModelRole::PassiveLivenessVisible,
+                &"22".repeat(32),
+                visible,
+            )?,
+        ])
+    }
+
     #[test]
     fn enrollment_requires_exact_root_polkit_broker_grant() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -273,6 +461,87 @@ mod tests {
             compare_template(&template, &observed),
             Err(BiometricComparisonError::Storage(StorageError::IncompatibleTemplate))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn complete_bound_evidence_can_be_accepted() -> Result<(), Box<dyn std::error::Error>> {
+        let embedding = test_embedding(0xaa)?;
+        let template = template_from_embedding(1000, &embedding);
+        let scores = pad_scores(0.95, 0.9)?;
+        let decision = evaluate_authentication(
+            AuthPolicy::default(),
+            &pad_policy(),
+            &template,
+            AuthenticationObservation {
+                timing: CapturePair {
+                    infrared_timestamp_micros: 1_000_000,
+                    visible_timestamp_micros: Some(1_050_000),
+                },
+                quality: 0.9,
+                embedding: &embedding,
+                passive_liveness: &scores,
+                active_challenge: ChallengeProgress::Passed,
+            },
+        )?;
+        assert!(decision.accepted);
+        assert_eq!(decision.reason, faceauth_core::DecisionReason::Accepted);
+        Ok(())
+    }
+
+    #[test]
+    fn pad_failure_and_incomplete_active_challenge_reject() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let embedding = test_embedding(0xaa)?;
+        let template = template_from_embedding(1000, &embedding);
+        let scores = pad_scores(0.79, 0.99)?;
+        let decision = evaluate_authentication(
+            AuthPolicy::default(),
+            &pad_policy(),
+            &template,
+            AuthenticationObservation {
+                timing: CapturePair {
+                    infrared_timestamp_micros: 1_000_000,
+                    visible_timestamp_micros: Some(1_010_000),
+                },
+                quality: 0.9,
+                embedding: &embedding,
+                passive_liveness: &scores,
+                active_challenge: ChallengeProgress::BaselineRequired,
+            },
+        )?;
+        assert!(!decision.accepted);
+        assert_eq!(decision.reason, faceauth_core::DecisionReason::PassiveLivenessFailed);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_duplicate_or_wrong_contract_pad_evidence_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let embedding = test_embedding(0xaa)?;
+        let template = template_from_embedding(1000, &embedding);
+        let mut scores = pad_scores(0.99, 0.99)?;
+        scores.push(PassiveLivenessScore::from_validated_output(
+            ModelRole::PassiveLivenessInfrared,
+            &"11".repeat(32),
+            0.99,
+        )?);
+        let result = evaluate_authentication(
+            AuthPolicy::default(),
+            &pad_policy(),
+            &template,
+            AuthenticationObservation {
+                timing: CapturePair {
+                    infrared_timestamp_micros: 1_000_000,
+                    visible_timestamp_micros: Some(1_010_000),
+                },
+                quality: 0.9,
+                embedding: &embedding,
+                passive_liveness: &scores,
+                active_challenge: ChallengeProgress::Passed,
+            },
+        );
+        assert!(matches!(result, Err(AuthenticationPipelineError::PassivePadEvidenceInvalid)));
         Ok(())
     }
 

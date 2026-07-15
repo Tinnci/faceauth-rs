@@ -70,6 +70,12 @@ when already unit-normalized and when their complete manifest compatibility dige
 and dimension exactly match the active embedding session. Passive-PAD values are
 not inferred from arbitrary tensors: only a schema-tagged scalar probability in
 `[0, 1]` is admitted, and thresholds must come from explicit calibration.
+At daemon orchestration, both the IR and visible PAD roles are mandatory and each
+score must match the configured full model/preprocessing compatibility digest.
+Exactly one score per required role is accepted. A configured fusion role is
+mandatory; an unconfigured fusion score is rejected rather than silently changing
+the evidence policy. Passing one modality can never compensate for failure in the
+other.
 
 Landmark output used by active liveness is an input to the independently tested
 challenge state machine, not a terminal authentication decision. Eye-openness

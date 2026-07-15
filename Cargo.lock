@@ -669,6 +669,8 @@ dependencies = [
  "faceauth-core",
  "faceauth-enrollment",
  "faceauth-inference",
+ "faceauth-liveness",
+ "faceauth-model",
  "faceauth-presence",
  "faceauth-protocol",
  "faceauth-session",

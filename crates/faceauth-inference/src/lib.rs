@@ -216,6 +216,37 @@ pub struct PassiveLivenessScore {
 }
 
 impl PassiveLivenessScore {
+    /// Construct a score from a role-specific adapter or another reviewed inference backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::ModelRoleMismatch`] for a non-PAD role or
+    /// [`InferenceError::PassiveLivenessOutputInvalid`] for an invalid contract digest or
+    /// probability.
+    pub fn from_validated_output(
+        role: ModelRole,
+        compatibility_sha256: &str,
+        probability: f32,
+    ) -> Result<Self, InferenceError> {
+        if !matches!(
+            role,
+            ModelRole::PassiveLivenessInfrared
+                | ModelRole::PassiveLivenessVisible
+                | ModelRole::PassiveLivenessFusion
+        ) {
+            return Err(InferenceError::ModelRoleMismatch);
+        }
+        if compatibility_sha256.len() != 64
+            || !compatibility_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || compatibility_sha256.bytes().any(|byte| byte.is_ascii_uppercase())
+            || !probability.is_finite()
+            || !(0.0..=1.0).contains(&probability)
+        {
+            return Err(InferenceError::PassiveLivenessOutputInvalid);
+        }
+        Ok(Self { role, compatibility_sha256: compatibility_sha256.to_owned(), probability })
+    }
+
     /// Passive liveness model role that produced this score.
     #[must_use]
     pub const fn role(&self) -> ModelRole {
@@ -460,11 +491,7 @@ fn extract_passive_liveness_output(
     if !probability.is_finite() || !(0.0..=1.0).contains(probability) {
         return Err(InferenceError::PassiveLivenessOutputInvalid);
     }
-    Ok(PassiveLivenessScore {
-        role: manifest.role,
-        compatibility_sha256: compatibility_sha256.to_owned(),
-        probability: *probability,
-    })
+    PassiveLivenessScore::from_validated_output(manifest.role, compatibility_sha256, *probability)
 }
 
 fn semantic_output(
@@ -1152,6 +1179,7 @@ mod tests {
 
     #[test]
     fn passive_liveness_adapter_requires_scalar_probability() -> Result<(), InferenceError> {
+        let compatibility = "ab".repeat(32);
         let manifest = model_manifest(
             ModelRole::PassiveLivenessInfrared,
             OutputSemantic::LiveProbability,
@@ -1162,7 +1190,7 @@ mod tests {
             dimensions: vec![1],
             values: Zeroizing::new(vec![0.8]),
         }];
-        let score = extract_passive_liveness_output(&manifest, "compatibility", &valid)?;
+        let score = extract_passive_liveness_output(&manifest, &compatibility, &valid)?;
         assert!(score.passes(0.75)?);
         assert!(!score.passes(0.85)?);
 
@@ -1172,7 +1200,7 @@ mod tests {
             values: Zeroizing::new(vec![1.1]),
         }];
         assert!(matches!(
-            extract_passive_liveness_output(&manifest, "compatibility", &invalid),
+            extract_passive_liveness_output(&manifest, &compatibility, &invalid),
             Err(InferenceError::PassiveLivenessOutputInvalid)
         ));
         Ok(())

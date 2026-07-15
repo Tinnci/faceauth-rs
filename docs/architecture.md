@@ -81,6 +81,13 @@ The daemon is the bridge between inference and encrypted storage: enrollment can
 construct a template only from a normalized `FaceEmbedding`, and authentication
 reconstructs an enrolled comparison vector only after the authenticated record's
 schema, unit norm, compatibility digest, and dimension match the active session.
+The authentication evidence orchestrator then requires a valid paired IR/visible
+timestamp, explicitly calibrated IR and visible PAD scores bound to exact model
+compatibility digests, a completed randomized challenge, a finite quality value,
+and the compatible template comparison before the core policy can accept. An
+optional fusion PAD model is also exact-contract-bound; missing, duplicated,
+unexpected, or incompatible PAD evidence fails closed. This boundary contains no
+raw image type and therefore cannot persist capture frames.
 Multi-sample registration and its dedicated root Polkit-broker grant are described
 in [enrollment.md](enrollment.md).
 The optional HPD contract and its fail-open semantics are described in
