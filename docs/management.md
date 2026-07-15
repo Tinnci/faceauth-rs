@@ -38,16 +38,25 @@ called. The crate contains no permissive state source or grant issuer.
 The adapter currently admits only a caller managing its own numeric UID. `GetEnrollmentState`
 delegates the enrolled-template lookup to the injected backend after that identity check;
 coordinator busy state is not mistaken for enrollment state. `BeginEnrollment` also checks that the
-returned authorization proof is bound to that exact UID. Cancellation parses the opaque UUID and
-requires the same sender-derived UID plus operation ID. Backend failures, absent senders,
-mismatched UIDs, malformed operation IDs, and poisoned coordinator state fail closed.
+returned authorization proof is bound to that exact UID. Each active operation is then bound to the
+exact unique D-Bus sender, target UID, and opaque UUID. Cancellation requires all three; another
+connection owned by the same UID cannot cancel the operation. Backend failures, absent senders,
+mismatched senders or UIDs, malformed operation IDs, and poisoned coordinator state fail closed.
+
+`ManagementDisconnectHandle::watch` subscribes to the bus daemon's `NameOwnerChanged` signal. It
+ignores well-known names, owner acquisition/replacement, and unrelated unique names. When the exact
+operation sender loses its owner, the handle consumes the operation as `cancelled`, releases camera
+capacity, and emits the stable terminal signal. The service must start this watcher before exposing
+Manager1 methods and stop if the watcher exits; continuing without disconnect cleanup is unsafe.
+If the initial `EnrollmentProgress` signal cannot be sent after `BeginEnrollment`, the adapter rolls
+the just-created operation back immediately.
 
 The daemon obtains a `ManagementWorkerHandle` that uses the adapter's exact coordinator and
 monotonic clock for progress, completion, and timeout reaping. It can emit only the resulting
 `ManagementUpdate` values through the adapter. Signals are restricted to the stable public codes
 listed below. No test claims the system bus name, and no production Polkit broker or D-Bus service
-activation is enabled by this milestone. Sender-disconnect cancellation and the daemon-owned
-production state/grant implementations remain required before service activation.
+activation is enabled by this milestone. The daemon-owned production state/grant implementations
+and service startup wiring remain required before activation.
 
 ## Authorization and identity
 
@@ -58,8 +67,8 @@ exact root broker grant. Only then can `AuthorizedEnrollment::from_grant` produc
 accepted by `ManagementCoordinator::start`.
 
 Enrollment state queries must likewise enforce caller-to-target UID policy. Serialized UIDs,
-operation IDs, object paths, and bus names never prove identity. Disconnect handling must cancel
-the sender's active operation rather than leaving camera work running.
+operation IDs, object paths, and bus names never prove identity. The adapter uses only the sender
+attached by the bus daemon and the kernel UID resolved for that unique name.
 
 ## Operation lifecycle
 

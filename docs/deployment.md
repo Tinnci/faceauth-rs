@@ -21,9 +21,9 @@ administrator must explicitly approve installation and activation.
 The `faceauth-management-dbus` crate now provides the asynchronous system-bus credential resolver
 and PolicyKit `CheckAuthorization` client for `org.faceauth.enroll`. A production daemon must still
 provide the authenticated encrypted-template state source and exact root grant issuer, then wire
-sender-disconnect cancellation. Until those implementations, D-Bus policy, and isolated
-integration tests exist, packaging must not claim `org.faceauth.Manager1` or activate it on the
-system bus.
+the supplied `ManagementDisconnectHandle` before exposing Manager1. The service must fail if the
+owner-change watcher exits. Until those implementations, D-Bus policy, and isolated integration
+tests exist, packaging must not claim `org.faceauth.Manager1` or activate it on the system bus.
 
 ## systemd service template
 

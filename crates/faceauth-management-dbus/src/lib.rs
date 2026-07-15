@@ -17,6 +17,7 @@ use faceauth_management::{
     ManagementCoordinator, ManagementError, ManagementProgress, ManagementResult, ManagementUpdate,
     OperationId,
 };
+use futures_util::StreamExt;
 use zbus::{Connection, interface, message::Header, object_server::SignalContext, zvariant::Value};
 
 /// Object-safe asynchronous result returned by management backends.
@@ -287,15 +288,34 @@ where
 
 /// D-Bus implementation of `org.faceauth.Manager1`.
 pub struct Manager1 {
-    coordinator: Arc<Mutex<ManagementCoordinator>>,
+    state: Arc<Mutex<ManagementState>>,
     backend: Arc<dyn AuthorizationBackend>,
     clock: Arc<dyn MonotonicClock>,
+}
+
+struct OperationOwner {
+    sender: String,
+    target_uid: u32,
+    operation_id: OperationId,
+}
+
+struct ManagementState {
+    coordinator: ManagementCoordinator,
+    owner: Option<OperationOwner>,
+}
+
+impl ManagementState {
+    fn clear_owner_if_terminal(&mut self, update: &ManagementUpdate) {
+        if matches!(update, ManagementUpdate::Completed { .. }) {
+            self.owner = None;
+        }
+    }
 }
 
 /// Daemon-worker view of the coordinator using the adapter's exact monotonic clock.
 #[derive(Clone)]
 pub struct ManagementWorkerHandle {
-    coordinator: Arc<Mutex<ManagementCoordinator>>,
+    state: Arc<Mutex<ManagementState>>,
     clock: Arc<dyn MonotonicClock>,
 }
 
@@ -311,11 +331,14 @@ impl ManagementWorkerHandle {
         operation_id: OperationId,
         progress: ManagementProgress,
     ) -> Result<ManagementUpdate, WorkerError> {
-        self.coordinator
-            .lock()
-            .map_err(|_| WorkerError::CoordinatorPoisoned)?
+        let mut state = self.state.lock().map_err(|_| WorkerError::CoordinatorPoisoned)?;
+        let update = state
+            .coordinator
             .progress(target_uid, operation_id, progress, self.clock.now_micros())
-            .map_err(WorkerError::Management)
+            .map_err(WorkerError::Management)?;
+        state.clear_owner_if_terminal(&update);
+        drop(state);
+        Ok(update)
     }
 
     /// Complete the exact target UID and operation with a daemon-owned result.
@@ -329,11 +352,14 @@ impl ManagementWorkerHandle {
         operation_id: OperationId,
         result: ManagementResult,
     ) -> Result<ManagementUpdate, WorkerError> {
-        self.coordinator
-            .lock()
-            .map_err(|_| WorkerError::CoordinatorPoisoned)?
+        let mut state = self.state.lock().map_err(|_| WorkerError::CoordinatorPoisoned)?;
+        let update = state
+            .coordinator
             .complete(target_uid, operation_id, result, self.clock.now_micros())
-            .map_err(WorkerError::Management)
+            .map_err(WorkerError::Management)?;
+        state.clear_owner_if_terminal(&update);
+        drop(state);
+        Ok(update)
     }
 
     /// Reap the active operation if its monotonic deadline elapsed.
@@ -342,11 +368,13 @@ impl ManagementWorkerHandle {
     ///
     /// Returns [`WorkerError::CoordinatorPoisoned`] when the coordinator lock is unavailable.
     pub fn expire(&self) -> Result<Option<ManagementUpdate>, WorkerError> {
-        Ok(self
-            .coordinator
-            .lock()
-            .map_err(|_| WorkerError::CoordinatorPoisoned)?
-            .expire(self.clock.now_micros()))
+        let mut state = self.state.lock().map_err(|_| WorkerError::CoordinatorPoisoned)?;
+        let update = state.coordinator.expire(self.clock.now_micros());
+        if let Some(update) = update.as_ref() {
+            state.clear_owner_if_terminal(update);
+        }
+        drop(state);
+        Ok(update)
     }
 }
 
@@ -379,6 +407,92 @@ impl std::error::Error for WorkerError {
     }
 }
 
+/// Cloneable system-bus disconnect monitor for a registered Manager1 object.
+#[derive(Clone)]
+pub struct ManagementDisconnectHandle {
+    state: Arc<Mutex<ManagementState>>,
+    clock: Arc<dyn MonotonicClock>,
+}
+
+impl ManagementDisconnectHandle {
+    /// Cancel and consume the operation owned by a disconnected unique D-Bus sender.
+    ///
+    /// Other senders and an idle coordinator return `Ok(None)` without changing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError`] if the coordinator lock or lifecycle invariant fails.
+    pub fn cancel_sender(&self, sender: &str) -> Result<Option<ManagementUpdate>, WorkerError> {
+        let mut state = self.state.lock().map_err(|_| WorkerError::CoordinatorPoisoned)?;
+        let Some(owner) = state.owner.as_ref() else {
+            return Ok(None);
+        };
+        if owner.sender != sender {
+            return Ok(None);
+        }
+        let target_uid = owner.target_uid;
+        let operation_id = owner.operation_id;
+        let update = state
+            .coordinator
+            .cancel(target_uid, operation_id, self.clock.now_micros())
+            .map_err(WorkerError::Management)?;
+        state.clear_owner_if_terminal(&update);
+        drop(state);
+        Ok(Some(update))
+    }
+
+    /// Watch system-bus ownership changes and cancel operations whose unique sender disappears.
+    ///
+    /// The caller should spawn this future alongside the object server and stop the service if it
+    /// returns an error, because continuing without disconnect cleanup can retain camera capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if the bus stream, cancellation, or terminal signal fails.
+    pub async fn watch(
+        &self,
+        connection: &Connection,
+        signal_context: &SignalContext<'_>,
+    ) -> Result<(), BackendError> {
+        let proxy = zbus::fdo::DBusProxy::new(connection).await.map_err(|error| {
+            BackendError::new(format!("unable to create D-Bus disconnect proxy: {error}"))
+        })?;
+        let mut changes = proxy.receive_name_owner_changed().await.map_err(|error| {
+            BackendError::new(format!("unable to subscribe to D-Bus owner changes: {error}"))
+        })?;
+        while let Some(change) = changes.next().await {
+            let args = change.args().map_err(|error| {
+                BackendError::new(format!("invalid D-Bus owner-change signal: {error}"))
+            })?;
+            let old_owner_present = args.old_owner().as_ref().is_some();
+            let new_owner_present = args.new_owner().as_ref().is_some();
+            if let Some(update) = self
+                .handle_owner_change(args.name().as_str(), old_owner_present, new_owner_present)
+                .map_err(|error| {
+                    BackendError::new(format!("unable to cancel disconnected sender: {error}"))
+                })?
+            {
+                emit_update_signal(signal_context, update).await.map_err(|error| {
+                    BackendError::new(format!("unable to emit disconnect cancellation: {error}"))
+                })?;
+            }
+        }
+        Err(BackendError::new("D-Bus owner-change stream ended"))
+    }
+
+    fn handle_owner_change(
+        &self,
+        name: &str,
+        old_owner_present: bool,
+        new_owner_present: bool,
+    ) -> Result<Option<ManagementUpdate>, WorkerError> {
+        if !old_owner_present || new_owner_present || unique_sender(name).is_err() {
+            return Ok(None);
+        }
+        self.cancel_sender(name)
+    }
+}
+
 impl Manager1 {
     /// Construct a Manager1 object around an existing coordinator and authorization backend.
     #[must_use]
@@ -388,7 +502,7 @@ impl Manager1 {
         clock: impl MonotonicClock,
     ) -> Self {
         Self {
-            coordinator: Arc::new(Mutex::new(coordinator)),
+            state: Arc::new(Mutex::new(ManagementState { coordinator, owner: None })),
             backend: Arc::new(backend),
             clock: Arc::new(clock),
         }
@@ -397,10 +511,31 @@ impl Manager1 {
     /// Return a worker handle bound to the same coordinator and monotonic clock.
     #[must_use]
     pub fn worker_handle(&self) -> ManagementWorkerHandle {
-        ManagementWorkerHandle {
-            coordinator: Arc::clone(&self.coordinator),
+        ManagementWorkerHandle { state: Arc::clone(&self.state), clock: Arc::clone(&self.clock) }
+    }
+
+    /// Return a handle that watches unique sender ownership and releases abandoned operations.
+    #[must_use]
+    pub fn disconnect_handle(&self) -> ManagementDisconnectHandle {
+        ManagementDisconnectHandle {
+            state: Arc::clone(&self.state),
             clock: Arc::clone(&self.clock),
         }
+    }
+
+    /// Cancel and consume the operation owned by a disconnected unique D-Bus sender.
+    ///
+    /// A `NameOwnerChanged` watcher should call this only when the unique name loses its owner.
+    /// Other senders and an idle coordinator return `Ok(None)` without changing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError`] if the coordinator lock or lifecycle invariant fails.
+    pub fn cancel_disconnected_sender(
+        &self,
+        sender: &str,
+    ) -> Result<Option<ManagementUpdate>, WorkerError> {
+        self.disconnect_handle().cancel_sender(sender)
     }
 
     /// Emit one safe management update on a caller-provided object-server context.
@@ -416,16 +551,7 @@ impl Manager1 {
         ctxt: &SignalContext<'_>,
         update: ManagementUpdate,
     ) -> zbus::Result<()> {
-        match update {
-            ManagementUpdate::Progress { operation_id, progress } => {
-                let operation_id = operation_id.to_string();
-                Self::enrollment_progress(ctxt, &operation_id, progress_name(progress)).await
-            }
-            ManagementUpdate::Completed { operation_id, result } => {
-                let operation_id = operation_id.to_string();
-                Self::enrollment_completed(ctxt, &operation_id, result_name(result)).await
-            }
-        }
+        emit_update_signal(ctxt, update).await
     }
 
     fn sender<'a>(header: &'a Header<'a>) -> Result<&'a str, zbus::fdo::Error> {
@@ -462,6 +588,7 @@ impl Manager1 {
         sender: &str,
         target_uid: u32,
     ) -> Result<(OperationId, ManagementProgress), zbus::fdo::Error> {
+        unique_sender(sender).map_err(|error| map_backend_error(&error))?;
         self.require_target(sender, target_uid).await?;
         let authorization = self
             .backend
@@ -474,10 +601,16 @@ impl Manager1 {
             ));
         }
         let update = {
-            let mut coordinator = self.coordinator.lock().map_err(|_| lock_error())?;
-            coordinator
+            let mut state = self.state.lock().map_err(|_| lock_error())?;
+            let update = state
+                .coordinator
                 .start(authorization, self.clock.now_micros())
-                .map_err(map_management_error)?
+                .map_err(map_management_error)?;
+            if let ManagementUpdate::Progress { operation_id, .. } = update {
+                state.owner =
+                    Some(OperationOwner { sender: sender.to_owned(), target_uid, operation_id });
+            }
+            update
         };
         let (operation_id, progress) = match update {
             ManagementUpdate::Progress { operation_id, progress } => (operation_id, progress),
@@ -499,10 +632,22 @@ impl Manager1 {
         self.require_target(sender, target_uid).await?;
         let operation_id = OperationId::parse(operation_id).map_err(map_management_error)?;
         let update = {
-            let mut coordinator = self.coordinator.lock().map_err(|_| lock_error())?;
-            coordinator
+            let mut state = self.state.lock().map_err(|_| lock_error())?;
+            let owner = state
+                .owner
+                .as_ref()
+                .ok_or_else(|| map_management_error(ManagementError::NoActiveOperation))?;
+            if owner.sender != sender {
+                return Err(zbus::fdo::Error::AccessDenied(
+                    "management operation belongs to another D-Bus sender".into(),
+                ));
+            }
+            let update = state
+                .coordinator
                 .cancel(target_uid, operation_id, self.clock.now_micros())
-                .map_err(map_management_error)?
+                .map_err(map_management_error)?;
+            state.clear_owner_if_terminal(&update);
+            update
         };
         let (operation_id, result) = match update {
             ManagementUpdate::Completed { operation_id, result } => (operation_id, result),
@@ -544,10 +689,16 @@ impl Manager1 {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
     ) -> Result<(String,), zbus::fdo::Error> {
+        let sender = Self::sender(&header)?.to_owned();
         let (operation_id, progress) =
-            Self::begin_enrollment_impl(self, Self::sender(&header)?, target_uid).await?;
+            Self::begin_enrollment_impl(self, &sender, target_uid).await?;
         let operation_id = operation_id.to_string();
-        Self::enrollment_progress(&ctxt, &operation_id, progress_name(progress)).await?;
+        if let Err(error) =
+            Self::enrollment_progress(&ctxt, &operation_id, progress_name(progress)).await
+        {
+            let _ = self.cancel_disconnected_sender(&sender);
+            return Err(zbus::fdo::Error::ZBus(error));
+        }
         Ok((operation_id,))
     }
 
@@ -583,6 +734,22 @@ impl Manager1 {
         operation_id: &str,
         result: &str,
     ) -> zbus::Result<()>;
+}
+
+async fn emit_update_signal(
+    ctxt: &SignalContext<'_>,
+    update: ManagementUpdate,
+) -> zbus::Result<()> {
+    match update {
+        ManagementUpdate::Progress { operation_id, progress } => {
+            let operation_id = operation_id.to_string();
+            Manager1::enrollment_progress(ctxt, &operation_id, progress_name(progress)).await
+        }
+        ManagementUpdate::Completed { operation_id, result } => {
+            let operation_id = operation_id.to_string();
+            Manager1::enrollment_completed(ctxt, &operation_id, result_name(result)).await
+        }
+    }
 }
 
 const fn progress_name(progress: ManagementProgress) -> &'static str {
@@ -649,7 +816,7 @@ mod tests {
     impl AuthorizationBackend for Backend {
         fn caller_uid<'a>(&'a self, sender: &'a str) -> BackendFuture<'a, u32> {
             Box::pin(async move {
-                (sender == ":1.7")
+                matches!(sender, ":1.7" | ":1.8")
                     .then_some(1000)
                     .ok_or_else(|| BackendError::new("unknown sender"))
             })
@@ -776,6 +943,21 @@ mod tests {
             worker.progress(1001, operation, ManagementProgress::Processing),
             Err(WorkerError::Management(ManagementError::WrongUid))
         );
+        assert!(matches!(
+            futures_lite::future::block_on(manager.cancel_enrollment_impl(
+                ":1.8",
+                1000,
+                &operation.to_string(),
+            )),
+            Err(zbus::fdo::Error::AccessDenied(_))
+        ));
+        assert_eq!(
+            worker.progress(1000, operation, ManagementProgress::Processing)?,
+            ManagementUpdate::Progress {
+                operation_id: operation,
+                progress: ManagementProgress::Processing,
+            }
+        );
         let (_, result) = futures_lite::future::block_on(manager.cancel_enrollment_impl(
             ":1.7",
             1000,
@@ -795,6 +977,46 @@ mod tests {
             )),
             Err(zbus::fdo::Error::InvalidArgs(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn disconnected_owner_is_cancelled_and_capacity_is_released()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let coordinator = ManagementCoordinator::new(ManagementConfig::default())?;
+        let manager = Manager1::new(coordinator, Backend, TestClock(AtomicU64::new(1_000_000)));
+        let worker = manager.worker_handle();
+        let disconnect = manager.disconnect_handle();
+        let (operation, _) =
+            futures_lite::future::block_on(manager.begin_enrollment_impl(":1.7", 1000))?;
+
+        assert_eq!(disconnect.handle_owner_change(":1.7", false, false)?, None);
+        assert_eq!(disconnect.handle_owner_change(":1.7", true, true)?, None);
+        assert_eq!(disconnect.handle_owner_change("org.faceauth.Client", true, false)?, None);
+        assert_eq!(disconnect.handle_owner_change(":1.8", true, false)?, None);
+        assert_eq!(
+            disconnect.handle_owner_change(":1.7", true, false)?,
+            Some(ManagementUpdate::Completed {
+                operation_id: operation,
+                result: ManagementResult::Cancelled,
+            })
+        );
+        assert_eq!(disconnect.cancel_sender(":1.7")?, None);
+        assert_eq!(
+            worker.progress(1000, operation, ManagementProgress::Processing),
+            Err(WorkerError::Management(ManagementError::NoActiveOperation))
+        );
+
+        let (second, _) =
+            futures_lite::future::block_on(manager.begin_enrollment_impl(":1.7", 1000))?;
+        assert!(matches!(
+            worker.complete(1000, second, ManagementResult::Completed)?,
+            ManagementUpdate::Completed {
+                operation_id,
+                result: ManagementResult::Completed,
+            } if operation_id == second
+        ));
+        assert_eq!(disconnect.cancel_sender(":1.7")?, None);
         Ok(())
     }
 

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 faceauth-authz = { path = "../faceauth-authz", version = "0.1.0" }
 faceauth-management = { path = "../faceauth-management", version = "0.1.0" }
+futures-util = { version = "0.3.31", default-features = false }
 zbus.workspace = true
 
 [dev-dependencies]
