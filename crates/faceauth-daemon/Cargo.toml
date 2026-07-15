@@ -13,6 +13,7 @@ faceauth-authz = { path = "../faceauth-authz", version = "0.1.0" }
 faceauth-camera = { path = "../faceauth-camera", version = "0.1.0" }
 faceauth-capture = { path = "../faceauth-capture", version = "0.1.0" }
 faceauth-core = { path = "../faceauth-core", version = "0.1.0" }
+faceauth-enrollment = { path = "../faceauth-enrollment", version = "0.1.0" }
 faceauth-inference = { path = "../faceauth-inference", version = "0.1.0" }
 faceauth-protocol = { path = "../faceauth-protocol", version = "0.1.0" }
 faceauth-session = { path = "../faceauth-session", version = "0.1.0" }

@@ -419,6 +419,7 @@ dependencies = [
  "faceauth-camera",
  "faceauth-capture",
  "faceauth-core",
+ "faceauth-enrollment",
  "faceauth-inference",
  "faceauth-protocol",
  "faceauth-session",
@@ -429,6 +430,17 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "faceauth-enrollment"
+version = "0.1.0"
+dependencies = [
+ "faceauth-inference",
+ "faceauth-storage",
+ "serde",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]

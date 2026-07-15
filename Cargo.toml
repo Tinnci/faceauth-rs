@@ -6,6 +6,7 @@ members = [
     "crates/faceauth-cli",
     "crates/faceauth-core",
     "crates/faceauth-daemon",
+    "crates/faceauth-enrollment",
     "crates/faceauth-inference",
     "crates/faceauth-liveness",
     "crates/faceauth-model",

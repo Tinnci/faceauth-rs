@@ -1,14 +1,49 @@
 //! Privileged daemon authentication boundary orchestration.
 
 use faceauth_authz::{
-    AuthorizationError, AuthorizationPolicy, ExecutableError, VerifiedExecutable,
+    AuthorizationError, AuthorizationGrant, AuthorizationPolicy, ExecutableError,
+    VerifiedExecutable,
 };
+use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
 use faceauth_inference::{FaceEmbedding, InferenceError};
-use faceauth_protocol::{RejectionCode, Request, Response};
+use faceauth_protocol::{AuthenticationPurpose, RejectionCode, Request, Response};
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
 use faceauth_storage::{StorageError, TEMPLATE_RECORD_SCHEMA_VERSION, TemplateRecord};
 use faceauth_transport::{PeerStream, TransportError};
 use thiserror::Error;
+
+const ENROLLMENT_SERVICE: &str = "faceauth-enroll";
+
+/// Start enrollment only from an exact root broker grant dedicated to Polkit enrollment.
+///
+/// # Errors
+///
+/// Returns [`EnrollmentBoundaryError`] when the grant is for another service/purpose, does not
+/// originate from a root peer, or the enrollment configuration is invalid.
+pub fn begin_authorized_enrollment(
+    grant: &AuthorizationGrant,
+    config: EnrollmentConfig,
+    now_micros: u64,
+) -> Result<EnrollmentSession, EnrollmentBoundaryError> {
+    if grant.peer.uid != 0
+        || grant.service.as_str() != ENROLLMENT_SERVICE
+        || grant.purpose != AuthenticationPurpose::Polkit
+    {
+        return Err(EnrollmentBoundaryError::UnauthorizedGrant);
+    }
+    Ok(EnrollmentSession::start(config, grant.target_uid, now_micros)?)
+}
+
+/// Enrollment authorization or transaction setup failure.
+#[derive(Debug, Error)]
+pub enum EnrollmentBoundaryError {
+    /// Grant was not issued to the dedicated root Polkit enrollment broker.
+    #[error("authorization grant is not valid for enrollment")]
+    UnauthorizedGrant,
+    /// Enrollment transaction configuration or deadline was invalid.
+    #[error("unable to start enrollment transaction: {0}")]
+    Enrollment(#[from] EnrollmentError),
+}
 
 /// Build the only persistable enrollment payload from a normalized derived embedding.
 ///
@@ -182,6 +217,40 @@ mod tests {
         let mut values = vec![0.0; 32];
         values[0] = 1.0;
         FaceEmbedding::from_normalized_template(&digest, &values)
+    }
+
+    fn enrollment_config() -> EnrollmentConfig {
+        EnrollmentConfig {
+            duration_micros: 30_000_000,
+            minimum_samples: 3,
+            maximum_samples: 5,
+            minimum_quality: 0.7,
+            minimum_sample_similarity: 0.9,
+        }
+    }
+
+    #[test]
+    fn enrollment_requires_exact_root_polkit_broker_grant() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = ServiceName::parse(ENROLLMENT_SERVICE)?;
+        let grant = AuthorizationGrant {
+            transaction_id: TransactionId::generate(),
+            peer: faceauth_transport::PeerIdentity { pid: 10, uid: 0, gid: 0 },
+            target_uid: 1000,
+            service,
+            purpose: AuthenticationPurpose::Polkit,
+            executable: ExecutableFingerprint { device: 1, inode: 1 },
+        };
+        let session = begin_authorized_enrollment(&grant, enrollment_config(), 1_000_000)?;
+        assert_eq!(session.accepted_samples(), 0);
+
+        let mut wrong_peer = grant;
+        wrong_peer.peer.uid = 1000;
+        assert!(matches!(
+            begin_authorized_enrollment(&wrong_peer, enrollment_config(), 1_000_000),
+            Err(EnrollmentBoundaryError::UnauthorizedGrant)
+        ));
+        Ok(())
     }
 
     #[test]

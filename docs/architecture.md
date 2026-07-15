@@ -20,16 +20,18 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 5. `faceauth-session`: one-shot connection-bound transaction lifecycle and deadlines.
 6. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
 7. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
-8. `faceauth-model`: bounded schema-v4 provenance, digest, preprocessing, semantic
+8. `faceauth-enrollment`: authorized, bounded multi-observation registration that
+   retains only zeroizing embeddings and emits one encrypted-storage record.
+9. `faceauth-model`: bounded schema-v4 provenance, digest, preprocessing, semantic
    output roles, and exact tensor-contract admission.
-9. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
+10. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
    whose graph I/O must exactly match an admitted manifest.
-10. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
+11. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
-11. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
+12. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
-12. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
-13. KDE KCM and lock-screen status UI: optional clients over stable APIs.
+13. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
+14. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
 The authentication transport contract is described in [ipc.md](ipc.md). Caller
 numeric peer identity comes from Unix peer credentials, not serialized request
@@ -77,6 +79,8 @@ The daemon is the bridge between inference and encrypted storage: enrollment can
 construct a template only from a normalized `FaceEmbedding`, and authentication
 reconstructs an enrolled comparison vector only after the authenticated record's
 schema, unit norm, compatibility digest, and dimension match the active session.
+Multi-sample registration and its dedicated root Polkit-broker grant are described
+in [enrollment.md](enrollment.md).
 
 Landmark models provide bounded eye-openness, yaw, and face-count measurements to
 the active-challenge state machine. They do not decide challenge success. The
