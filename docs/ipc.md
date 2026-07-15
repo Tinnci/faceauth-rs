@@ -78,6 +78,14 @@ the originating connection token. A wrong connection or ID cannot alter or reap
 the active transaction. The monotonic deadline is fixed at start and cannot be
 extended by wire input.
 
+When a transaction starts, the daemon may clone a private cancellation token into
+its bounded capture/inference worker. The token is never serialized or obtainable
+without the exact session binding. Cancellation marks the token before emitting
+`Cancelled`; terminal completion and timeout also mark it, so a worker can stop
+before opening another camera frame or loading another template. Workers must
+check the token at bounded operation boundaries and must not synthesize terminal
+`Cancelled` or `TimedOut` decisions themselves.
+
 Completion consumes the slot and produces exactly one terminal response.
 `Cancelled` and `TimedOut` are manager-owned results and cannot be injected by
 the inference pipeline. At or after the deadline, progress, completion, or

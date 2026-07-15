@@ -1,5 +1,10 @@
 //! Bounded one-shot authentication transaction lifecycle for the privileged daemon.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use faceauth_authz::AuthorizationGrant;
 use faceauth_protocol::{DecisionCode, ProgressCode, Response, TransactionId};
 use thiserror::Error;
@@ -24,6 +29,29 @@ impl ConnectionToken {
         let mut token = [0_u8; 16];
         getrandom::fill(&mut token)?;
         Ok(Self(token))
+    }
+}
+
+/// Daemon-internal cancellation signal for one admitted transaction.
+///
+/// The token is never serialized and can only be obtained after validating the exact connection
+/// and transaction binding. It is safe to clone into a bounded capture/inference worker.
+#[derive(Clone, Debug)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Return whether the owning transaction was cancelled or reached a terminal state.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -61,6 +89,7 @@ struct ActiveSession {
     grant: AuthorizationGrant,
     connection: ConnectionToken,
     deadline_micros: u64,
+    cancellation: CancellationToken,
 }
 
 /// Single-capacity authentication transaction manager.
@@ -104,7 +133,12 @@ impl SessionManager {
             .checked_add(self.config.transaction_duration_micros)
             .ok_or(SessionError::DeadlineOverflow)?;
         let transaction_id = grant.transaction_id;
-        self.active = Some(ActiveSession { grant, connection, deadline_micros });
+        self.active = Some(ActiveSession {
+            grant,
+            connection,
+            deadline_micros,
+            cancellation: CancellationToken::new(),
+        });
         Ok(Response::Started { transaction_id })
     }
 
@@ -168,6 +202,9 @@ impl SessionManager {
         now_micros: u64,
     ) -> Result<Response, SessionError> {
         self.verify_binding(connection, transaction_id)?;
+        if let Some(active) = self.active.as_ref() {
+            active.cancellation.cancel();
+        }
         if self.deadline_reached(now_micros)? {
             return self.take_terminal(DecisionCode::TimedOut);
         }
@@ -205,6 +242,23 @@ impl SessionManager {
             .ok_or(SessionError::NoActiveTransaction)
     }
 
+    /// Return a cancellation signal for the exact active connection and transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError`] when no transaction is active or either binding differs.
+    pub fn cancellation_token(
+        &self,
+        connection: ConnectionToken,
+        transaction_id: TransactionId,
+    ) -> Result<CancellationToken, SessionError> {
+        self.verify_binding(connection, transaction_id)?;
+        self.active
+            .as_ref()
+            .map(|active| active.cancellation.clone())
+            .ok_or(SessionError::NoActiveTransaction)
+    }
+
     fn verify_binding(
         &self,
         connection: ConnectionToken,
@@ -229,6 +283,7 @@ impl SessionManager {
 
     fn take_terminal(&mut self, decision: DecisionCode) -> Result<Response, SessionError> {
         let active = self.active.take().ok_or(SessionError::NoActiveTransaction)?;
+        active.cancellation.cancel();
         Ok(Response::Completed { transaction_id: active.grant.transaction_id, decision })
     }
 }
@@ -292,6 +347,7 @@ mod tests {
             manager.start(grant, connection, 1_000_000)?,
             Response::Started { transaction_id }
         );
+        let cancellation = manager.cancellation_token(connection, transaction_id)?;
         assert_eq!(
             manager.progress(connection, transaction_id, ProgressCode::HoldStill, 2_000_000)?,
             Response::Progress { transaction_id, progress: ProgressCode::HoldStill }
@@ -300,6 +356,7 @@ mod tests {
             manager.complete(connection, transaction_id, DecisionCode::Accepted, 3_000_000)?,
             Response::Completed { transaction_id, decision: DecisionCode::Accepted }
         );
+        assert!(cancellation.is_cancelled());
         assert!(matches!(
             manager.complete(connection, transaction_id, DecisionCode::Accepted, 3_000_001),
             Err(SessionError::NoActiveTransaction)
@@ -324,6 +381,33 @@ mod tests {
         assert!(matches!(
             manager.target_uid(connection, TransactionId::generate()),
             Err(SessionError::WrongTransaction)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_token_is_bound_and_signaled_before_terminal_cancel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut manager = SessionManager::new(SessionConfig::default())?;
+        let connection = ConnectionToken::generate()?;
+        let other_connection = ConnectionToken::generate()?;
+        let grant = grant()?;
+        let transaction_id = grant.transaction_id;
+        let _ = manager.start(grant, connection, 1_000_000)?;
+        let token = manager.cancellation_token(connection, transaction_id)?;
+        assert!(!token.is_cancelled());
+        assert!(matches!(
+            manager.cancellation_token(other_connection, transaction_id),
+            Err(SessionError::WrongConnection)
+        ));
+        assert_eq!(
+            manager.cancel(connection, transaction_id, 2_000_000)?,
+            Response::Completed { transaction_id, decision: DecisionCode::Cancelled }
+        );
+        assert!(token.is_cancelled());
+        assert!(matches!(
+            manager.cancellation_token(connection, transaction_id),
+            Err(SessionError::NoActiveTransaction)
         ));
         Ok(())
     }
