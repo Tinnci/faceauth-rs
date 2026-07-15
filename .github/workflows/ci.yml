@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install --yes libtss2-dev libudev-dev
+      - run: sudo apt-get update && sudo apt-get install --yes libpam0g-dev libtss2-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
