@@ -12,7 +12,7 @@ pub use tpm::TpmKeyProvider;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -35,6 +35,23 @@ const HEADER_LENGTH: usize = MAGIC.len() + std::mem::size_of::<u16>() + NONCE_LE
 const MAX_CIPHERTEXT_LENGTH: usize = 1024 * 1024;
 const MAX_EMBEDDING_DIMENSION: usize = 4096;
 const KEY_LENGTH: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrustPolicy {
+    owner_uid: u32,
+    verify_ancestors: bool,
+}
+
+impl TrustPolicy {
+    const fn root() -> Self {
+        Self { owner_uid: 0, verify_ancestors: true }
+    }
+
+    #[cfg(test)]
+    const fn test(owner_uid: u32) -> Self {
+        Self { owner_uid, verify_ancestors: false }
+    }
+}
 
 /// Strength of the key protection selected by the daemon.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -93,13 +110,14 @@ pub trait KeyProvider {
 #[derive(Clone, Debug)]
 pub struct FileKeyProvider {
     path: PathBuf,
+    trust: TrustPolicy,
 }
 
 impl FileKeyProvider {
     /// Use a specific key path. The parent directory must already be administrator-controlled.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self { path: path.into(), trust: TrustPolicy::root() }
     }
 
     /// Return the configured key path.
@@ -111,9 +129,11 @@ impl FileKeyProvider {
 
 impl KeyProvider for FileKeyProvider {
     fn load_key(&self) -> Result<SecretKey, KeyError> {
-        reject_symlink_key(&self.path)?;
-        match OpenOptions::new().read(true).open(&self.path) {
-            Ok(file) => read_key_file(file, &self.path),
+        let parent = self.path.parent().ok_or_else(|| KeyError::InvalidPath(self.path.clone()))?;
+        verify_directory_key(parent, self.trust)?;
+        verify_replace_target_key(&self.path, self.trust)?;
+        match open_read_nofollow(&self.path) {
+            Ok(file) => read_key_file(file, &self.path, self.trust),
             Err(error) if error.kind() == io::ErrorKind::NotFound => self.create_key(),
             Err(error) => Err(KeyError::Io(error)),
         }
@@ -125,22 +145,33 @@ impl KeyProvider for FileKeyProvider {
 }
 
 impl FileKeyProvider {
+    #[cfg(test)]
+    fn for_test(path: impl Into<PathBuf>, owner_uid: u32) -> Self {
+        Self { path: path.into(), trust: TrustPolicy::test(owner_uid) }
+    }
+
     fn create_key(&self) -> Result<SecretKey, KeyError> {
         let mut bytes = [0_u8; KEY_LENGTH];
         getrandom::fill(&mut bytes).map_err(|error| KeyError::Random(error.to_string()))?;
-        let mut file =
-            match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    bytes.zeroize();
-                    return self.load_key();
-                }
-                Err(error) => {
-                    bytes.zeroize();
-                    return Err(KeyError::Io(error));
-                }
-            };
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&self.path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                bytes.zeroize();
+                return self.load_key();
+            }
+            Err(error) => {
+                bytes.zeroize();
+                return Err(KeyError::Io(error));
+            }
+        };
         let result: Result<SecretKey, KeyError> = (|| {
+            verify_open_key_file(&file, &self.path, self.trust)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             SecretKey::from_slice(&bytes)
@@ -150,11 +181,8 @@ impl FileKeyProvider {
     }
 }
 
-fn read_key_file(mut file: File, path: &Path) -> Result<SecretKey, KeyError> {
-    let mode = file.metadata()?.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(KeyError::UnsafePermissions { path: path.to_owned(), mode: mode & 0o777 });
-    }
+fn read_key_file(mut file: File, path: &Path, trust: TrustPolicy) -> Result<SecretKey, KeyError> {
+    verify_open_key_file(&file, path, trust)?;
     let mut bytes = Vec::with_capacity(KEY_LENGTH);
     file.read_to_end(&mut bytes)?;
     SecretKey::from_slice(&bytes)
@@ -228,6 +256,7 @@ impl TemplateRecord {
 pub struct EncryptedTemplateStore<K> {
     directory: PathBuf,
     key_provider: K,
+    trust: TrustPolicy,
 }
 
 impl<K> EncryptedTemplateStore<K>
@@ -237,7 +266,7 @@ where
     /// Create a store rooted at an administrator-controlled directory.
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>, key_provider: K) -> Self {
-        Self { directory: directory.into(), key_provider }
+        Self { directory: directory.into(), key_provider, trust: TrustPolicy::root() }
     }
 
     /// Report the selected key protection strength.
@@ -254,8 +283,8 @@ where
     /// fails.
     pub fn save(&self, record: &TemplateRecord) -> Result<(), StorageError> {
         record.validate()?;
+        prepare_directory_storage(&self.directory, self.trust)?;
         let key = self.key_provider.load_key()?;
-        fs::create_dir_all(&self.directory)?;
         let plaintext = Zeroizing::new(serde_json::to_vec(record)?);
         let nonce = random_nonce()?;
         let aad = associated_data(record.uid);
@@ -271,7 +300,7 @@ where
         encoded.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
-        atomic_write(&self.path_for(record.uid), &encoded, &self.directory)
+        atomic_write(&self.path_for(record.uid), &encoded, &self.directory, self.trust)
     }
 
     /// Load and authenticate a record for one UID.
@@ -282,12 +311,10 @@ where
     /// invalid, or the record belongs to another UID.
     pub fn load(&self, uid: u32) -> Result<TemplateRecord, StorageError> {
         let path = self.path_for(uid);
-        reject_symlink_storage(&path)?;
-        let mut file = File::open(&path)?;
-        let mode = file.metadata()?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(StorageError::UnsafePermissions { path, mode: mode & 0o777 });
-        }
+        verify_directory_storage(&self.directory, self.trust)?;
+        verify_replace_target_storage(&path, self.trust)?;
+        let mut file = open_read_nofollow(&path)?;
+        verify_open_storage_file(&file, &path, self.trust)?;
         let mut encoded = Vec::new();
         file.read_to_end(&mut encoded)?;
         if encoded.len() < HEADER_LENGTH || encoded.len() > HEADER_LENGTH + MAX_CIPHERTEXT_LENGTH {
@@ -327,6 +354,11 @@ where
     fn path_for(&self, uid: u32) -> PathBuf {
         self.directory.join(format!("{uid}.template"))
     }
+
+    #[cfg(test)]
+    fn for_test(directory: impl Into<PathBuf>, key_provider: K, owner_uid: u32) -> Self {
+        Self { directory: directory.into(), key_provider, trust: TrustPolicy::test(owner_uid) }
+    }
 }
 
 fn random_nonce() -> Result<[u8; NONCE_LENGTH], StorageError> {
@@ -343,47 +375,237 @@ fn associated_data(uid: u32) -> Vec<u8> {
     aad
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], directory: &Path) -> Result<(), StorageError> {
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    directory: &Path,
+    trust: TrustPolicy,
+) -> Result<(), StorageError> {
+    verify_directory_storage(directory, trust)?;
+    verify_replace_target_storage(path, trust)?;
     let temporary = directory.join(format!(
         ".{}.tmp-{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         Uuid::new_v4()
     ));
-    let result = (|| {
-        let mut file =
-            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+    let result: Result<(), StorageError> = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        verify_open_storage_file(&file, &temporary, trust)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         let directory_file = File::open(directory)?;
         directory_file.sync_all()?;
-        Ok::<(), io::Error>(())
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map_err(StorageError::Io)
+    result
 }
 
-fn reject_symlink_key(path: &Path) -> Result<(), KeyError> {
+fn prepare_directory_storage(directory: &Path, trust: TrustPolicy) -> Result<(), StorageError> {
+    match fs::symlink_metadata(directory) {
+        Ok(_) => verify_directory_storage(directory, trust),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut existing = directory
+                .parent()
+                .ok_or_else(|| StorageError::UnsafePathType { path: directory.to_owned() })?;
+            while !existing.exists() {
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| StorageError::UnsafePathType { path: directory.to_owned() })?;
+            }
+            verify_directory_storage(existing, trust)?;
+            fs::create_dir_all(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            verify_directory_storage(directory, trust)
+        }
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
+pub(crate) fn prepare_directory_key(directory: &Path, trust: TrustPolicy) -> Result<(), KeyError> {
+    match fs::symlink_metadata(directory) {
+        Ok(_) => verify_directory_key(directory, trust),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut existing =
+                directory.parent().ok_or_else(|| KeyError::InvalidPath(directory.to_owned()))?;
+            while !existing.exists() {
+                existing =
+                    existing.parent().ok_or_else(|| KeyError::InvalidPath(directory.to_owned()))?;
+            }
+            verify_directory_key(existing, trust)?;
+            fs::create_dir_all(directory)?;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            verify_directory_key(directory, trust)
+        }
+        Err(error) => Err(KeyError::Io(error)),
+    }
+}
+
+fn verify_directory_storage(path: &Path, trust: TrustPolicy) -> Result<(), StorageError> {
+    verify_directory_chain(path, trust).map_err(|violation| match violation {
+        TrustViolation::Io(error) => StorageError::Io(error),
+        TrustViolation::Owner { path, actual_uid } => {
+            StorageError::UnsafeOwner { path, expected_uid: trust.owner_uid, actual_uid }
+        }
+        TrustViolation::Permissions { path, mode } => {
+            StorageError::UnsafePermissions { path, mode }
+        }
+        TrustViolation::Type { path } => StorageError::UnsafePathType { path },
+    })
+}
+
+pub(crate) fn verify_directory_key(path: &Path, trust: TrustPolicy) -> Result<(), KeyError> {
+    verify_directory_chain(path, trust).map_err(|violation| match violation {
+        TrustViolation::Io(error) => KeyError::Io(error),
+        TrustViolation::Owner { path, actual_uid } => {
+            KeyError::UnsafeOwner { path, expected_uid: trust.owner_uid, actual_uid }
+        }
+        TrustViolation::Permissions { path, mode } => KeyError::UnsafePermissions { path, mode },
+        TrustViolation::Type { path } => KeyError::UnsafePathType { path },
+    })
+}
+
+fn verify_directory_chain(path: &Path, trust: TrustPolicy) -> Result<(), TrustViolation> {
+    let mut directories = path.ancestors();
+    loop {
+        let Some(directory) = directories.next() else {
+            return Ok(());
+        };
+        let metadata = fs::symlink_metadata(directory).map_err(TrustViolation::Io)?;
+        if !metadata.file_type().is_dir() {
+            return Err(TrustViolation::Type { path: directory.to_owned() });
+        }
+        if metadata.uid() != trust.owner_uid {
+            return Err(TrustViolation::Owner {
+                path: directory.to_owned(),
+                actual_uid: metadata.uid(),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(TrustViolation::Permissions { path: directory.to_owned(), mode });
+        }
+        if !trust.verify_ancestors {
+            return Ok(());
+        }
+    }
+}
+
+pub(crate) fn verify_open_key_file(
+    file: &File,
+    path: &Path,
+    trust: TrustPolicy,
+) -> Result<(), KeyError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(KeyError::UnsafePathType { path: path.to_owned() });
+    }
+    if metadata.uid() != trust.owner_uid {
+        return Err(KeyError::UnsafeOwner {
+            path: path.to_owned(),
+            expected_uid: trust.owner_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(KeyError::UnsafePermissions { path: path.to_owned(), mode });
+    }
+    Ok(())
+}
+
+fn verify_open_storage_file(
+    file: &File,
+    path: &Path,
+    trust: TrustPolicy,
+) -> Result<(), StorageError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(StorageError::UnsafePathType { path: path.to_owned() });
+    }
+    if metadata.uid() != trust.owner_uid {
+        return Err(StorageError::UnsafeOwner {
+            path: path.to_owned(),
+            expected_uid: trust.owner_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(StorageError::UnsafePermissions { path: path.to_owned(), mode });
+    }
+    Ok(())
+}
+
+fn verify_replace_target_storage(path: &Path, trust: TrustPolicy) -> Result<(), StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(StorageError::Symlink { path: path.to_owned() })
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            Err(StorageError::UnsafePathType { path: path.to_owned() })
+        }
+        Ok(metadata) if metadata.uid() != trust.owner_uid => Err(StorageError::UnsafeOwner {
+            path: path.to_owned(),
+            expected_uid: trust.owner_uid,
+            actual_uid: metadata.uid(),
+        }),
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                Err(StorageError::UnsafePermissions { path: path.to_owned(), mode })
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
+pub(crate) fn verify_replace_target_key(path: &Path, trust: TrustPolicy) -> Result<(), KeyError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err(KeyError::Symlink { path: path.to_owned() })
         }
-        Ok(_) => Ok(()),
+        Ok(metadata) if !metadata.is_file() => {
+            Err(KeyError::UnsafePathType { path: path.to_owned() })
+        }
+        Ok(metadata) if metadata.uid() != trust.owner_uid => Err(KeyError::UnsafeOwner {
+            path: path.to_owned(),
+            expected_uid: trust.owner_uid,
+            actual_uid: metadata.uid(),
+        }),
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                Err(KeyError::UnsafePermissions { path: path.to_owned(), mode })
+            } else {
+                Ok(())
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(KeyError::Io(error)),
     }
 }
 
-fn reject_symlink_storage(path: &Path) -> Result<(), StorageError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err(StorageError::Symlink { path: path.to_owned() })
-        }
-        Ok(_) => Ok(()),
-        Err(error) => Err(StorageError::Io(error)),
-    }
+enum TrustViolation {
+    Io(io::Error),
+    Owner { path: PathBuf, actual_uid: u32 },
+    Permissions { path: PathBuf, mode: u32 },
+    Type { path: PathBuf },
+}
+
+pub(crate) fn open_read_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
 }
 
 /// Key loading failure.
@@ -413,6 +635,22 @@ pub enum KeyError {
         path: PathBuf,
         /// Unix permission bits.
         mode: u32,
+    },
+    /// Key file or containing directory has an unexpected owner.
+    #[error("key path {path} owner {actual_uid} does not match required UID {expected_uid}")]
+    UnsafeOwner {
+        /// Rejected path.
+        path: PathBuf,
+        /// Required owner UID.
+        expected_uid: u32,
+        /// Actual owner UID.
+        actual_uid: u32,
+    },
+    /// Key path component is not the required regular-file or directory type.
+    #[error("key path has unsafe filesystem type: {path}")]
+    UnsafePathType {
+        /// Rejected path.
+        path: PathBuf,
     },
     /// The key path is a symbolic link.
     #[error("key path {path} must not be a symbolic link")]
@@ -460,6 +698,22 @@ pub enum StorageError {
         /// Unix permission bits.
         mode: u32,
     },
+    /// Template file or containing directory has an unexpected owner.
+    #[error("template path {path} owner {actual_uid} does not match required UID {expected_uid}")]
+    UnsafeOwner {
+        /// Rejected path.
+        path: PathBuf,
+        /// Required owner UID.
+        expected_uid: u32,
+        /// Actual owner UID.
+        actual_uid: u32,
+    },
+    /// Template path component is not the required regular-file or directory type.
+    #[error("template path has unsafe filesystem type: {path}")]
+    UnsafePathType {
+        /// Rejected path.
+        path: PathBuf,
+    },
     /// Random nonce generation failed.
     #[error("random source failed: {0}")]
     Random(String),
@@ -500,11 +754,17 @@ mod tests {
         Ok(directory)
     }
 
+    fn test_store(
+        directory: &Path,
+    ) -> Result<EncryptedTemplateStore<TestKeyProvider>, StorageError> {
+        let owner_uid = fs::metadata(directory)?.uid();
+        Ok(EncryptedTemplateStore::for_test(directory, TestKeyProvider([7; KEY_LENGTH]), owner_uid))
+    }
+
     #[test]
     fn encrypted_records_round_trip_without_raw_frames() -> Result<(), StorageError> {
         let directory = temporary_directory()?;
-        let store =
-            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        let store = test_store(&directory)?;
         let expected = record(1000);
         store.save(&expected)?;
         let actual = store.load(1000)?;
@@ -518,8 +778,7 @@ mod tests {
     #[test]
     fn tampering_fails_authenticated_decryption() -> Result<(), StorageError> {
         let directory = temporary_directory()?;
-        let store =
-            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        let store = test_store(&directory)?;
         store.save(&record(1000))?;
         let path = directory.join("1000.template");
         let mut bytes = fs::read(&path)?;
@@ -537,7 +796,8 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("faceauth-key-{}", Uuid::new_v4()));
         fs::create_dir(&directory).map_err(KeyError::Io)?;
         let path = directory.join("machine.key");
-        let provider = FileKeyProvider::new(&path);
+        let owner_uid = fs::metadata(&directory).map_err(KeyError::Io)?.uid();
+        let provider = FileKeyProvider::for_test(&path, owner_uid);
         let first = provider.load_key()?;
         let second = provider.load_key()?;
 
@@ -552,8 +812,7 @@ mod tests {
     #[test]
     fn template_symlink_is_rejected() -> Result<(), StorageError> {
         let directory = temporary_directory()?;
-        let store =
-            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        let store = test_store(&directory)?;
         store.save(&record(1000))?;
         let target = directory.join("real.template");
         fs::rename(directory.join("1000.template"), &target)?;
@@ -567,8 +826,7 @@ mod tests {
     #[test]
     fn template_group_permissions_are_rejected() -> Result<(), StorageError> {
         let directory = temporary_directory()?;
-        let store =
-            EncryptedTemplateStore::new(directory.clone(), TestKeyProvider([7; KEY_LENGTH]));
+        let store = test_store(&directory)?;
         store.save(&record(1000))?;
         let path = directory.join("1000.template");
         let mut permissions = fs::metadata(&path)?.permissions();
@@ -603,5 +861,51 @@ mod tests {
         let mut template = record(1000);
         template.embedding = vec![0.5, 0.0, 0.0];
         assert!(matches!(template.validate(), Err(StorageError::InvalidRecord(_))));
+    }
+
+    #[test]
+    fn unsafe_or_wrong_owner_directories_are_rejected() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let owner_uid = fs::metadata(&directory)?.uid();
+        let wrong_owner_store = EncryptedTemplateStore::for_test(
+            &directory,
+            TestKeyProvider([7; KEY_LENGTH]),
+            owner_uid.saturating_add(1),
+        );
+        assert!(matches!(
+            wrong_owner_store.save(&record(1000)),
+            Err(StorageError::UnsafeOwner { .. })
+        ));
+
+        let mut permissions = fs::metadata(&directory)?.permissions();
+        permissions.set_mode(0o770);
+        fs::set_permissions(&directory, permissions)?;
+        let unsafe_mode_store = EncryptedTemplateStore::for_test(
+            &directory,
+            TestKeyProvider([7; KEY_LENGTH]),
+            owner_uid,
+        );
+        assert!(matches!(
+            unsafe_mode_store.save(&record(1000)),
+            Err(StorageError::UnsafePermissions { .. })
+        ));
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn file_key_symlink_is_rejected_even_when_target_is_owner_only() -> Result<(), KeyError> {
+        let directory = std::env::temp_dir().join(format!("faceauth-key-{}", Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let owner_uid = fs::metadata(&directory)?.uid();
+        let target = directory.join("target.key");
+        fs::write(&target, [7_u8; KEY_LENGTH])?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        let link = directory.join("machine.key");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let provider = FileKeyProvider::for_test(&link, owner_uid);
+        assert!(matches!(provider.load_key(), Err(KeyError::Symlink { .. })));
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
     }
 }

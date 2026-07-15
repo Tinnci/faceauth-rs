@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -22,7 +22,10 @@ use tss_esapi::{
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use super::{KEY_LENGTH, KeyError, KeyProvider, KeyStrength, SecretKey};
+use super::{
+    KEY_LENGTH, KeyError, KeyProvider, KeyStrength, SecretKey, TrustPolicy, open_read_nofollow,
+    prepare_directory_key, verify_directory_key, verify_open_key_file, verify_replace_target_key,
+};
 
 const BLOB_MAGIC: &[u8; 4] = b"FATK";
 const BLOB_VERSION: u16 = 1;
@@ -38,19 +41,24 @@ const MAX_BLOB_LENGTH: usize = 64 * 1024;
 pub struct TpmKeyProvider {
     blob_path: PathBuf,
     tcti: String,
+    trust: TrustPolicy,
 }
 
 impl TpmKeyProvider {
     /// Use the kernel resource manager at `/dev/tpmrm0` and persist one sealed-key blob.
     #[must_use]
     pub fn new(blob_path: impl Into<PathBuf>) -> Self {
-        Self { blob_path: blob_path.into(), tcti: "device:/dev/tpmrm0".to_owned() }
+        Self {
+            blob_path: blob_path.into(),
+            tcti: "device:/dev/tpmrm0".to_owned(),
+            trust: TrustPolicy::root(),
+        }
     }
 
     /// Override the TCTI string for testing with a TPM simulator or another device.
     #[must_use]
     pub fn with_tcti(blob_path: impl Into<PathBuf>, tcti: impl Into<String>) -> Self {
-        Self { blob_path: blob_path.into(), tcti: tcti.into() }
+        Self { blob_path: blob_path.into(), tcti: tcti.into(), trust: TrustPolicy::root() }
     }
 
     /// Return the sealed-key blob path.
@@ -85,7 +93,7 @@ impl TpmKeyProvider {
     fn create_sealed_key(&self) -> Result<SecretKey, KeyError> {
         let parent =
             self.blob_path.parent().ok_or_else(|| KeyError::InvalidPath(self.blob_path.clone()))?;
-        fs::create_dir_all(parent)?;
+        prepare_directory_key(parent, self.trust)?;
         let mut context = self.context()?;
         let primary = create_primary(&mut context)?;
         let mut key_bytes = [0_u8; KEY_LENGTH];
@@ -101,7 +109,7 @@ impl TpmKeyProvider {
         let public_buffer = PublicBuffer::try_from(created.out_public)
             .map_err(|error| KeyError::Tpm(error.to_string()))?;
         let encoded = encode_blob(public_buffer.value(), created.out_private.value())?;
-        let write_result = atomic_write_blob(&self.blob_path, &encoded, parent);
+        let write_result = atomic_write_blob(&self.blob_path, &encoded, parent, self.trust);
         let flush_result =
             context.flush_context(primary.into()).map_err(|error| KeyError::Tpm(error.to_string()));
         if let Err(error) = write_result {
@@ -115,8 +123,11 @@ impl TpmKeyProvider {
     }
 
     fn unseal_key(&self) -> Result<SecretKey, KeyError> {
-        reject_symlink(&self.blob_path)?;
-        let (public_bytes, private_bytes) = read_blob(&self.blob_path)?;
+        let parent =
+            self.blob_path.parent().ok_or_else(|| KeyError::InvalidPath(self.blob_path.clone()))?;
+        verify_directory_key(parent, self.trust)?;
+        verify_replace_target_key(&self.blob_path, self.trust)?;
+        let (public_bytes, private_bytes) = read_blob(&self.blob_path, self.trust)?;
         let public_buffer = PublicBuffer::try_from(public_bytes)
             .map_err(|error| KeyError::Tpm(error.to_string()))?;
         let public =
@@ -223,12 +234,9 @@ fn encode_blob(public: &[u8], private: &[u8]) -> Result<Vec<u8>, KeyError> {
     Ok(encoded)
 }
 
-fn read_blob(path: &Path) -> Result<(Vec<u8>, Vec<u8>), KeyError> {
-    let file = File::open(path)?;
-    let mode = file.metadata()?.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(KeyError::UnsafePermissions { path: path.to_owned(), mode: mode & 0o777 });
-    }
+fn read_blob(path: &Path, trust: TrustPolicy) -> Result<(Vec<u8>, Vec<u8>), KeyError> {
+    let file = open_read_nofollow(path)?;
+    verify_open_key_file(&file, path, trust)?;
     let mut encoded = Vec::new();
     file.take(u64::try_from(MAX_BLOB_LENGTH + 1).map_err(|_| KeyError::InvalidBlob)?)
         .read_to_end(&mut encoded)?;
@@ -264,34 +272,39 @@ fn read_blob(path: &Path) -> Result<(Vec<u8>, Vec<u8>), KeyError> {
     Ok((encoded[public_start..public_end].to_vec(), encoded[public_end..private_end].to_vec()))
 }
 
-fn atomic_write_blob(path: &Path, bytes: &[u8], directory: &Path) -> Result<(), KeyError> {
+fn atomic_write_blob(
+    path: &Path,
+    bytes: &[u8],
+    directory: &Path,
+    trust: TrustPolicy,
+) -> Result<(), KeyError> {
+    verify_directory_key(directory, trust)?;
+    verify_replace_target_key(path, trust)?;
     let temporary = directory.join(format!(".faceauth-tpm-key.tmp-{}", Uuid::new_v4()));
-    let result = (|| {
-        let mut file =
-            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+    let result: Result<(), KeyError> = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        verify_open_key_file(&file, &temporary, trust)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         File::open(directory)?.sync_all()?;
-        Ok::<(), io::Error>(())
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map_err(KeyError::Io)
-}
-
-fn reject_symlink(path: &Path) -> Result<(), KeyError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        Err(KeyError::Symlink { path: path.to_owned() })
-    } else {
-        Ok(())
-    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     use super::*;
 
     #[test]
@@ -304,7 +317,8 @@ mod tests {
         let mut permissions = fs::metadata(&path)?.permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(&path, permissions)?;
-        let decoded = read_blob(&path)?;
+        let owner_uid = fs::metadata(&path)?.uid();
+        let decoded = read_blob(&path, TrustPolicy::test(owner_uid))?;
 
         assert_eq!(decoded, (public, private));
         let _ = fs::remove_file(path);
