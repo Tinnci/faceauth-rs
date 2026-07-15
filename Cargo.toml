@@ -10,6 +10,7 @@ members = [
     "crates/faceauth-inference",
     "crates/faceauth-liveness",
     "crates/faceauth-management",
+    "crates/faceauth-management-dbus",
     "crates/faceauth-model",
     "crates/faceauth-presence",
     "crates/pam-faceauth",

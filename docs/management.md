@@ -1,8 +1,8 @@
 # Desktop-independent management contract
 
-`faceauth-management` defines the version-1 contract that a future system D-Bus adapter, KDE
-System Settings module, and enrollment OSD consume. The Rust crate owns the security-relevant
-operation lifecycle; a desktop adapter must remain a thin translation layer.
+`faceauth-management` defines the version-1 contract that the `faceauth-management-dbus` adapter,
+future KDE System Settings module, and enrollment OSD consume. The core crate owns the
+security-relevant operation lifecycle; the D-Bus crate remains a thin translation layer.
 
 Stable identifiers:
 
@@ -15,13 +15,34 @@ The matching introspection input is
 [`org.faceauth.Manager1.xml`](../contrib/dbus/org.faceauth.Manager1.xml). It is a packaging input and
 is not installed or claimed by the current daemon.
 
+## D-Bus adapter
+
+`faceauth-management-dbus` implements the `org.faceauth.Manager1` method and signal shape with zbus
+4.x. It reads the unique sender from the D-Bus message header, never from a serialized method
+argument. Its injected `AuthorizationBackend` must resolve the sender's kernel UID and perform the
+fresh `org.faceauth.enroll` Polkit decision before returning an `AuthorizedEnrollment` proof. The
+crate does not contain a permissive default backend and therefore cannot bypass this boundary.
+
+The adapter currently admits only a caller managing its own numeric UID. `GetEnrollmentState`
+delegates the enrolled-template lookup to the injected backend after that identity check;
+coordinator busy state is not mistaken for enrollment state. `BeginEnrollment` also checks that the
+returned authorization proof is bound to that exact UID. Cancellation parses the opaque UUID and
+requires the same sender-derived UID plus operation ID. Backend failures, absent senders,
+mismatched UIDs, malformed operation IDs, and poisoned coordinator state fail closed.
+
+The daemon obtains a `ManagementWorkerHandle` that uses the adapter's exact coordinator and
+monotonic clock for progress, completion, and timeout reaping. It can emit only the resulting
+`ManagementUpdate` values through the adapter. Signals are restricted to the stable public codes
+listed below. No test claims the system bus name, and no production Polkit broker or D-Bus service
+activation is enabled by this milestone.
+
 ## Authorization and identity
 
 `BeginEnrollment` cannot directly create an operation from caller-supplied UID data. The D-Bus
-adapter must derive the unique bus sender, resolve its kernel credentials, perform the
-`org.faceauth.enroll` Polkit check, and have the daemon validate the resulting exact root broker
-grant. Only then can `AuthorizedEnrollment::from_grant` produce the opaque value accepted by
-`ManagementCoordinator::start`.
+adapter derives the unique bus sender and delegates kernel-credential resolution and the
+`org.faceauth.enroll` Polkit check to the injected backend. The daemon must validate the resulting
+exact root broker grant. Only then can `AuthorizedEnrollment::from_grant` produce the opaque value
+accepted by `ManagementCoordinator::start`.
 
 Enrollment state queries must likewise enforce caller-to-target UID policy. Serialized UIDs,
 operation IDs, object paths, and bus names never prove identity. Disconnect handling must cancel

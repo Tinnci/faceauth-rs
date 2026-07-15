@@ -30,10 +30,13 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
    whose graph I/O must exactly match an admitted manifest.
 12. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
-13. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
+13. `faceauth-management`: desktop-independent enrollment authorization and operation lifecycle.
+14. `faceauth-management-dbus`: thin zbus Manager1 adapter with injected credential and Polkit
+   authorization; it has no permissive default backend.
+15. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
-14. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
-15. KDE KCM and lock-screen status UI: optional clients over stable APIs.
+16. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
+17. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
 The authentication transport contract is described in [ipc.md](ipc.md). Caller
 numeric peer identity comes from Unix peer credentials, not serialized request

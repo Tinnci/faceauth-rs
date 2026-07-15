@@ -1,0 +1,19 @@
+[package]
+name = "faceauth-management-dbus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+faceauth-management = { path = "../faceauth-management", version = "0.1.0" }
+zbus.workspace = true
+
+[dev-dependencies]
+faceauth-authz = { path = "../faceauth-authz", version = "0.1.0" }
+faceauth-protocol = { path = "../faceauth-protocol", version = "0.1.0" }
+faceauth-transport = { path = "../faceauth-transport", version = "0.1.0" }
+
+[lints]
+workspace = true

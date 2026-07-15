@@ -3,7 +3,9 @@
 use faceauth_authz::AuthorizationGrant;
 use faceauth_protocol::AuthenticationPurpose;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
+
 use uuid::Uuid;
 
 /// Stable system D-Bus service name reserved for the future adapter.
@@ -60,6 +62,21 @@ pub struct OperationId(Uuid);
 impl OperationId {
     fn generate() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Parse an operation identifier received from an external management client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManagementError::InvalidOperationId`] for malformed identifiers.
+    pub fn parse(value: &str) -> Result<Self, ManagementError> {
+        Uuid::parse_str(value).map(Self).map_err(|_| ManagementError::InvalidOperationId)
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -317,6 +334,9 @@ pub enum ManagementError {
     /// Operation identifier did not match.
     #[error("management operation identifier does not match")]
     WrongOperation,
+    /// Operation identifier was not a canonical UUID.
+    #[error("management operation identifier is invalid")]
+    InvalidOperationId,
     /// Caller tried to synthesize coordinator-owned cancellation or timeout.
     #[error("cancelled and timed-out management results are reserved")]
     ReservedResult,
@@ -377,6 +397,8 @@ mod tests {
         let mut coordinator = ManagementCoordinator::new(ManagementConfig::default())?;
         let started = coordinator.start(authorization, 1_000_000)?;
         let operation_id = id_from_update(started);
+        assert_eq!(OperationId::parse(&operation_id.to_string())?, operation_id);
+        assert_eq!(OperationId::parse("not-a-uuid"), Err(ManagementError::InvalidOperationId));
         assert!(coordinator.is_busy());
         assert_eq!(coordinator.start(authorization, 1_000_001), Err(ManagementError::Busy));
         assert_eq!(
