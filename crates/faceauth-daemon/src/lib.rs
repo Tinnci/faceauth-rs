@@ -13,7 +13,8 @@ use faceauth_inference::{FaceEmbedding, InferenceError, PassiveLivenessScore};
 use faceauth_liveness::ChallengeProgress;
 use faceauth_model::ModelRole;
 use faceauth_protocol::{
-    AuthenticationPurpose, DecisionCode, RejectionCode, Request, Response, TransactionId,
+    AuthenticationPurpose, DecisionCode, ProgressCode, RejectionCode, Request, Response,
+    TransactionId,
 };
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
 use faceauth_storage::{
@@ -424,6 +425,47 @@ impl BoundaryService {
     pub const fn sessions(&mut self) -> &mut SessionManager {
         &mut self.sessions
     }
+
+    /// Emit one transaction-bound, non-biometric progress response on the admitted connection.
+    ///
+    /// If the session deadline has elapsed, the emitted response is terminal `TimedOut` and the
+    /// transaction is consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundaryError`] for an invalid session binding or response transport failure.
+    pub fn send_progress(
+        &mut self,
+        stream: &mut PeerStream,
+        connection: ConnectionToken,
+        transaction_id: TransactionId,
+        progress: ProgressCode,
+        now_micros: u64,
+    ) -> Result<Response, BoundaryError> {
+        let response = self.sessions.progress(connection, transaction_id, progress, now_micros)?;
+        stream.write_message(response.clone())?;
+        Ok(response)
+    }
+
+    /// Complete one authentication transaction and write its terminal response on the admitted
+    /// connection.
+    ///
+    /// The session is consumed before the response write. A broken client connection therefore
+    /// cannot retry or replay a successful terminal result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundaryError`] for an invalid session binding or response transport failure.
+    pub fn send_completion<S: TemplateSource>(
+        &mut self,
+        stream: &mut PeerStream,
+        templates: &S,
+        completion: AuthenticationCompletion<'_>,
+    ) -> Result<Response, BoundaryError> {
+        let response = complete_authentication(&mut self.sessions, templates, completion)?;
+        stream.write_message(response.clone())?;
+        Ok(response)
+    }
 }
 
 enum ExecutableOrAuthorizationError {
@@ -443,6 +485,9 @@ pub enum BoundaryError {
     /// Local protocol transport failed.
     #[error("daemon authentication boundary transport failed: {0}")]
     Transport(#[from] TransportError),
+    /// Authentication transaction binding or lifecycle failed.
+    #[error("daemon authentication session failed: {0}")]
+    Session(#[from] SessionError),
 }
 
 #[cfg(test)]
@@ -700,6 +745,85 @@ mod tests {
             Response::Completed { transaction_id, decision: DecisionCode::Accepted }
         );
         assert!(!sessions.is_busy());
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_socket_receives_started_progress_and_terminal_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let embedding = test_embedding(0xaa)?;
+        let source = TestTemplateSource {
+            record: Some(template_from_embedding(1000, &embedding)),
+            requested_uid: Cell::new(None),
+        };
+        let scores = pad_scores(0.99, 0.99)?;
+        let rule = AuthorizationRule {
+            service: ServiceName::parse("faceauth-test")?,
+            purpose: AuthenticationPurpose::Test,
+            caller: CallerRelation::RootOnly,
+            executables: vec![ExecutableFingerprint { device: 1, inode: 1 }],
+        };
+        let mut service = BoundaryService::new(
+            AuthorizationPolicy::new(vec![rule])?,
+            SessionManager::new(SessionConfig::default())?,
+        );
+        let connection = ConnectionToken::generate()?;
+        let transaction_id = TransactionId::generate();
+        let grant = AuthorizationGrant {
+            transaction_id,
+            peer: faceauth_transport::PeerIdentity { pid: 123, uid: 0, gid: 0 },
+            target_uid: 1000,
+            service: ServiceName::parse("faceauth-test")?,
+            purpose: AuthenticationPurpose::Test,
+            executable: ExecutableFingerprint { device: 1, inode: 1 },
+        };
+        let started = service.sessions().start(grant, connection, 1_000_000)?;
+        let (client, server) = UnixStream::pair()?;
+        let mut client = PeerStream::connect(client, TransportConfig::default())?;
+        let mut server = PeerStream::connect(server, TransportConfig::default())?;
+        server.write_message(started)?;
+        service.send_progress(
+            &mut server,
+            connection,
+            transaction_id,
+            ProgressCode::Processing,
+            2_000_000,
+        )?;
+        service.send_completion(
+            &mut server,
+            &source,
+            AuthenticationCompletion {
+                connection,
+                transaction_id,
+                policy: AuthPolicy::default(),
+                passive_pad_policy: &pad_policy(),
+                observation: AuthenticationObservation {
+                    timing: CapturePair {
+                        infrared_timestamp_micros: 2_000_000,
+                        visible_timestamp_micros: Some(2_010_000),
+                    },
+                    quality: 0.9,
+                    embedding: &embedding,
+                    passive_liveness: &scores,
+                    active_challenge: ChallengeProgress::Passed,
+                },
+                now_micros: 3_000_000,
+            },
+        )?;
+
+        assert_eq!(
+            client.read_message::<Response>()?.message,
+            Response::Started { transaction_id }
+        );
+        assert_eq!(
+            client.read_message::<Response>()?.message,
+            Response::Progress { transaction_id, progress: ProgressCode::Processing }
+        );
+        assert_eq!(
+            client.read_message::<Response>()?.message,
+            Response::Completed { transaction_id, decision: DecisionCode::Accepted }
+        );
+        assert!(!service.sessions().is_busy());
         Ok(())
     }
 

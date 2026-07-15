@@ -12,6 +12,8 @@ unlock, `sudo`, Polkit, or any other production authentication stack.
 - It connects only to `/run/faceauth/auth.sock` and requires the socket peer UID to be root.
 - It sends the versioned faceauth protocol with `AuthenticationPurpose::Test`.
 - It accepts only a matching transaction's terminal `DecisionCode::Accepted` response.
+- The daemon sends start, bounded UI progress, and the single terminal result on the same
+  peer-credentialed connection; reconnecting cannot recover or replay a completed success.
 - The exchange is bounded to 64 responses and 20 seconds.
 - Panics, malformed data, timeouts, unavailable services, rejections, and mismatches all become
   `PAM_IGNORE`; the surrounding PAM policy must retain a password path.
@@ -48,4 +50,3 @@ Test it only in an isolated PAM configuration location supported by the target d
 a disposable container/VM. Do not copy it over an existing system policy. Before any production
 integration, add an end-to-end libpam harness, package ownership checks, daemon mediation tests,
 distribution-specific policy review, and recovery testing for a stopped or compromised daemon.
-

@@ -85,6 +85,14 @@ collapse to `InternalError` at this post-admission boundary and never become
 success. A deadline reached during processing overrides even a valid biometric
 decision with `TimedOut`.
 
+`BoundaryService` writes `Started`, transaction-bound `Progress`, and the single
+terminal `Completed` response on the same peer-credentialed stream. Progress
+contains only stable UI prompt codes. Both progress and completion re-check the
+connection token and transaction identifier through `SessionManager`; a different
+socket cannot emit or consume another connection's transaction. Completion is
+consumed before writing, so a disconnected client cannot reconnect and replay a
+successful terminal response.
+
 ## PAM staging
 
 The first PAM integration must use a dedicated `faceauth-test` service. It must
