@@ -32,7 +32,7 @@ See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 [IPC boundary](docs/ipc.md), [model policy](docs/model-policy.md),
 [template storage](docs/storage.md), [camera capture](docs/capture.md),
 [active liveness](docs/liveness.md), [enrollment](docs/enrollment.md), and
-[research](docs/research.md).
+[presence integration](docs/presence.md), and [research](docs/research.md).
 
 ## Development
 
@@ -49,6 +49,7 @@ Read-only local diagnostics:
 ```bash
 cargo run -p faceauth-daemon -- doctor
 cargo run -p faceauth-daemon -- capture-doctor --config ./cameras.json
+cargo run -p faceauth-daemon -- presence-doctor
 cargo run -p faceauth-cli -- policy
 ```
 

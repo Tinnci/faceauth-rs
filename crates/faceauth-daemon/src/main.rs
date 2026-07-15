@@ -12,6 +12,7 @@ use faceauth_capture::{
     CaptureSpec, FrameSummary, PairingPolicy, PixelFormat, V4l2CaptureDevice, capture_pair,
 };
 use faceauth_core::CaptureModality;
+use faceauth_presence::HpdClient;
 use faceauth_storage::TpmKeyProvider;
 use serde::Serialize;
 use tracing::info;
@@ -40,6 +41,8 @@ enum Command {
         #[arg(long, default_value = "/etc/faceauth/cameras.json")]
         config: PathBuf,
     },
+    /// Read the optional thinkpad-hpd presence hint; never used for authentication.
+    PresenceDoctor,
     /// Refuse to start the production service until the transport is implemented.
     Serve,
 }
@@ -94,6 +97,14 @@ struct CaptureDoctorReport<'a> {
     visible: &'a FrameSummary,
     skew_micros: u64,
     raw_frames_retained: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PresenceDoctorReport {
+    available: bool,
+    present: bool,
+    raw_value: i32,
+    authentication_evidence: bool,
 }
 
 fn main() -> Result<()> {
@@ -186,6 +197,7 @@ fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::PresenceDoctor => run_presence_doctor()?,
         Command::Serve => {
             info!(
                 "service start refused: audited models, calibrated passive PAD orchestration, active-liveness orchestration, and enrollment are incomplete"
@@ -193,5 +205,17 @@ fn main() -> Result<()> {
             anyhow::bail!("faceauth-daemon is not production-ready")
         }
     }
+    Ok(())
+}
+
+fn run_presence_doctor() -> Result<()> {
+    let snapshot = HpdClient::system()?.get_state(0)?;
+    let report = PresenceDoctorReport {
+        available: snapshot.available,
+        present: snapshot.present,
+        raw_value: snapshot.raw_value,
+        authentication_evidence: false,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

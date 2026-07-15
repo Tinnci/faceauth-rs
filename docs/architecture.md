@@ -22,16 +22,18 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 7. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
 8. `faceauth-enrollment`: authorized, bounded multi-observation registration that
    retains only zeroizing embeddings and emits one encrypted-storage record.
-9. `faceauth-model`: bounded schema-v4 provenance, digest, preprocessing, semantic
+9. `faceauth-presence`: optional versioned thinkpad-hpd D-Bus hints and a generic
+   capture-activity lease registry; never part of identity evidence.
+10. `faceauth-model`: bounded schema-v4 provenance, digest, preprocessing, semantic
    output roles, and exact tensor-contract admission.
-10. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
+11. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
    whose graph I/O must exactly match an admitted manifest.
-11. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
+12. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
-12. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
+13. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
-13. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
-14. KDE KCM and lock-screen status UI: optional clients over stable APIs.
+14. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
+15. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
 The authentication transport contract is described in [ipc.md](ipc.md). Caller
 numeric peer identity comes from Unix peer credentials, not serialized request
@@ -81,6 +83,8 @@ reconstructs an enrolled comparison vector only after the authenticated record's
 schema, unit norm, compatibility digest, and dimension match the active session.
 Multi-sample registration and its dedicated root Polkit-broker grant are described
 in [enrollment.md](enrollment.md).
+The optional HPD contract and its fail-open semantics are described in
+[presence.md](presence.md).
 
 Landmark models provide bounded eye-openness, yaw, and face-count measurements to
 the active-challenge state machine. They do not decide challenge success. The
