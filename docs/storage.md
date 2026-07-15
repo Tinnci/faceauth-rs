@@ -26,6 +26,11 @@ comparison additionally requires the active digest and embedding dimension to
 match exactly; incompatible templates fail closed and must be explicitly
 re-enrolled rather than silently migrated or renormalized.
 
+`has_authenticated_template(uid)` reports enrollment state only after the same bounded file checks,
+key retrieval, AEAD authentication, JSON decoding, UID binding, and record validation as a normal
+load. Missing storage returns `false`; corrupt, tampered, or untrusted storage remains an error. It
+does not reduce enrollment state to file existence.
+
 ## TPM backend
 
 The native Rust TPM backend uses `tss-esapi` and `/dev/tpmrm0`. It creates a

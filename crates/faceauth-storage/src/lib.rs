@@ -351,6 +351,26 @@ where
         Ok(record)
     }
 
+    /// Return whether a UID has a fully authenticated, structurally valid encrypted template.
+    ///
+    /// This performs the same bounded read, key retrieval, authenticated decryption, and record
+    /// validation as [`Self::load`]. A missing directory or template returns `false`; corrupt or
+    /// untrusted storage remains an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] for any failure other than a missing directory or template.
+    pub fn has_authenticated_template(&self, uid: u32) -> Result<bool, StorageError> {
+        match self.load(uid) {
+            Ok(record) => {
+                drop(record);
+                Ok(true)
+            }
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn path_for(&self, uid: u32) -> PathBuf {
         self.directory.join(format!("{uid}.template"))
     }
@@ -766,10 +786,13 @@ mod tests {
         let directory = temporary_directory()?;
         let store = test_store(&directory)?;
         let expected = record(1000);
+        assert!(!store.has_authenticated_template(1000)?);
         store.save(&expected)?;
         let actual = store.load(1000)?;
 
         assert_eq!(actual, expected);
+        assert!(store.has_authenticated_template(1000)?);
+        assert!(!store.has_authenticated_template(1001)?);
         assert_eq!(store.key_strength(), KeyStrength::TpmBound);
         let _ = fs::remove_dir_all(directory);
         Ok(())
@@ -787,6 +810,10 @@ mod tests {
         fs::write(path, bytes)?;
 
         assert!(matches!(store.load(1000), Err(StorageError::AuthenticationFailed)));
+        assert!(matches!(
+            store.has_authenticated_template(1000),
+            Err(StorageError::AuthenticationFailed)
+        ));
         let _ = fs::remove_dir_all(directory);
         Ok(())
     }

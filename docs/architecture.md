@@ -16,7 +16,8 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 1. `faceauth-core`: policy, evidence, and decision types without desktop code.
 2. `faceauth-protocol`: versioned messages that contain no raw images or embeddings.
 3. `faceauth-transport`: peer-credentialed, length-bounded local socket framing.
-4. `faceauth-authz`: exact service, purpose, UID, and executable authorization.
+4. `faceauth-authz`: exact service, purpose, UID, and executable authorization, including a
+   policy-bound issuer that reauthorizes every target with a fresh transaction ID.
 5. `faceauth-session`: one-shot connection-bound transaction lifecycle and deadlines.
 6. `faceauth-capture`: bounded V4L2 streaming and monotonic IR/RGB frame pairing.
 7. `faceauth-liveness`: randomized, deadline-bound active-challenge state machine.
@@ -34,7 +35,8 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 14. `faceauth-management-dbus`: thin asynchronous zbus Manager1 adapter with real system-bus
    sender-UID and PolicyKit clients plus injected template-state and root-grant boundaries; it has
    no permissive default backend. Operations are bound to unique senders and a bus owner-change
-   watcher cancels abandoned enrollment work.
+   watcher cancels abandoned enrollment work. Authenticated template-state reads use one bounded
+   storage worker rather than blocking the D-Bus executor.
 15. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
 16. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.

@@ -33,7 +33,20 @@ failure is rejected.
 dedicated root grant issuer. It rechecks caller UID before state access and before PolicyKit. After
 PolicyKit succeeds it still passes the issued grant through `AuthorizedEnrollment::from_grant`, so
 only an exact root `faceauth-enroll`/Polkit grant is admitted. UID mismatch stops before PolicyKit is
-called. The crate contains no permissive state source or grant issuer.
+called. The crate contains no permissive defaults.
+
+The daemon builds the grant issuer with `management_enrollment_grant_issuer`. Its
+`BoundAuthorizationIssuer` retains one validated `AuthorizationPolicy`, kernel peer,
+`VerifiedExecutable`, service, and purpose. Construction requires UID 0 and preflights the exact
+`faceauth-enroll`/Polkit rule. Every real target is reauthorized by the original policy with a fresh
+transaction ID, and the D-Bus adapter revalidates the resulting grant before use.
+
+The daemon supplies authenticated template state through
+`management_template_state_source`. This wraps its existing encrypted `TemplateSource` in a
+single-worker bounded queue, so TPM/key retrieval and authenticated decryption never run on the
+zbus executor. The worker returns only a boolean; the zeroizing template record is dropped inside
+the worker. Missing templates return `false`, while corrupt, tampered, or unsafe storage fails the
+query. Queue saturation and worker loss also fail closed.
 
 The adapter currently admits only a caller managing its own numeric UID. `GetEnrollmentState`
 delegates the enrolled-template lookup to the injected backend after that identity check;
@@ -55,8 +68,8 @@ The daemon obtains a `ManagementWorkerHandle` that uses the adapter's exact coor
 monotonic clock for progress, completion, and timeout reaping. It can emit only the resulting
 `ManagementUpdate` values through the adapter. Signals are restricted to the stable public codes
 listed below. No test claims the system bus name, and no production Polkit broker or D-Bus service
-activation is enabled by this milestone. The daemon-owned production state/grant implementations
-and service startup wiring remain required before activation.
+activation is enabled by this milestone. Reviewed production broker evidence, configuration, and
+service startup wiring remain required before activation.
 
 ## Authorization and identity
 

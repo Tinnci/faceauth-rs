@@ -19,11 +19,13 @@ executable fingerprint into the daemon authorization policy, and preserve passwo
 administrator must explicitly approve installation and activation.
 
 The `faceauth-management-dbus` crate now provides the asynchronous system-bus credential resolver
-and PolicyKit `CheckAuthorization` client for `org.faceauth.enroll`. A production daemon must still
-provide the authenticated encrypted-template state source and exact root grant issuer, then wire
-the supplied `ManagementDisconnectHandle` before exposing Manager1. The service must fail if the
-owner-change watcher exits. Until those implementations, D-Bus policy, and isolated integration
-tests exist, packaging must not claim `org.faceauth.Manager1` or activate it on the system bus.
+and PolicyKit `CheckAuthorization` client for `org.faceauth.enroll`. The daemon now provides the
+bounded authenticated-template state adapter and policy-bound enrollment grant issuer. Production
+startup must supply the reviewed `AuthorizationPolicy`, pidfd-bound root broker executable evidence,
+and storage/key configuration, then wire the `ManagementDisconnectHandle` before exposing
+Manager1. The service must fail if the owner-change watcher exits. Until that composition, D-Bus
+policy, and isolated integration tests exist, packaging must not claim `org.faceauth.Manager1` or
+activate it on the system bus.
 
 ## systemd service template
 

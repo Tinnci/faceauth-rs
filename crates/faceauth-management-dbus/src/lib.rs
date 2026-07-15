@@ -8,10 +8,11 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Instant;
 
-use faceauth_authz::AuthorizationGrant;
+use faceauth_authz::{AuthorizationGrant, BoundAuthorizationIssuer};
 use faceauth_management::{
     AuthorizedEnrollment, ENROLLMENT_POLKIT_ACTION, MANAGEMENT_SCHEMA_VERSION,
     ManagementCoordinator, ManagementError, ManagementProgress, ManagementResult, ManagementUpdate,
@@ -57,6 +58,94 @@ pub trait EnrollmentStateSource: Send + Sync + 'static {
     fn is_enrolled(&self, target_uid: u32) -> BackendFuture<'_, bool>;
 }
 
+/// Maximum queued encrypted-template state lookups.
+pub const MAX_TEMPLATE_STATE_QUEUE_CAPACITY: usize = 64;
+
+/// Synchronous authenticated-template reader executed outside the D-Bus executor.
+pub trait TemplateStateReader: Send + 'static {
+    /// Load and authenticate enough template state to answer whether a UID is enrolled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] for corrupt, untrusted, or unavailable storage.
+    fn is_enrolled(&self, target_uid: u32) -> Result<bool, BackendError>;
+}
+
+enum TemplateStateRequest {
+    Query {
+        target_uid: u32,
+        response: futures_channel::oneshot::Sender<Result<bool, BackendError>>,
+    },
+    Shutdown,
+}
+
+/// Single-worker, bounded bridge from asynchronous Manager1 calls to blocking template storage.
+pub struct BoundedEnrollmentStateSource {
+    requests: mpsc::SyncSender<TemplateStateRequest>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl BoundedEnrollmentStateSource {
+    /// Start one named storage worker with a bounded request queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] for zero/excessive capacity or thread creation failure.
+    pub fn new(
+        reader: impl TemplateStateReader,
+        queue_capacity: usize,
+    ) -> Result<Self, BackendError> {
+        if queue_capacity == 0 || queue_capacity > MAX_TEMPLATE_STATE_QUEUE_CAPACITY {
+            return Err(BackendError::new("template state queue capacity is invalid"));
+        }
+        let (requests, receiver) = mpsc::sync_channel(queue_capacity);
+        let worker = thread::Builder::new()
+            .name("faceauth-template-state".into())
+            .spawn(move || template_state_worker(&reader, &receiver))
+            .map_err(|error| {
+                BackendError::new(format!("unable to start template state worker: {error}"))
+            })?;
+        Ok(Self { requests, worker: Some(worker) })
+    }
+}
+
+impl EnrollmentStateSource for BoundedEnrollmentStateSource {
+    fn is_enrolled(&self, target_uid: u32) -> BackendFuture<'_, bool> {
+        let (response, receiver) = futures_channel::oneshot::channel();
+        if self.requests.try_send(TemplateStateRequest::Query { target_uid, response }).is_err() {
+            return Box::pin(async {
+                Err(BackendError::new("template state worker queue is unavailable or full"))
+            });
+        }
+        Box::pin(async move {
+            receiver.await.map_err(|_| BackendError::new("template state worker stopped"))?
+        })
+    }
+}
+
+impl Drop for BoundedEnrollmentStateSource {
+    fn drop(&mut self) {
+        let _ = self.requests.send(TemplateStateRequest::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn template_state_worker(
+    reader: &impl TemplateStateReader,
+    receiver: &mpsc::Receiver<TemplateStateRequest>,
+) {
+    while let Ok(request) = receiver.recv() {
+        match request {
+            TemplateStateRequest::Query { target_uid, response } => {
+                let _ = response.send(reader.is_enrolled(target_uid));
+            }
+            TemplateStateRequest::Shutdown => break,
+        }
+    }
+}
+
 /// Dedicated root-broker grant issuer supplied by the privileged daemon.
 pub trait EnrollmentGrantIssuer: Send + Sync + 'static {
     /// Issue an exact root `faceauth-enroll`/Polkit grant for the authorized target UID.
@@ -65,6 +154,23 @@ pub trait EnrollmentGrantIssuer: Send + Sync + 'static {
         sender: &'a str,
         target_uid: u32,
     ) -> BackendFuture<'a, AuthorizationGrant>;
+}
+
+impl EnrollmentGrantIssuer for BoundAuthorizationIssuer {
+    fn issue_grant<'a>(
+        &'a self,
+        sender: &'a str,
+        target_uid: u32,
+    ) -> BackendFuture<'a, AuthorizationGrant> {
+        Box::pin(async move {
+            unique_sender(sender)?;
+            let grant =
+                self.issue(target_uid).map_err(|error| BackendError::new(error.to_string()))?;
+            AuthorizedEnrollment::from_grant(&grant)
+                .map_err(|error| BackendError::new(error.to_string()))?;
+            Ok(grant)
+        })
+    }
 }
 
 /// Credential and `PolicyKit` operations used by [`SystemBusBackend`].
@@ -897,6 +1003,18 @@ mod tests {
         }
     }
 
+    struct BlockingStateReader;
+
+    impl TemplateStateReader for BlockingStateReader {
+        fn is_enrolled(&self, target_uid: u32) -> Result<bool, BackendError> {
+            match target_uid {
+                1000 => Ok(true),
+                1001 => Ok(false),
+                _ => Err(BackendError::new("untrusted template state")),
+            }
+        }
+    }
+
     struct MockIssuer {
         peer_uid: u32,
     }
@@ -1083,6 +1201,24 @@ mod tests {
         );
         assert!(unique_sender(":1.7").is_ok());
         assert!(unique_sender("org.faceauth.Manager1").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn template_state_queries_use_one_bounded_worker() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(BoundedEnrollmentStateSource::new(BlockingStateReader, 0).is_err());
+        assert!(
+            BoundedEnrollmentStateSource::new(
+                BlockingStateReader,
+                MAX_TEMPLATE_STATE_QUEUE_CAPACITY + 1,
+            )
+            .is_err()
+        );
+
+        let source = BoundedEnrollmentStateSource::new(BlockingStateReader, 2)?;
+        assert!(futures_lite::future::block_on(source.is_enrolled(1000))?);
+        assert!(!futures_lite::future::block_on(source.is_enrolled(1001))?);
+        assert!(futures_lite::future::block_on(source.is_enrolled(2000)).is_err());
         Ok(())
     }
 

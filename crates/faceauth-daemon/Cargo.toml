@@ -17,6 +17,7 @@ faceauth-enrollment = { path = "../faceauth-enrollment", version = "0.1.0" }
 faceauth-inference = { path = "../faceauth-inference", version = "0.1.0" }
 faceauth-liveness = { path = "../faceauth-liveness", version = "0.1.0" }
 faceauth-management = { path = "../faceauth-management", version = "0.1.0" }
+faceauth-management-dbus = { path = "../faceauth-management-dbus", version = "0.1.0" }
 faceauth-model = { path = "../faceauth-model", version = "0.1.0" }
 faceauth-protocol = { path = "../faceauth-protocol", version = "0.1.0" }
 faceauth-presence = { path = "../faceauth-presence", version = "0.1.0" }
@@ -28,6 +29,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures-lite = "2.6.1"
 
 [lints]
 workspace = true

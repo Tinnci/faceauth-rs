@@ -229,6 +229,48 @@ impl AuthorizationPolicy {
     }
 }
 
+/// Reusable issuer bound to one validated policy, kernel peer, executable, service, and purpose.
+///
+/// Each issued grant still passes through [`AuthorizationPolicy::authorize`] with a fresh
+/// transaction identifier and exact target UID.
+pub struct BoundAuthorizationIssuer {
+    policy: AuthorizationPolicy,
+    peer: PeerIdentity,
+    executable: VerifiedExecutable,
+    service: ServiceName,
+    purpose: AuthenticationPurpose,
+}
+
+impl BoundAuthorizationIssuer {
+    /// Bind immutable caller evidence and an exact service/purpose to a validated policy.
+    #[must_use]
+    pub const fn new(
+        policy: AuthorizationPolicy,
+        peer: PeerIdentity,
+        executable: VerifiedExecutable,
+        service: ServiceName,
+        purpose: AuthenticationPurpose,
+    ) -> Self {
+        Self { policy, peer, executable, service, purpose }
+    }
+
+    /// Issue a new policy-authorized grant for one exact target UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorizationError`] unless the bound peer, executable, service, and purpose are
+    /// admitted for the requested target UID.
+    pub fn issue(&self, target_uid: u32) -> Result<AuthorizationGrant, AuthorizationError> {
+        let request = RequestContext {
+            transaction_id: TransactionId::generate(),
+            target_uid,
+            service: self.service.clone(),
+            purpose: self.purpose,
+        };
+        self.policy.authorize(self.peer, Some(self.executable), &request)
+    }
+}
+
 /// Immutable authorization result bound to the request and kernel peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationGrant {
@@ -431,6 +473,36 @@ mod tests {
         assert_eq!(
             policy.authorize(peer(1000), Some(executable(ALLOWED)), &request),
             Err(AuthorizationError::ServiceNotAllowed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bound_issuer_reauthorizes_each_target_with_fresh_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let issuer = BoundAuthorizationIssuer::new(
+            AuthorizationPolicy::new(vec![rule()?])?,
+            peer(0),
+            executable(ALLOWED),
+            service()?,
+            AuthenticationPurpose::Test,
+        );
+        let first = issuer.issue(1000)?;
+        let second = issuer.issue(1001)?;
+        assert_eq!(first.target_uid, 1000);
+        assert_eq!(second.target_uid, 1001);
+        assert_ne!(first.transaction_id, second.transaction_id);
+
+        let denied = BoundAuthorizationIssuer::new(
+            AuthorizationPolicy::new(vec![rule()?])?,
+            peer(1001),
+            executable(ALLOWED),
+            service()?,
+            AuthenticationPurpose::Test,
+        );
+        assert_eq!(
+            denied.issue(1000),
+            Err(AuthorizationError::PeerTargetMismatch { peer_uid: 1001, target_uid: 1000 })
         );
         Ok(())
     }

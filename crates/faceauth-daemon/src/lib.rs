@@ -1,8 +1,8 @@
 //! Privileged daemon authentication boundary orchestration.
 
 use faceauth_authz::{
-    AuthorizationError, AuthorizationGrant, AuthorizationPolicy, ExecutableError,
-    VerifiedExecutable,
+    AuthorizationError, AuthorizationGrant, AuthorizationPolicy, BoundAuthorizationIssuer,
+    ExecutableError, VerifiedExecutable,
 };
 use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
 use faceauth_core::{
@@ -17,6 +17,9 @@ use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
 };
 use faceauth_management::AuthorizedEnrollment;
+use faceauth_management_dbus::{
+    BackendError as ManagementBackendError, BoundedEnrollmentStateSource, TemplateStateReader,
+};
 use faceauth_model::ModelRole;
 use faceauth_protocol::{
     DecisionCode, ProgressCode, RejectionCode, Request, Response, TransactionId,
@@ -26,7 +29,7 @@ use faceauth_storage::{
     EncryptedTemplateStore, KeyProvider, StorageError, TEMPLATE_RECORD_SCHEMA_VERSION,
     TemplateRecord,
 };
-use faceauth_transport::{PeerStream, TransportError};
+use faceauth_transport::{PeerIdentity, PeerStream, TransportError};
 use thiserror::Error;
 
 /// Start enrollment only from an exact root broker grant dedicated to Polkit enrollment.
@@ -43,6 +46,40 @@ pub fn begin_authorized_enrollment(
     let authorization = AuthorizedEnrollment::from_grant(grant)
         .map_err(|_| EnrollmentBoundaryError::UnauthorizedGrant)?;
     Ok(EnrollmentSession::start(config, authorization.target_uid(), now_micros)?)
+}
+
+/// Bind the daemon's exact root broker evidence to the Manager1 enrollment grant issuer.
+///
+/// Construction performs a policy preflight for an arbitrary target and revalidates the resulting
+/// grant through [`AuthorizedEnrollment::from_grant`]. Each real issuance later uses a fresh
+/// transaction identifier and the requested target UID.
+///
+/// # Errors
+///
+/// Returns [`ManagementBackendError`] unless the peer is root and the policy, executable,
+/// `faceauth-enroll` service, and Polkit purpose produce an accepted enrollment grant.
+pub fn management_enrollment_grant_issuer(
+    policy: AuthorizationPolicy,
+    peer: PeerIdentity,
+    executable: VerifiedExecutable,
+) -> Result<BoundAuthorizationIssuer, ManagementBackendError> {
+    if peer.uid != 0 {
+        return Err(ManagementBackendError::new("enrollment grant issuer peer is not root"));
+    }
+    let service = faceauth_protocol::ServiceName::parse(faceauth_management::ENROLLMENT_SERVICE)
+        .map_err(|error| ManagementBackendError::new(error.to_string()))?;
+    let issuer = BoundAuthorizationIssuer::new(
+        policy,
+        peer,
+        executable,
+        service,
+        faceauth_protocol::AuthenticationPurpose::Polkit,
+    );
+    let probe =
+        issuer.issue(u32::MAX).map_err(|error| ManagementBackendError::new(error.to_string()))?;
+    AuthorizedEnrollment::from_grant(&probe)
+        .map_err(|error| ManagementBackendError::new(error.to_string()))?;
+    Ok(issuer)
 }
 
 /// Enrollment authorization or transaction setup failure.
@@ -334,6 +371,57 @@ where
     }
 }
 
+/// Authenticated enrollment-state reader suitable for the bounded Manager1 storage worker.
+pub struct AuthenticatedTemplateStateReader<S> {
+    source: S,
+}
+
+impl<S> AuthenticatedTemplateStateReader<S> {
+    /// Wrap a daemon template source without exposing template contents to D-Bus types.
+    #[must_use]
+    pub const fn new(source: S) -> Self {
+        Self { source }
+    }
+}
+
+impl<S> TemplateStateReader for AuthenticatedTemplateStateReader<S>
+where
+    S: TemplateSource + Send + 'static,
+{
+    fn is_enrolled(&self, target_uid: u32) -> Result<bool, ManagementBackendError> {
+        match self.source.load_template(target_uid) {
+            Ok(record) => {
+                drop(record);
+                Ok(true)
+            }
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(_) => {
+                Err(ManagementBackendError::new("unable to authenticate encrypted template state"))
+            }
+        }
+    }
+}
+
+/// Build the bounded Manager1 template-state source owned by the daemon.
+///
+/// Authenticated storage reads run on one dedicated worker rather than the zbus executor. The
+/// returned source exposes only a boolean enrollment state.
+///
+/// # Errors
+///
+/// Returns [`ManagementBackendError`] for invalid queue bounds or worker creation failure.
+pub fn management_template_state_source<S>(
+    source: S,
+    queue_capacity: usize,
+) -> Result<BoundedEnrollmentStateSource, ManagementBackendError>
+where
+    S: TemplateSource + Send + 'static,
+{
+    BoundedEnrollmentStateSource::new(AuthenticatedTemplateStateReader::new(source), queue_capacity)
+}
+
 /// Inputs bound to one admitted authentication transaction completion.
 #[derive(Clone, Copy)]
 pub struct AuthenticationCompletion<'a> {
@@ -559,6 +647,7 @@ mod tests {
     use faceauth_authz::{
         AuthorizationGrant, AuthorizationRule, CallerRelation, ExecutableFingerprint,
     };
+    use faceauth_management_dbus::EnrollmentStateSource;
     use faceauth_protocol::{
         AuthenticationPurpose, Envelope, RequestContext, ServiceName, TransactionId,
     };
@@ -624,6 +713,32 @@ mod tests {
         }
     }
 
+    enum StateTemplateMode {
+        Present,
+        Missing,
+        Corrupt,
+    }
+
+    struct StateTemplateSource(StateTemplateMode);
+
+    impl TemplateSource for StateTemplateSource {
+        fn load_template(&self, uid: u32) -> Result<TemplateRecord, StorageError> {
+            match self.0 {
+                StateTemplateMode::Present => Ok(TemplateRecord {
+                    schema_version: TEMPLATE_RECORD_SCHEMA_VERSION,
+                    uid,
+                    model_compatibility_sha256: "aa".repeat(32),
+                    embedding: vec![1.0, 0.0, 0.0],
+                }),
+                StateTemplateMode::Missing => Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing test template",
+                ))),
+                StateTemplateMode::Corrupt => Err(StorageError::AuthenticationFailed),
+            }
+        }
+    }
+
     fn active_session(
         target_uid: u32,
     ) -> Result<(SessionManager, ConnectionToken, TransactionId), Box<dyn std::error::Error>> {
@@ -663,6 +778,24 @@ mod tests {
             begin_authorized_enrollment(&wrong_peer, enrollment_config(), 1_000_000),
             Err(EnrollmentBoundaryError::UnauthorizedGrant)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn management_state_reader_authenticates_without_exposing_templates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source =
+            management_template_state_source(StateTemplateSource(StateTemplateMode::Present), 2)?;
+        assert!(futures_lite::future::block_on(source.is_enrolled(1000))?);
+        assert!(
+            !AuthenticatedTemplateStateReader::new(StateTemplateSource(StateTemplateMode::Missing))
+                .is_enrolled(1000)?
+        );
+        assert!(
+            AuthenticatedTemplateStateReader::new(StateTemplateSource(StateTemplateMode::Corrupt))
+                .is_enrolled(1000)
+                .is_err()
+        );
         Ok(())
     }
 

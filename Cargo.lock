@@ -671,12 +671,14 @@ dependencies = [
  "faceauth-inference",
  "faceauth-liveness",
  "faceauth-management",
+ "faceauth-management-dbus",
  "faceauth-model",
  "faceauth-presence",
  "faceauth-protocol",
  "faceauth-session",
  "faceauth-storage",
  "faceauth-transport",
+ "futures-lite",
  "serde",
  "serde_json",
  "thiserror",
@@ -735,6 +737,7 @@ dependencies = [
  "faceauth-management",
  "faceauth-protocol",
  "faceauth-transport",
+ "futures-channel",
  "futures-lite",
  "futures-util",
  "zbus",
@@ -812,6 +815,15 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
+name = "futures-channel"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "futures-core"
