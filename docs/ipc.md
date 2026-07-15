@@ -29,6 +29,12 @@ transport with explicit peer-credential checks.
   active challenges, recovery, and processing. These messages contain no raw
   frames, landmarks, similarity scores, liveness scores, or templates.
 
+The daemon listener binds only inside an existing root-owned directory that is
+not writable by group or others. It accepts only socket modes `0600` or `0660`,
+never unlinks or replaces an existing path, and captures credentials and pidfd
+immediately after `accept`. Stale socket cleanup and optional group ownership are
+explicit service-manager operations.
+
 `SO_PEERCRED` establishes connection identity, not authorization. The daemon must
 still verify the allowed service/purpose pair, target UID relationship, executable
 policy, transaction capacity, and enrollment state before starting camera work.
@@ -76,3 +82,9 @@ The first PAM integration must use a dedicated `faceauth-test` service. It must
 exercise invalid peer credentials, malformed frames, response replay, timeout,
 daemon restart, camera loss, and password fallback before any SDDM, KDE locker,
 Polkit, login, or sudo configuration is modified.
+
+The current `BoundaryService` implements decode → peer executable verification →
+exact authorization → session start/cancel → framed response. The installed
+production `serve` command still refuses to run until inference, passive PAD,
+active-liveness orchestration, and enrollment are complete; the boundary never
+substitutes a scaffold response for biometric success.

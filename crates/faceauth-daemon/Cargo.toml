@@ -9,12 +9,17 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+faceauth-authz = { path = "../faceauth-authz", version = "0.1.0" }
 faceauth-camera = { path = "../faceauth-camera", version = "0.1.0" }
 faceauth-capture = { path = "../faceauth-capture", version = "0.1.0" }
 faceauth-core = { path = "../faceauth-core", version = "0.1.0" }
+faceauth-protocol = { path = "../faceauth-protocol", version = "0.1.0" }
+faceauth-session = { path = "../faceauth-session", version = "0.1.0" }
 faceauth-storage = { path = "../faceauth-storage", version = "0.1.0" }
+faceauth-transport = { path = "../faceauth-transport", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

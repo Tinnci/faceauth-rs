@@ -415,12 +415,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "faceauth-authz",
  "faceauth-camera",
  "faceauth-capture",
  "faceauth-core",
+ "faceauth-protocol",
+ "faceauth-session",
  "faceauth-storage",
+ "faceauth-transport",
  "serde",
  "serde_json",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
 ]

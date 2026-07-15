@@ -188,7 +188,7 @@ fn main() -> Result<()> {
         }
         Command::Serve => {
             info!(
-                "service start refused: authenticated IPC, capture, inference, and liveness are incomplete"
+                "service start refused: inference, passive PAD, active-liveness integration, and enrollment are incomplete"
             );
             anyhow::bail!("faceauth-daemon is not production-ready")
         }
