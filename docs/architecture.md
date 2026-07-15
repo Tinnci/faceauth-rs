@@ -36,7 +36,8 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
    sender-UID and PolicyKit clients plus injected template-state and root-grant boundaries; it has
    no permissive default backend. Operations are bound to unique senders and a bus owner-change
    watcher cancels abandoned enrollment work. Authenticated template-state reads use one bounded
-   storage worker rather than blocking the D-Bus executor.
+   storage worker rather than blocking the D-Bus executor. Its service runner subscribes before
+   exposure and obtains the well-known name without queuing or replacement.
 15. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
 16. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.

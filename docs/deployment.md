@@ -23,9 +23,10 @@ and PolicyKit `CheckAuthorization` client for `org.faceauth.enroll`. The daemon 
 bounded authenticated-template state adapter and policy-bound enrollment grant issuer. Production
 startup must supply the reviewed `AuthorizationPolicy`, pidfd-bound root broker executable evidence,
 and storage/key configuration, then wire the `ManagementDisconnectHandle` before exposing
-Manager1. The service must fail if the owner-change watcher exits. Until that composition, D-Bus
-policy, and isolated integration tests exist, packaging must not claim `org.faceauth.Manager1` or
-activate it on the system bus.
+Manager1 through `run_manager1_service`. The runner subscribes to disconnects before name
+acquisition, refuses to replace an existing owner, and fails if the watcher exits. Until the final
+production composition and reviewed D-Bus policy exist, packaging must not claim
+`org.faceauth.Manager1` or activate it on the system bus.
 
 ## systemd service template
 

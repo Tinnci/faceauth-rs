@@ -27,7 +27,8 @@ sender name, resolves its UID with `GetConnectionUnixUser`, and calls PolicyKit
 `CheckAuthorization` for the exact `org.faceauth.enroll` action and `system-bus-name` subject. The
 call permits user interaction because enrollment requires a fresh administrator decision; a false
 authorization result, malformed sender, missing authority, transport error, or credential lookup
-failure is rejected.
+failure is rejected. The PolicyKit result is modeled as the exact single `(bba{ss})` D-Bus struct,
+not three independent reply arguments.
 
 `SystemBusBackend` composes that authority with an injected authenticated-template state source and
 dedicated root grant issuer. It rechecks caller UID before state access and before PolicyKit. After
@@ -64,12 +65,23 @@ Manager1 methods and stop if the watcher exits; continuing without disconnect cl
 If the initial `EnrollmentProgress` signal cannot be sent after `BeginEnrollment`, the adapter rolls
 the just-created operation back immediately.
 
+`run_manager1_service` owns activation ordering. It first connects a bus-daemon lifecycle proxy and
+subscribes to `NameOwnerChanged`, then registers `/org/faceauth/Manager1`, and only then requests
+`org.faceauth.Manager1`. Name acquisition uses `DoNotQueue` without `ReplaceExisting`, so a second
+instance fails instead of replacing or waiting behind the active daemon. Any watcher, decoding,
+cancellation, or signal failure is service-fatal; shutdown releases the name and removes the object.
+
 The daemon obtains a `ManagementWorkerHandle` that uses the adapter's exact coordinator and
 monotonic clock for progress, completion, and timeout reaping. It can emit only the resulting
 `ManagementUpdate` values through the adapter. Signals are restricted to the stable public codes
 listed below. No test claims the system bus name, and no production Polkit broker or D-Bus service
 activation is enabled by this milestone. Reviewed production broker evidence, configuration, and
 service startup wiring remain required before activation.
+
+Tests launch a private `dbus-daemon` rather than touching the host system bus. They verify the full
+Manager1 method path, exclusive name ownership, disconnect cancellation, real
+`GetConnectionUnixUser`, exact PolicyKit subject/action/flags and `(bba{ss})` result signature, plus
+both authorized and denied PolicyKit outcomes.
 
 ## Authorization and identity
 

@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use faceauth_authz::{AuthorizationGrant, BoundAuthorizationIssuer};
 use faceauth_management::{
-    AuthorizedEnrollment, ENROLLMENT_POLKIT_ACTION, MANAGEMENT_SCHEMA_VERSION,
-    ManagementCoordinator, ManagementError, ManagementProgress, ManagementResult, ManagementUpdate,
-    OperationId,
+    AuthorizedEnrollment, ENROLLMENT_POLKIT_ACTION, MANAGEMENT_SCHEMA_VERSION, MANAGER_BUS_NAME,
+    MANAGER_OBJECT_PATH, ManagementCoordinator, ManagementError, ManagementProgress,
+    ManagementResult, ManagementUpdate, OperationId,
 };
 use futures_util::StreamExt;
 use zbus::{Connection, interface, message::Header, object_server::SignalContext, zvariant::Value};
@@ -225,6 +225,9 @@ const POLKIT_INTERFACE: &str = "org.freedesktop.PolicyKit1.Authority";
 const POLKIT_SUBJECT_SYSTEM_BUS_NAME: &str = "system-bus-name";
 const POLKIT_ALLOW_USER_INTERACTION: u32 = 1;
 
+#[derive(Debug, serde::Deserialize, serde::Serialize, zbus::zvariant::Type)]
+struct PolkitAuthorizationResult(bool, bool, HashMap<String, String>);
+
 /// Minimal `PolicyKit` Authority proxy used for enrollment authorization.
 #[zbus::proxy(
     interface = "org.freedesktop.PolicyKit1.Authority",
@@ -241,7 +244,7 @@ trait PolicyKitAuthority {
         details: HashMap<&str, &str>,
         flags: u32,
         cancellation_id: &str,
-    ) -> zbus::Result<(bool, bool, HashMap<String, String>)>;
+    ) -> zbus::Result<PolkitAuthorizationResult>;
 }
 
 /// System-bus credential and `PolicyKit` authority client.
@@ -298,7 +301,7 @@ impl SystemBusAuthority {
         let mut subject_details = HashMap::new();
         subject_details.insert("name", Value::from(sender.as_str()));
         let subject = (POLKIT_SUBJECT_SYSTEM_BUS_NAME, subject_details);
-        let (authorized, _, _) = proxy
+        let PolkitAuthorizationResult(authorized, _, _) = proxy
             .check_authorization(
                 subject,
                 ENROLLMENT_POLKIT_ACTION,
@@ -842,6 +845,88 @@ impl Manager1 {
     ) -> zbus::Result<()>;
 }
 
+/// Run one Manager1 object on an already-connected message bus.
+///
+/// Startup subscribes to sender ownership changes before registering the object and requesting the
+/// well-known name. Name acquisition uses `DoNotQueue` without replacement. The future runs until
+/// the bus stream or cancellation signaling fails, then releases the name and removes the object.
+/// The caller should treat every return as service-fatal.
+///
+/// # Errors
+///
+/// Returns [`BackendError`] for subscription, object registration, exclusive name acquisition,
+/// disconnect cleanup, signaling, or bus-stream failure.
+pub async fn run_manager1_service(
+    connection: Connection,
+    manager: Manager1,
+) -> Result<(), BackendError> {
+    let proxy = zbus::fdo::DBusProxy::new(&connection).await.map_err(|error| {
+        BackendError::new(format!("unable to create Manager1 lifecycle proxy: {error}"))
+    })?;
+    let mut changes = proxy.receive_name_owner_changed().await.map_err(|error| {
+        BackendError::new(format!("unable to subscribe before Manager1 activation: {error}"))
+    })?;
+    let disconnect = manager.disconnect_handle();
+    let signal_context = SignalContext::new(&connection, MANAGER_OBJECT_PATH)
+        .map_err(|error| BackendError::new(format!("invalid Manager1 object path: {error}")))?;
+    let added =
+        connection.object_server().at(MANAGER_OBJECT_PATH, manager).await.map_err(|error| {
+            BackendError::new(format!("unable to register Manager1 object: {error}"))
+        })?;
+    if !added {
+        return Err(BackendError::new("Manager1 object was already registered"));
+    }
+    let reply = connection
+        .request_name_with_flags(MANAGER_BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())
+        .await
+        .map_err(|error| BackendError::new(format!("unable to request Manager1 name: {error}")))?;
+    if !matches!(
+        reply,
+        zbus::fdo::RequestNameReply::PrimaryOwner | zbus::fdo::RequestNameReply::AlreadyOwner
+    ) {
+        let _ = connection.object_server().remove::<Manager1, _>(MANAGER_OBJECT_PATH).await;
+        return Err(BackendError::new("Manager1 bus name is already owned"));
+    }
+
+    let result = loop {
+        let Some(change) = changes.next().await else {
+            break Err(BackendError::new("Manager1 owner-change stream ended"));
+        };
+        let args = match change.args() {
+            Ok(args) => args,
+            Err(error) => {
+                break Err(BackendError::new(format!(
+                    "invalid Manager1 owner-change signal: {error}"
+                )));
+            }
+        };
+        let update = disconnect
+            .handle_owner_change(
+                args.name().as_str(),
+                args.old_owner().as_ref().is_some(),
+                args.new_owner().as_ref().is_some(),
+            )
+            .map_err(|error| {
+                BackendError::new(format!("unable to cancel disconnected Manager1 sender: {error}"))
+            });
+        let update = match update {
+            Ok(update) => update,
+            Err(error) => break Err(error),
+        };
+        if let Some(update) = update
+            && let Err(error) = emit_update_signal(&signal_context, update).await
+        {
+            break Err(BackendError::new(format!(
+                "unable to emit Manager1 disconnect result: {error}"
+            )));
+        }
+    };
+
+    let _ = connection.release_name(MANAGER_BUS_NAME).await;
+    let _ = connection.object_server().remove::<Manager1, _>(MANAGER_OBJECT_PATH).await;
+    result
+}
+
 async fn emit_update_signal(
     ctxt: &SignalContext<'_>,
     update: ManagementUpdate,
@@ -908,7 +993,14 @@ fn map_management_error(error: ManagementError) -> zbus::fdo::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::MetadataExt;
+    use std::process::{Child, ChildStdout, Command, Stdio};
+    use std::sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc as test_mpsc,
+    };
+    use std::time::{Duration, Instant as TestInstant};
 
     use faceauth_authz::{AuthorizationGrant, ExecutableFingerprint};
     use faceauth_management::{ENROLLMENT_SERVICE, ManagementConfig};
@@ -916,6 +1008,93 @@ mod tests {
     use faceauth_transport::PeerIdentity;
 
     use super::*;
+
+    struct PrivateBus {
+        child: Child,
+        _stdout: BufReader<ChildStdout>,
+        address: String,
+    }
+
+    impl PrivateBus {
+        fn start() -> Result<Self, Box<dyn std::error::Error>> {
+            let mut child = Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let stdout = child.stdout.take().ok_or("dbus-daemon stdout is unavailable")?;
+            let mut stdout = BufReader::new(stdout);
+            let mut address = String::new();
+            stdout.read_line(&mut address)?;
+            let address = address.trim().to_owned();
+            if address.is_empty() {
+                return Err("dbus-daemon did not print an address".into());
+            }
+            Ok(Self { child, _stdout: stdout, address })
+        }
+
+        fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            if self.child.try_wait()?.is_none() {
+                self.child.kill()?;
+            }
+            let _ = self.child.wait()?;
+            Ok(())
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.stop();
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservedPolkitCall {
+        subject_kind: String,
+        subject_name: String,
+        action_id: String,
+        flags: u32,
+        cancellation_id: String,
+    }
+
+    struct FakePolicyKit {
+        authorized: Arc<std::sync::atomic::AtomicBool>,
+        observations: test_mpsc::Sender<ObservedPolkitCall>,
+    }
+
+    #[interface(name = "org.freedesktop.PolicyKit1.Authority")]
+    impl FakePolicyKit {
+        #[allow(clippy::needless_pass_by_value)]
+        fn check_authorization(
+            &self,
+            subject: (&str, HashMap<&str, Value<'_>>),
+            action_id: &str,
+            details: HashMap<&str, &str>,
+            flags: u32,
+            cancellation_id: &str,
+        ) -> PolkitAuthorizationResult {
+            let _ = details;
+            let subject_name = subject
+                .1
+                .get("name")
+                .and_then(|value| value.downcast_ref::<&str>().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let _ = self.observations.send(ObservedPolkitCall {
+                subject_kind: subject.0.to_owned(),
+                subject_name,
+                action_id: action_id.to_owned(),
+                flags,
+                cancellation_id: cancellation_id.to_owned(),
+            });
+            PolkitAuthorizationResult(
+                self.authorized.load(Ordering::Relaxed),
+                false,
+                HashMap::new(),
+            )
+        }
+    }
 
     struct Backend;
 
@@ -964,6 +1143,49 @@ mod tests {
                 } else {
                     Err(BackendError::new("unknown account"))
                 }
+            })
+        }
+    }
+
+    struct AnyCallerBackend;
+
+    impl AuthorizationBackend for AnyCallerBackend {
+        fn caller_uid<'a>(&'a self, sender: &'a str) -> BackendFuture<'a, u32> {
+            Box::pin(async move {
+                unique_sender(sender)?;
+                Ok(1000)
+            })
+        }
+
+        fn enrollment_state<'a>(
+            &'a self,
+            sender: &'a str,
+            target_uid: u32,
+        ) -> BackendFuture<'a, bool> {
+            Box::pin(async move {
+                unique_sender(sender)?;
+                Ok(target_uid == 1000)
+            })
+        }
+
+        fn authorize_enrollment<'a>(
+            &'a self,
+            sender: &'a str,
+            target_uid: u32,
+        ) -> BackendFuture<'a, AuthorizedEnrollment> {
+            Box::pin(async move {
+                unique_sender(sender)?;
+                let grant = AuthorizationGrant {
+                    transaction_id: TransactionId::generate(),
+                    peer: PeerIdentity { pid: 1, uid: 0, gid: 0 },
+                    target_uid,
+                    service: ServiceName::parse(ENROLLMENT_SERVICE)
+                        .map_err(|error| BackendError::new(error.to_string()))?,
+                    purpose: AuthenticationPurpose::Polkit,
+                    executable: ExecutableFingerprint { device: 1, inode: 2 },
+                };
+                AuthorizedEnrollment::from_grant(&grant)
+                    .map_err(|error| BackendError::new(error.to_string()))
             })
         }
     }
@@ -1219,6 +1441,150 @@ mod tests {
         assert!(futures_lite::future::block_on(source.is_enrolled(1000))?);
         assert!(!futures_lite::future::block_on(source.is_enrolled(1001))?);
         assert!(futures_lite::future::block_on(source.is_enrolled(2000)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_policykit_proxy_binds_exact_sender_action_and_flags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use zbus::zvariant::Type;
+
+        assert_eq!(PolkitAuthorizationResult::signature().as_str(), "(bba{ss})");
+        assert_eq!(<(&str, HashMap<&str, Value<'_>>)>::signature().as_str(), "(sa{sv})");
+        let mut bus = PrivateBus::start()?;
+        let address = bus.address.clone();
+        futures_lite::future::block_on(async move {
+            let policy_connection =
+                zbus::ConnectionBuilder::address(address.as_str())?.build().await?;
+            let authority_connection =
+                zbus::ConnectionBuilder::address(address.as_str())?.build().await?;
+            let subject_connection =
+                zbus::ConnectionBuilder::address(address.as_str())?.build().await?;
+            let authorized = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (observations, observed) = test_mpsc::channel();
+            policy_connection
+                .object_server()
+                .at(
+                    POLKIT_PATH,
+                    FakePolicyKit { authorized: Arc::clone(&authorized), observations },
+                )
+                .await?;
+            let reply = policy_connection
+                .request_name_with_flags(
+                    POLKIT_SERVICE,
+                    zbus::fdo::RequestNameFlags::DoNotQueue.into(),
+                )
+                .await?;
+            assert_eq!(reply, zbus::fdo::RequestNameReply::PrimaryOwner);
+
+            let sender = subject_connection
+                .unique_name()
+                .ok_or("private D-Bus subject has no unique name")?
+                .as_str()
+                .to_owned();
+            let authority = SystemBusAuthority::from_connection(authority_connection);
+            let resolved_uid = authority.caller_uid(&sender).await?;
+            let expected_uid = std::fs::metadata("/proc/self")?.uid();
+            assert_eq!(resolved_uid, expected_uid);
+            authority.authorize_enrollment(&sender).await?;
+            let call = observed.recv_timeout(Duration::from_secs(2))?;
+            assert_eq!(call.subject_kind, POLKIT_SUBJECT_SYSTEM_BUS_NAME);
+            assert_eq!(call.subject_name, sender);
+            assert_eq!(call.action_id, ENROLLMENT_POLKIT_ACTION);
+            assert_eq!(call.flags, POLKIT_ALLOW_USER_INTERACTION);
+            assert!(call.cancellation_id.is_empty());
+
+            authorized.store(false, Ordering::Relaxed);
+            assert!(authority.authorize_enrollment(&sender).await.is_err());
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+        bus.stop()?;
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_bus_runner_serves_exclusively_and_cancels_disconnected_client()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bus = PrivateBus::start()?;
+        let coordinator = ManagementCoordinator::new(ManagementConfig::default())?;
+        let manager = Manager1::new(coordinator, AnyCallerBackend, SystemMonotonicClock);
+        let worker = manager.worker_handle();
+        let service_address = bus.address.clone();
+        let (service_result_tx, service_result_rx) = test_mpsc::channel();
+        let service_thread = thread::spawn(move || {
+            let result = futures_lite::future::block_on(async move {
+                let connection = zbus::ConnectionBuilder::address(service_address.as_str())
+                    .map_err(|error| error.to_string())?
+                    .build()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                run_manager1_service(connection, manager).await.map_err(|error| error.to_string())
+            });
+            let _ = service_result_tx.send(result);
+        });
+
+        let client = zbus::blocking::connection::Builder::address(bus.address.as_str())?.build()?;
+        let proxy = zbus::blocking::Proxy::new(
+            &client,
+            MANAGER_BUS_NAME,
+            MANAGER_OBJECT_PATH,
+            faceauth_management::MANAGER_INTERFACE,
+        )?;
+        let ready_deadline = TestInstant::now() + Duration::from_secs(5);
+        loop {
+            let version: zbus::Result<u16> = proxy.call("GetVersion", &());
+            if version == Ok(MANAGEMENT_SCHEMA_VERSION) {
+                break;
+            }
+            if TestInstant::now() >= ready_deadline {
+                return Err("Manager1 service did not become ready".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let second_address = bus.address.clone();
+        let second_result = futures_lite::future::block_on(async move {
+            let connection = zbus::ConnectionBuilder::address(second_address.as_str())
+                .map_err(|error| BackendError::new(error.to_string()))?
+                .build()
+                .await
+                .map_err(|error| BackendError::new(error.to_string()))?;
+            let manager = Manager1::new(
+                ManagementCoordinator::new(ManagementConfig::default())
+                    .map_err(|error| BackendError::new(error.to_string()))?,
+                AnyCallerBackend,
+                SystemMonotonicClock,
+            );
+            run_manager1_service(connection, manager).await
+        });
+        assert!(second_result.is_err());
+        let version: u16 = proxy.call("GetVersion", &())?;
+        assert_eq!(version, MANAGEMENT_SCHEMA_VERSION);
+
+        let enrolled: bool = proxy.call("GetEnrollmentState", &(1000_u32,))?;
+        assert!(enrolled);
+        let operation: String = proxy.call("BeginEnrollment", &(1000_u32,))?;
+        let operation = OperationId::parse(&operation)?;
+        drop(proxy);
+        drop(client);
+
+        let disconnect_deadline = TestInstant::now() + Duration::from_secs(5);
+        loop {
+            match worker.progress(1000, operation, ManagementProgress::HoldStill) {
+                Err(WorkerError::Management(ManagementError::NoActiveOperation)) => break,
+                Ok(_) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if TestInstant::now() >= disconnect_deadline {
+                return Err("disconnected Manager1 client retained its operation".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        bus.stop()?;
+        let service_result = service_result_rx.recv_timeout(Duration::from_secs(5))?;
+        assert!(service_result.is_err());
+        service_thread.join().map_err(|_| "Manager1 service thread panicked")?;
         Ok(())
     }
 

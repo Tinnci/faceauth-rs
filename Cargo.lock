@@ -740,6 +740,7 @@ dependencies = [
  "futures-channel",
  "futures-lite",
  "futures-util",
+ "serde",
  "zbus",
 ]
 
