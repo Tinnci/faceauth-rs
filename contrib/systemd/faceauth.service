@@ -1,0 +1,33 @@
+[Unit]
+Description=faceauth-rs Linux face authentication daemon
+Documentation=https://github.com/Tinnci/faceauth-rs
+After=local-fs.target
+ConditionPathExists=/usr/libexec/faceauth/faceauth-daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/faceauth/faceauth-daemon serve
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/faceauth /run/faceauth
+RuntimeDirectory=faceauth
+RuntimeDirectoryMode=0700
+StateDirectory=faceauth
+StateDirectoryMode=0700
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
