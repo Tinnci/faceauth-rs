@@ -31,8 +31,9 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
 12. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
 13. `faceauth-management`: desktop-independent enrollment authorization and operation lifecycle.
-14. `faceauth-management-dbus`: thin zbus Manager1 adapter with injected credential and Polkit
-   authorization; it has no permissive default backend.
+14. `faceauth-management-dbus`: thin asynchronous zbus Manager1 adapter with real system-bus
+   sender-UID and PolicyKit clients plus injected template-state and root-grant boundaries; it has
+   no permissive default backend.
 15. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
 16. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.

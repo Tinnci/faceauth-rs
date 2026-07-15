@@ -19,9 +19,21 @@ is not installed or claimed by the current daemon.
 
 `faceauth-management-dbus` implements the `org.faceauth.Manager1` method and signal shape with zbus
 4.x. It reads the unique sender from the D-Bus message header, never from a serialized method
-argument. Its injected `AuthorizationBackend` must resolve the sender's kernel UID and perform the
-fresh `org.faceauth.enroll` Polkit decision before returning an `AuthorizedEnrollment` proof. The
-crate does not contain a permissive default backend and therefore cannot bypass this boundary.
+argument. Its object-safe asynchronous `AuthorizationBackend` permits credential and PolicyKit
+lookups without blocking the zbus executor.
+
+`SystemBusAuthority` implements the real system-bus operations: it accepts only a D-Bus unique
+sender name, resolves its UID with `GetConnectionUnixUser`, and calls PolicyKit
+`CheckAuthorization` for the exact `org.faceauth.enroll` action and `system-bus-name` subject. The
+call permits user interaction because enrollment requires a fresh administrator decision; a false
+authorization result, malformed sender, missing authority, transport error, or credential lookup
+failure is rejected.
+
+`SystemBusBackend` composes that authority with an injected authenticated-template state source and
+dedicated root grant issuer. It rechecks caller UID before state access and before PolicyKit. After
+PolicyKit succeeds it still passes the issued grant through `AuthorizedEnrollment::from_grant`, so
+only an exact root `faceauth-enroll`/Polkit grant is admitted. UID mismatch stops before PolicyKit is
+called. The crate contains no permissive state source or grant issuer.
 
 The adapter currently admits only a caller managing its own numeric UID. `GetEnrollmentState`
 delegates the enrolled-template lookup to the injected backend after that identity check;
@@ -34,7 +46,8 @@ The daemon obtains a `ManagementWorkerHandle` that uses the adapter's exact coor
 monotonic clock for progress, completion, and timeout reaping. It can emit only the resulting
 `ManagementUpdate` values through the adapter. Signals are restricted to the stable public codes
 listed below. No test claims the system bus name, and no production Polkit broker or D-Bus service
-activation is enabled by this milestone.
+activation is enabled by this milestone. Sender-disconnect cancellation and the daemon-owned
+production state/grant implementations remain required before service activation.
 
 ## Authorization and identity
 

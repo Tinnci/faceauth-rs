@@ -7,13 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+faceauth-authz = { path = "../faceauth-authz", version = "0.1.0" }
 faceauth-management = { path = "../faceauth-management", version = "0.1.0" }
 zbus.workspace = true
 
 [dev-dependencies]
-faceauth-authz = { path = "../faceauth-authz", version = "0.1.0" }
 faceauth-protocol = { path = "../faceauth-protocol", version = "0.1.0" }
 faceauth-transport = { path = "../faceauth-transport", version = "0.1.0" }
+futures-lite = "2.6.1"
 
 [lints]
 workspace = true

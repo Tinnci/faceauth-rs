@@ -735,6 +735,7 @@ dependencies = [
  "faceauth-management",
  "faceauth-protocol",
  "faceauth-transport",
+ "futures-lite",
  "zbus",
 ]
 

@@ -18,11 +18,12 @@ Packaging review must verify the action's installed ownership and XML validity, 
 executable fingerprint into the daemon authorization policy, and preserve password fallback. An
 administrator must explicitly approve installation and activation.
 
-The `faceauth-management-dbus` crate is only the transport adapter. A production daemon must still
-provide a backend that obtains the unique sender's Unix credentials from the system bus and makes a
-fresh Polkit decision for `org.faceauth.enroll`. Until that backend, D-Bus policy, disconnect
-cancellation, and isolated integration tests exist, packaging must not claim `org.faceauth.Manager1`
-or activate it on the system bus.
+The `faceauth-management-dbus` crate now provides the asynchronous system-bus credential resolver
+and PolicyKit `CheckAuthorization` client for `org.faceauth.enroll`. A production daemon must still
+provide the authenticated encrypted-template state source and exact root grant issuer, then wire
+sender-disconnect cancellation. Until those implementations, D-Bus policy, and isolated
+integration tests exist, packaging must not claim `org.faceauth.Manager1` or activate it on the
+system bus.
 
 ## systemd service template
 
