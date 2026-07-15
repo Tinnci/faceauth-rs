@@ -35,6 +35,15 @@ never unlinks or replaces an existing path, and captures credentials and pidfd
 immediately after `accept`. Stale socket cleanup and optional group ownership are
 explicit service-manager operations.
 
+The transport also provides a bounded sequential accept loop for the daemon's
+initial single-camera capacity. It uses non-blocking accept with a 1–100 ms poll
+interval, a configured total connection ceiling, and a consecutive
+accept/peer-initialization failure budget. Only streams with captured kernel
+credentials, a pinned peer pidfd, framing limits, and read/write timeouts reach
+the daemon handler. The loop can be stopped through an external shutdown check;
+one empty queue cannot cause busy-spinning and one malformed connection cannot
+silently remove all resource bounds.
+
 `SO_PEERCRED` establishes connection identity, not authorization. The daemon must
 still verify the allowed service/purpose pair, target UID relationship, executable
 policy, transaction capacity, and enrollment state before starting camera work.

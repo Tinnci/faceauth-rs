@@ -10,6 +10,7 @@ use std::{
         net::UnixListener,
     },
     path::{Path, PathBuf},
+    thread,
     time::Duration,
 };
 
@@ -84,11 +85,129 @@ impl SecureListener {
         PeerStream::connect(stream, config)
     }
 
+    /// Switch the listener between blocking and non-blocking accept behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when the socket option cannot be changed.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), TransportError> {
+        self.listener.set_nonblocking(nonblocking)?;
+        Ok(())
+    }
+
+    /// Attempt one non-blocking accept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when accept or peer credential/pidfd initialization fails.
+    pub fn try_accept(
+        &self,
+        config: TransportConfig,
+    ) -> Result<Option<PeerStream>, TransportError> {
+        match self.listener.accept() {
+            Ok((stream, _address)) => PeerStream::connect(stream, config).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(TransportError::Io(error)),
+        }
+    }
+
     /// Return the bound filesystem path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Bounds for a sequential non-blocking listener loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptLoopConfig {
+    /// Delay between empty non-blocking accept attempts.
+    pub poll_interval: Duration,
+    /// Maximum successfully initialized connections handled before returning.
+    pub max_connections: u64,
+    /// Maximum consecutive accept/peer-initialization failures tolerated.
+    pub max_consecutive_failures: u16,
+}
+
+impl AcceptLoopConfig {
+    /// Validate listener-loop resource bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::InvalidAcceptLoopConfig`] for zero or excessive bounds.
+    pub fn validate(self) -> Result<(), TransportError> {
+        if !(Duration::from_millis(1)..=Duration::from_millis(100)).contains(&self.poll_interval)
+            || !(1..=1_000_000).contains(&self.max_connections)
+            || !(1..=1_000).contains(&self.max_consecutive_failures)
+        {
+            Err(TransportError::InvalidAcceptLoopConfig)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for AcceptLoopConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(25),
+            max_connections: 1_000_000,
+            max_consecutive_failures: 32,
+        }
+    }
+}
+
+/// Summary returned when a bounded listener loop stops normally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptLoopReport {
+    /// Successfully peer-credentialed connections passed to the handler.
+    pub accepted_connections: u64,
+    /// Failed accept or peer-initialization attempts tolerated by the loop.
+    pub initialization_failures: u64,
+}
+
+/// Run a sequential, stoppable accept loop over already-secured listener and stream policies.
+///
+/// The handler receives only streams whose kernel credentials and pidfd were captured and whose
+/// framing I/O is bounded. Handler error and panic policy remains the daemon's responsibility.
+/// Sequential delivery intentionally matches the initial single-camera session capacity.
+///
+/// # Errors
+///
+/// Returns [`TransportError`] for invalid configuration, listener mode failure, or excessive
+/// consecutive accept/peer-initialization failures.
+pub fn run_accept_loop(
+    listener: &SecureListener,
+    transport: TransportConfig,
+    config: AcceptLoopConfig,
+    mut should_stop: impl FnMut() -> bool,
+    mut handle: impl FnMut(PeerStream),
+) -> Result<AcceptLoopReport, TransportError> {
+    transport.validate()?;
+    config.validate()?;
+    listener.set_nonblocking(true)?;
+    let mut report = AcceptLoopReport { accepted_connections: 0, initialization_failures: 0 };
+    let mut consecutive_failures = 0_u16;
+    while report.accepted_connections < config.max_connections && !should_stop() {
+        match listener.try_accept(transport) {
+            Ok(Some(stream)) => {
+                report.accepted_connections += 1;
+                consecutive_failures = 0;
+                handle(stream);
+            }
+            Ok(None) => thread::sleep(config.poll_interval),
+            Err(_) => {
+                report.initialization_failures += 1;
+                consecutive_failures = consecutive_failures
+                    .checked_add(1)
+                    .ok_or(TransportError::AcceptFailureBudgetExceeded)?;
+                if consecutive_failures >= config.max_consecutive_failures {
+                    return Err(TransportError::AcceptFailureBudgetExceeded);
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Bounded blocking-I/O configuration for one connected socket.
@@ -244,6 +363,12 @@ pub enum TransportError {
     /// Configured frame or timeout bounds are invalid.
     #[error("invalid local transport configuration")]
     InvalidConfig,
+    /// Listener-loop polling or resource bounds are invalid.
+    #[error("invalid local listener-loop configuration")]
+    InvalidAcceptLoopConfig,
+    /// Consecutive accept or peer-initialization failures exceeded policy.
+    #[error("local listener accept failure budget exceeded")]
+    AcceptFailureBudgetExceeded,
     /// Kernel peer credentials contained an invalid process identifier.
     #[error("invalid Unix peer credentials")]
     InvalidPeer,
@@ -307,6 +432,7 @@ pub enum ListenerError {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         fs,
         os::unix::{fs::PermissionsExt, net::UnixStream},
     };
@@ -335,6 +461,90 @@ mod tests {
                 purpose: AuthenticationPurpose::Test,
             },
         })
+    }
+
+    #[test]
+    fn accept_loop_configuration_is_bounded() {
+        assert!(AcceptLoopConfig::default().validate().is_ok());
+        assert!(
+            AcceptLoopConfig { poll_interval: Duration::ZERO, ..AcceptLoopConfig::default() }
+                .validate()
+                .is_err()
+        );
+        assert!(
+            AcceptLoopConfig { max_connections: 0, ..AcceptLoopConfig::default() }
+                .validate()
+                .is_err()
+        );
+        assert!(
+            AcceptLoopConfig { max_consecutive_failures: 0, ..AcceptLoopConfig::default() }
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_accept_loop_delivers_only_initialized_peer_streams()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = temporary_directory()?;
+        let socket = directory.join("auth.sock");
+        let uid = fs::metadata(&directory)?.uid();
+        let listener = SecureListener::bind_owned(&socket, 0o600, uid)?;
+        let client = UnixStream::connect(&socket)?;
+        let mut client = PeerStream::connect(client, TransportConfig::default())?;
+        let request = request()?;
+        client.write_message(request.clone())?;
+        let received = Cell::new(false);
+        let report = run_accept_loop(
+            &listener,
+            TransportConfig::default(),
+            AcceptLoopConfig {
+                poll_interval: Duration::from_millis(1),
+                max_connections: 1,
+                max_consecutive_failures: 2,
+            },
+            || false,
+            |mut stream| {
+                let actual = stream.read_message::<Request>().map(|envelope| envelope.message);
+                received.set(matches!(actual, Ok(actual) if actual == request));
+            },
+        )?;
+        assert!(received.get());
+        assert_eq!(
+            report,
+            AcceptLoopReport { accepted_connections: 1, initialization_failures: 0 }
+        );
+        fs::remove_file(&socket)?;
+        fs::remove_dir(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn accept_loop_can_stop_without_a_connection() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = temporary_directory()?;
+        let socket = directory.join("auth.sock");
+        let uid = fs::metadata(&directory)?.uid();
+        let listener = SecureListener::bind_owned(&socket, 0o600, uid)?;
+        let polls = Cell::new(0_u8);
+        let report = run_accept_loop(
+            &listener,
+            TransportConfig::default(),
+            AcceptLoopConfig {
+                poll_interval: Duration::from_millis(1),
+                max_connections: 1,
+                max_consecutive_failures: 2,
+            },
+            || {
+                let next = polls.get().saturating_add(1);
+                polls.set(next);
+                next >= 3
+            },
+            |_stream| {},
+        )?;
+        assert_eq!(report.accepted_connections, 0);
+        fs::remove_file(&socket)?;
+        fs::remove_dir(&directory)?;
+        Ok(())
     }
 
     #[test]
