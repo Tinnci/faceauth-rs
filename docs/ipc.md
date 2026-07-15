@@ -94,6 +94,9 @@ float tensor and before every output row; partially produced tensors zeroize on
 drop.
 The active-liveness state machine checks before each observation and leaves its
 phase and sequence state unchanged when cancellation is requested.
+The daemon `AuthenticationWorker` is the sole mapping point from the private
+session token to these capture, preprocessing, and liveness callbacks; no client
+can provide or replace that callback through the wire protocol.
 
 Completion consumes the slot and produces exactly one terminal response.
 `Cancelled` and `TimedOut` are manager-owned results and cannot be injected by

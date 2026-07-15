@@ -4,19 +4,24 @@ use faceauth_authz::{
     AuthorizationError, AuthorizationGrant, AuthorizationPolicy, ExecutableError,
     VerifiedExecutable,
 };
+use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
 use faceauth_core::{
     AuthPolicy, AuthenticationDecision, AuthenticationEvidence, CapturePair, CheckStatus,
     DecisionReason, ObservationStatus, PolicyError,
 };
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
-use faceauth_inference::{FaceEmbedding, InferenceError, PassiveLivenessScore};
-use faceauth_liveness::ChallengeProgress;
+use faceauth_inference::{
+    FaceEmbedding, ImageView, InferenceError, InputTensor, OnnxSession, PassiveLivenessScore,
+};
+use faceauth_liveness::{
+    ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
+};
 use faceauth_model::ModelRole;
 use faceauth_protocol::{
     AuthenticationPurpose, DecisionCode, ProgressCode, RejectionCode, Request, Response,
     TransactionId,
 };
-use faceauth_session::{ConnectionToken, SessionError, SessionManager};
+use faceauth_session::{CancellationToken, ConnectionToken, SessionError, SessionManager};
 use faceauth_storage::{
     EncryptedTemplateStore, KeyProvider, StorageError, TEMPLATE_RECORD_SCHEMA_VERSION,
     TemplateRecord,
@@ -251,6 +256,69 @@ pub enum AuthenticationPipelineError {
     /// Passive PAD score or calibrated threshold was invalid.
     #[error("passive PAD inference evidence failed: {0}")]
     Inference(#[from] InferenceError),
+}
+
+/// Daemon-owned facade that propagates one transaction cancellation signal through every
+/// cancellable biometric stage without coupling those crates to session management.
+#[derive(Clone, Debug)]
+pub struct AuthenticationWorker {
+    cancellation: CancellationToken,
+}
+
+impl AuthenticationWorker {
+    /// Bind a worker to an already authorized transaction cancellation signal.
+    #[must_use]
+    pub const fn new(cancellation: CancellationToken) -> Self {
+        Self { cancellation }
+    }
+
+    /// Return whether the owning transaction has been cancelled or terminally consumed.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Pair one IR/RGB observation while mapping the transaction signal to capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded capture/pairing error, including [`CaptureError::Cancelled`].
+    pub fn capture_pair(
+        &self,
+        infrared: &mut impl FrameSource,
+        visible: &mut impl FrameSource,
+        policy: PairingPolicy,
+    ) -> Result<PairedFrames, CaptureError> {
+        faceauth_capture::capture_pair_cancellable(infrared, visible, policy, || {
+            self.cancellation.is_cancelled()
+        })
+    }
+
+    /// Preprocess one image while mapping the transaction signal to inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded preprocessing error, including [`InferenceError::Cancelled`].
+    pub fn preprocess(
+        &self,
+        session: &OnnxSession,
+        image: ImageView<'_>,
+    ) -> Result<InputTensor, InferenceError> {
+        session.preprocess_cancellable(image, || self.cancellation.is_cancelled())
+    }
+
+    /// Process one fresh active-liveness observation while mapping the transaction signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded challenge error, including [`ChallengeError::Cancelled`].
+    pub fn observe_liveness(
+        &self,
+        challenge: &mut ChallengeSession,
+        observation: ChallengeObservation,
+    ) -> Result<ChallengeProgress, ChallengeError> {
+        challenge.observe_cancellable(observation, || self.cancellation.is_cancelled())
+    }
 }
 
 /// Source of authenticated, UID-addressed biometric templates.
@@ -860,6 +928,46 @@ mod tests {
             Response::Completed { transaction_id, decision: DecisionCode::InternalError }
         );
         assert!(!sessions.is_busy());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_maps_the_bound_session_token_into_liveness() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut sessions, connection, transaction_id) = active_session(1000)?;
+        let worker =
+            AuthenticationWorker::new(sessions.cancellation_token(connection, transaction_id)?);
+        assert!(!worker.is_cancelled());
+        let _ = sessions.cancel(connection, transaction_id, 2_000_000)?;
+        assert!(worker.is_cancelled());
+        let mut challenge = ChallengeSession::begin(
+            faceauth_liveness::ChallengeConfig {
+                max_pair_skew_micros: 100_000,
+                duration_micros: 10_000_000,
+                max_observations: 90,
+                open_eye_threshold: 0.65,
+                closed_eye_threshold: 0.25,
+                neutral_yaw_degrees: 10.0,
+                turn_yaw_degrees: 20.0,
+            },
+            1_000_000,
+        )?;
+        let result = worker.observe_liveness(
+            &mut challenge,
+            ChallengeObservation {
+                timing: CapturePair {
+                    infrared_timestamp_micros: 1_100_000,
+                    visible_timestamp_micros: Some(1_110_000),
+                },
+                infrared_sequence: 1,
+                visible_sequence: 1,
+                face_count: 1,
+                eye_openness: 0.9,
+                yaw_degrees: 0.0,
+            },
+        );
+        assert!(matches!(result, Err(ChallengeError::Cancelled)));
+        assert_eq!(challenge.progress(), ChallengeProgress::BaselineRequired);
         Ok(())
     }
 

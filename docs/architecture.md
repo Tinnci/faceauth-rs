@@ -81,6 +81,11 @@ The daemon is the bridge between inference and encrypted storage: enrollment can
 construct a template only from a normalized `FaceEmbedding`, and authentication
 reconstructs an enrolled comparison vector only after the authenticated record's
 schema, unit norm, compatibility digest, and dimension match the active session.
+Its authentication worker binds one private session cancellation token across
+dual-camera pairing, deterministic preprocessing, and active-liveness observation
+callbacks. Each underlying crate remains desktop/session independent, while the
+daemon facade ensures cancellation cannot stop at one stage and leave later camera
+or landmark work running.
 The authentication evidence orchestrator then requires a valid paired IR/visible
 timestamp, explicitly calibrated IR and visible PAD scores bound to exact model
 compatibility digests, a completed randomized challenge, a finite quality value,
