@@ -1,8 +1,15 @@
 //! Privileged daemon authentication boundary orchestration.
 
+mod engine;
 mod production;
 mod supervision;
 
+pub use engine::{
+    AuthenticationEngine, AuthenticationEngineClient, AuthenticationEngineFailure,
+    AuthenticationEngineHandle, AuthenticationEngineService, AuthenticationEngineServiceError,
+    AuthenticationEngineSubmitError, AuthenticationEngineUpdate, AuthenticationJob,
+    DerivedAuthenticationEvidence,
+};
 pub use production::{
     PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,
     READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind, ReadinessReport,
@@ -589,6 +596,19 @@ impl BoundaryService {
         &mut self.sessions
     }
 
+    /// Create the only engine job admitted for an exact active socket transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundaryError`] when the connection or transaction does not own the active slot.
+    pub fn authentication_job(
+        &self,
+        connection: ConnectionToken,
+        transaction_id: TransactionId,
+    ) -> Result<AuthenticationJob, BoundaryError> {
+        Ok(AuthenticationJob::from_session(&self.sessions, connection, transaction_id)?)
+    }
+
     /// Emit one transaction-bound, non-biometric progress response on the admitted connection.
     ///
     /// If the session deadline has elapsed, the emitted response is terminal `TimedOut` and the
@@ -628,6 +648,35 @@ impl BoundaryService {
         let response = complete_authentication(&mut self.sessions, templates, completion)?;
         stream.write_message(response.clone())?;
         Ok(response)
+    }
+
+    /// Evaluate a successful engine result against authenticated storage and emit one terminal
+    /// transaction-bound response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundaryError`] for invalid session binding or terminal response delivery failure.
+    pub fn send_derived_completion<S: TemplateSource>(
+        &mut self,
+        stream: &mut PeerStream,
+        templates: &S,
+        connection: ConnectionToken,
+        policy: AuthPolicy,
+        passive_pad_policy: &PassivePadPolicy,
+        evidence: &DerivedAuthenticationEvidence,
+    ) -> Result<Response, BoundaryError> {
+        self.send_completion(
+            stream,
+            templates,
+            AuthenticationCompletion {
+                connection,
+                transaction_id: evidence.transaction_id(),
+                policy,
+                passive_pad_policy,
+                observation: evidence.observation(),
+                now_micros: evidence.completed_at_micros(),
+            },
+        )
     }
 }
 
@@ -986,6 +1035,21 @@ mod tests {
             executable: ExecutableFingerprint { device: 1, inode: 1 },
         };
         let started = service.sessions().start(grant, connection, 1_000_000)?;
+        let job = service.authentication_job(connection, transaction_id)?;
+        assert_eq!(job.transaction_id(), transaction_id);
+        assert_eq!(job.target_uid(), 1000);
+        let evidence = DerivedAuthenticationEvidence::new(
+            transaction_id,
+            CapturePair {
+                infrared_timestamp_micros: 2_000_000,
+                visible_timestamp_micros: Some(2_010_000),
+            },
+            0.9,
+            embedding,
+            scores,
+            ChallengeProgress::Passed,
+            3_000_000,
+        );
         let (client, server) = UnixStream::pair()?;
         let mut client = PeerStream::connect(client, TransportConfig::default())?;
         let mut server = PeerStream::connect(server, TransportConfig::default())?;
@@ -997,26 +1061,13 @@ mod tests {
             ProgressCode::Processing,
             2_000_000,
         )?;
-        service.send_completion(
+        service.send_derived_completion(
             &mut server,
             &source,
-            AuthenticationCompletion {
-                connection,
-                transaction_id,
-                policy: AuthPolicy::default(),
-                passive_pad_policy: &pad_policy(),
-                observation: AuthenticationObservation {
-                    timing: CapturePair {
-                        infrared_timestamp_micros: 2_000_000,
-                        visible_timestamp_micros: Some(2_010_000),
-                    },
-                    quality: 0.9,
-                    embedding: &embedding,
-                    passive_liveness: &scores,
-                    active_challenge: ChallengeProgress::Passed,
-                },
-                now_micros: 3_000_000,
-            },
+            connection,
+            AuthPolicy::default(),
+            &pad_policy(),
+            &evidence,
         )?;
 
         assert_eq!(

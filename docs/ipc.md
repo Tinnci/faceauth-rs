@@ -99,6 +99,14 @@ The daemon `AuthenticationWorker` is the sole mapping point from the private
 session token to these capture, preprocessing, and liveness callbacks; no client
 can provide or replace that callback through the wire protocol.
 
+After admission, the daemon can construct an `AuthenticationJob` only from the exact active
+connection and transaction. A supervised single-capacity engine owns heavy capture/inference work;
+submissions fail immediately while another job is active rather than building a biometric queue.
+Its bounded updates contain only the transaction ID, public progress code, and final derived
+evidence. Evidence with another transaction ID is converted to an internal failure before it can
+reach template comparison. Session cancellation and daemon shutdown are both observed through the
+same job helpers at bounded capture, preprocessing, and active-liveness boundaries.
+
 Completion consumes the slot and produces exactly one terminal response.
 `Cancelled` and `TimedOut` are manager-owned results and cannot be injected by
 the inference pipeline. At or after the deadline, progress, completion, or

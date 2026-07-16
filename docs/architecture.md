@@ -94,6 +94,13 @@ dual-camera pairing, deterministic preprocessing, and active-liveness observatio
 callbacks. Each underlying crate remains desktop/session independent, while the
 daemon facade ensures cancellation cannot stop at one stage and leave later camera
 or landmark work running.
+Authorized work is submitted to one long-lived, single-capacity engine service intended to own the
+calibrated camera streams and mutable ONNX sessions. A second job cannot queue behind the active
+face transaction. The bounded result channel carries only closed progress codes and owned derived
+evidence: paired timestamps, quality, a normalized embedding, role-bound PAD probabilities, active
+challenge state, and completion time. Every result is checked against the exact transaction that
+created the job before encrypted template comparison. Raw frames, landmark arrays, tensors,
+templates, and keys have no representation in this channel.
 The authentication evidence orchestrator then requires a valid paired IR/visible
 timestamp, explicitly calibrated IR and visible PAD scores bound to exact model
 compatibility digests, a completed randomized challenge, a finite quality value,

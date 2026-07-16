@@ -71,6 +71,12 @@ float output to the regular deterministic path. ONNX graph execution remains
 bounded separately by per-run `RunOptions` termination and the hard watchdog;
 worker cancellation must be checked again before starting a graph call.
 
+Production sessions are intended to remain inside the daemon's dedicated single-capacity
+authentication engine thread. The socket coordinator submits only an already-authorized,
+transaction-bound job and receives no model tensors or raw image buffers back. The engine can emit
+bounded user-guidance codes while it runs, but only a normalized embedding, role-bound PAD scores,
+paired timestamps, quality, active-challenge state, and completion time cross the worker boundary.
+
 The embedding adapter rejects degenerate vectors and L2-normalizes accepted model
 outputs before enrollment or comparison. Cosine similarity is mapped from
 `[-1, 1]` to `[0, 1]` for the core policy. Persisted templates are accepted only

@@ -39,10 +39,11 @@ all dependent gates explicitly unevaluated. A root-only file key is retained for
 it can never satisfy the production storage gate.
 
 The current build deliberately reports the service-composition gate as false: capture, inference,
-authentication, enrollment, Manager1, cancellation, and shutdown supervision are not yet wired into
-one audited production runner. Consequently `faceauth-daemon serve` still refuses startup even if
-all external files appear complete. This prevents configuration from claiming capabilities the
-binary does not yet implement.
+authentication, enrollment, and Manager1 are not yet wired into one audited production runner. The
+single-capacity authentication engine and shutdown supervision boundaries now exist, but no
+reviewed model implementation has yet populated that engine. Consequently `faceauth-daemon serve`
+still refuses startup even if all external files appear complete. This prevents configuration from
+claiming capabilities the binary does not yet implement.
 
 Neither `doctor` nor readiness inspection opens cameras, creates TPM keys, binds the authentication
 socket, claims a D-Bus name, installs policy, enables a service, or changes PAM configuration.
