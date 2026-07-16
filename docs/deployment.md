@@ -33,8 +33,9 @@ production composition and reviewed D-Bus policy exist, packaging must not claim
 [`faceauth.service`](../contrib/systemd/faceauth.service) is a hardened template for a future
 package. It runs as root, restricts network families to Unix sockets, uses private state/runtime
 directories, and makes no assumption that a TPM or model suite is present. The current `serve`
-command intentionally refuses to start because the audited production model set and full capture
-pipeline are incomplete; installing this unit does not change that gate.
+command evaluates the itemized [production readiness report](production-readiness.md) and
+intentionally refuses to start because the full supervised service composition remains incomplete;
+installing this unit does not change that gate.
 
 Before activation, a distribution package must review device access for the selected IR/RGB nodes,
 TPM resource manager, root-owned model/runtime paths, service readiness behavior, socket group
@@ -48,7 +49,8 @@ system until isolated PAM, Polkit, camera-loss, daemon-restart, and password-rec
 2. Install the service and action through the distribution package manager; never copy files into
    `/etc` manually during development.
 3. Validate the camera selector configuration and encrypted template storage policy.
-4. Run the read-only `doctor`, capture, storage, and presence diagnostics.
+4. Install the reviewed strict production configuration, then run the read-only `doctor`, capture,
+   storage, and presence diagnostics.
 5. Test the dedicated `faceauth-test` PAM policy in an isolated environment.
 6. Obtain an explicit administrator decision before enabling any login, locker, sudo, or Polkit
    authentication integration.

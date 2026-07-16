@@ -12,6 +12,7 @@ use faceauth_capture::{
     CaptureSpec, FrameSummary, PairingPolicy, PixelFormat, V4l2CaptureDevice, capture_pair,
 };
 use faceauth_core::CaptureModality;
+use faceauth_daemon::{ReadinessReport, readiness_from_config_path};
 use faceauth_presence::HpdClient;
 use faceauth_storage::TpmKeyProvider;
 use serde::Serialize;
@@ -28,7 +29,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print read-only hardware and readiness diagnostics.
-    Doctor,
+    Doctor {
+        /// Root-controlled versioned production configuration.
+        #[arg(long, default_value = "/etc/faceauth/faceauth.json")]
+        config: PathBuf,
+    },
     /// Exercise TPM sealing and unsealing without enrolling a face.
     StorageDoctor {
         /// Root-only path for the TPM public/private sealed-key blob.
@@ -43,14 +48,12 @@ enum Command {
     },
     /// Read the optional thinkpad-hpd presence hint; never used for authentication.
     PresenceDoctor,
-    /// Refuse to start the production service until the transport is implemented.
-    Serve,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum ProductionStatus {
-    ScaffoldOnly,
+    /// Evaluate all production gates and refuse startup while any remain unproven.
+    Serve {
+        /// Root-controlled versioned production configuration.
+        #[arg(long, default_value = "/etc/faceauth/faceauth.json")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -75,13 +78,13 @@ enum HpdRole {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum StorageKeyPolicy {
-    TpmPreferredFileFallbackExplicit,
+    TpmRequiredFileFallbackDiagnosticOnly,
 }
 
 #[derive(Debug, Serialize)]
 struct DoctorReport {
     version: &'static str,
-    production_status: ProductionStatus,
+    readiness: ReadinessReport,
     cameras: Vec<CameraDevice>,
     tpm2_resource_manager: DeviceStatus,
     password_fallback: PasswordFallbackPolicy,
@@ -116,96 +119,116 @@ fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Doctor => {
-            let report = DoctorReport {
-                version: env!("CARGO_PKG_VERSION"),
-                production_status: ProductionStatus::ScaffoldOnly,
-                cameras: faceauth_camera::discover()?
-                    .into_iter()
-                    .filter(|camera| camera.capture_capable)
-                    .collect(),
-                tpm2_resource_manager: if Path::new("/dev/tpmrm0").exists() {
-                    DeviceStatus::Available
-                } else {
-                    DeviceStatus::Unavailable
-                },
-                password_fallback: PasswordFallbackPolicy::Mandatory,
-                hpd_role: HpdRole::HintOnly,
-                storage_key_policy: StorageKeyPolicy::TpmPreferredFileFallbackExplicit,
-            };
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        Command::StorageDoctor { blob } => {
-            let provider = TpmKeyProvider::new(&blob);
-            provider.self_test()?;
-            println!("TPM sealed-key self-test passed for {}", blob.display());
-        }
-        Command::CaptureDoctor { config } => {
-            let selector_bytes = fs::read(&config).with_context(|| {
-                format!("unable to read camera selectors from {}", config.display())
-            })?;
-            let selectors: CameraPairSelector = serde_json::from_slice(&selector_bytes)
-                .with_context(|| format!("invalid camera selector JSON in {}", config.display()))?;
-            let inventory = faceauth_camera::discover()?;
-            let cameras = faceauth_camera::resolve_pair(&inventory, &selectors)?;
-            let infrared_device = V4l2CaptureDevice::open(
-                &cameras.infrared.node,
-                CaptureModality::Infrared,
-                CaptureSpec {
-                    width: 640,
-                    height: 360,
-                    pixel_format: PixelFormat::Gray8,
-                    frames_per_second: 15,
-                    buffer_count: 4,
-                    warmup_frames: 2,
-                    frame_timeout_millis: 1_500,
-                    max_frame_bytes: 1024 * 1024,
-                },
-            )?;
-            let visible_device = V4l2CaptureDevice::open(
-                &cameras.visible.node,
-                CaptureModality::Visible,
-                CaptureSpec {
-                    width: 640,
-                    height: 360,
-                    pixel_format: PixelFormat::Yuyv,
-                    frames_per_second: 30,
-                    buffer_count: 4,
-                    warmup_frames: 2,
-                    frame_timeout_millis: 1_500,
-                    max_frame_bytes: 1024 * 1024,
-                },
-            )?;
-            let mut infrared_stream = infrared_device.stream()?;
-            let mut visible_stream = visible_device.stream()?;
-            let pair = capture_pair(
-                &mut infrared_stream,
-                &mut visible_stream,
-                PairingPolicy { max_skew_micros: 100_000, max_replacements: 8 },
-            )?;
-            let report = CaptureDoctorReport {
-                infrared_device: &cameras.infrared,
-                visible_device: &cameras.visible,
-                infrared: pair.infrared.summary(),
-                visible: pair.visible.summary(),
-                skew_micros: pair
-                    .infrared
-                    .summary()
-                    .timestamp_micros
-                    .abs_diff(pair.visible.summary().timestamp_micros),
-                raw_frames_retained: false,
-            };
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
+        Command::Doctor { config } => run_doctor(&config)?,
+        Command::StorageDoctor { blob } => run_storage_doctor(&blob)?,
+        Command::CaptureDoctor { config } => run_capture_doctor(&config)?,
         Command::PresenceDoctor => run_presence_doctor()?,
-        Command::Serve => {
-            info!(
-                "service start refused: audited models, calibrated passive PAD orchestration, active-liveness orchestration, and enrollment are incomplete"
-            );
-            anyhow::bail!("faceauth-daemon is not production-ready")
-        }
+        Command::Serve { config } => run_serve(&config)?,
     }
     Ok(())
+}
+
+fn run_doctor(config: &Path) -> Result<()> {
+    let report = DoctorReport {
+        version: env!("CARGO_PKG_VERSION"),
+        readiness: readiness_from_config_path(config),
+        cameras: faceauth_camera::discover()?
+            .into_iter()
+            .filter(|camera| camera.capture_capable)
+            .collect(),
+        tpm2_resource_manager: if Path::new("/dev/tpmrm0").exists() {
+            DeviceStatus::Available
+        } else {
+            DeviceStatus::Unavailable
+        },
+        password_fallback: PasswordFallbackPolicy::Mandatory,
+        hpd_role: HpdRole::HintOnly,
+        storage_key_policy: StorageKeyPolicy::TpmRequiredFileFallbackDiagnosticOnly,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn run_storage_doctor(blob: &Path) -> Result<()> {
+    let provider = TpmKeyProvider::new(blob);
+    provider.self_test()?;
+    println!("TPM sealed-key self-test passed for {}", blob.display());
+    Ok(())
+}
+
+fn run_capture_doctor(config: &Path) -> Result<()> {
+    let selector_bytes = fs::read(config)
+        .with_context(|| format!("unable to read camera selectors from {}", config.display()))?;
+    let selectors: CameraPairSelector = serde_json::from_slice(&selector_bytes)
+        .with_context(|| format!("invalid camera selector JSON in {}", config.display()))?;
+    let inventory = faceauth_camera::discover()?;
+    let cameras = faceauth_camera::resolve_pair(&inventory, &selectors)?;
+    let infrared_device = V4l2CaptureDevice::open(
+        &cameras.infrared.node,
+        CaptureModality::Infrared,
+        CaptureSpec {
+            width: 640,
+            height: 360,
+            pixel_format: PixelFormat::Gray8,
+            frames_per_second: 15,
+            buffer_count: 4,
+            warmup_frames: 2,
+            frame_timeout_millis: 1_500,
+            max_frame_bytes: 1024 * 1024,
+        },
+    )?;
+    let visible_device = V4l2CaptureDevice::open(
+        &cameras.visible.node,
+        CaptureModality::Visible,
+        CaptureSpec {
+            width: 640,
+            height: 360,
+            pixel_format: PixelFormat::Yuyv,
+            frames_per_second: 30,
+            buffer_count: 4,
+            warmup_frames: 2,
+            frame_timeout_millis: 1_500,
+            max_frame_bytes: 1024 * 1024,
+        },
+    )?;
+    let mut infrared_stream = infrared_device.stream()?;
+    let mut visible_stream = visible_device.stream()?;
+    let pair = capture_pair(
+        &mut infrared_stream,
+        &mut visible_stream,
+        PairingPolicy { max_skew_micros: 100_000, max_replacements: 8 },
+    )?;
+    let report = CaptureDoctorReport {
+        infrared_device: &cameras.infrared,
+        visible_device: &cameras.visible,
+        infrared: pair.infrared.summary(),
+        visible: pair.visible.summary(),
+        skew_micros: pair
+            .infrared
+            .summary()
+            .timestamp_micros
+            .abs_diff(pair.visible.summary().timestamp_micros),
+        raw_frames_retained: false,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn run_serve(config: &Path) -> Result<()> {
+    let readiness = readiness_from_config_path(config);
+    if !readiness.production_ready {
+        let blocking = readiness
+            .blocking_gates()
+            .into_iter()
+            .map(|gate| format!("{gate:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info!(blocking_gates = %blocking, "service start refused by production readiness gates");
+        anyhow::bail!("faceauth-daemon is not production-ready; blocking gates: {blocking}")
+    }
+    anyhow::bail!(
+        "faceauth-daemon readiness contradiction: this build has no production service composition"
+    )
 }
 
 fn run_presence_doctor() -> Result<()> {

@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "cameras": {
+    "infrared": {
+      "vendor_id": "04f2",
+      "product_id": "b769",
+      "serial": "replace-with-udev-serial",
+      "physical_path": "replace-with-ID_PATH"
+    },
+    "visible": {
+      "vendor_id": "04f2",
+      "product_id": "b768",
+      "serial": "replace-with-udev-serial",
+      "physical_path": "replace-with-ID_PATH"
+    }
+  },
+  "runtime": {
+    "library_path": "/usr/lib/faceauth/libonnxruntime.so",
+    "intra_threads": 2,
+    "inter_threads": 1,
+    "max_model_bytes": 536870912,
+    "max_run_millis": 1000
+  },
+  "models": [
+    {
+      "role": "face-detector",
+      "manifest_path": "/usr/share/faceauth/models/face-detector.json",
+      "artifact_path": "/usr/share/faceauth/models/face-detector.onnx",
+      "review_evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/face-detector.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "role": "face-landmarks",
+      "manifest_path": "/usr/share/faceauth/models/face-landmarks.json",
+      "artifact_path": "/usr/share/faceauth/models/face-landmarks.onnx",
+      "review_evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/face-landmarks.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "role": "face-embedding",
+      "manifest_path": "/usr/share/faceauth/models/face-embedding.json",
+      "artifact_path": "/usr/share/faceauth/models/face-embedding.onnx",
+      "review_evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/face-embedding.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "role": "passive-liveness-infrared",
+      "manifest_path": "/usr/share/faceauth/models/passive-ir.json",
+      "artifact_path": "/usr/share/faceauth/models/passive-ir.onnx",
+      "review_evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/passive-ir.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "role": "passive-liveness-visible",
+      "manifest_path": "/usr/share/faceauth/models/passive-visible.json",
+      "artifact_path": "/usr/share/faceauth/models/passive-visible.onnx",
+      "review_evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/passive-visible.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "role": "passive-liveness-fusion",
+      "manifest_path": "/usr/share/faceauth/models/passive-fusion.json",
+      "artifact_path": "/usr/share/faceauth/models/passive-fusion.onnx",
+      "review_evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/passive-fusion.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ],
+  "calibration": {
+    "recognition": {
+      "embedding_compatibility_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policy": {
+        "capture": {
+          "require_infrared": true,
+          "require_visible": true,
+          "max_pair_skew_micros": 100000
+        },
+        "liveness": "passive-and-active",
+        "minimum_similarity": 0.7,
+        "minimum_quality": 0.7,
+        "password_fallback": true
+      },
+      "evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/recognition-calibration.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "passive_pad": {
+      "infrared_compatibility_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "minimum_infrared_probability": 0.8,
+      "visible_compatibility_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "minimum_visible_probability": 0.8,
+      "fusion_compatibility_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "minimum_fusion_probability": 0.8,
+      "evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/passive-pad-calibration.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "active_liveness": {
+      "landmarks_compatibility_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "challenge": {
+        "max_pair_skew_micros": 100000,
+        "duration_micros": 10000000,
+        "max_observations": 60,
+        "open_eye_threshold": 0.7,
+        "closed_eye_threshold": 0.3,
+        "neutral_yaw_degrees": 8.0,
+        "turn_yaw_degrees": 20.0
+      },
+      "evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/active-liveness-calibration.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "enrollment": {
+      "policy": {
+        "duration_micros": 30000000,
+        "minimum_samples": 5,
+        "maximum_samples": 8,
+        "minimum_quality": 0.7,
+        "minimum_sample_similarity": 0.75
+      },
+      "evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/enrollment.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  },
+  "storage": {
+    "template_directory": "/var/lib/faceauth/templates",
+    "key": {
+      "kind": "tpm",
+      "sealed_key_blob": "/var/lib/faceauth/machine-key.tpm"
+    },
+    "recovery_evidence": {
+      "path": "/usr/share/doc/faceauth/reviews/storage-recovery.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "authorization": {
+    "rules": [
+      {
+        "service": "faceauth-locker",
+        "purpose": "screen-unlock",
+        "caller": "root-only",
+        "executables": [{ "device": 1, "inode": 1 }]
+      },
+      {
+        "service": "faceauth-login",
+        "purpose": "login",
+        "caller": "root-only",
+        "executables": [{ "device": 1, "inode": 2 }]
+      },
+      {
+        "service": "faceauth-enroll",
+        "purpose": "polkit",
+        "caller": "root-only",
+        "executables": [{ "device": 1, "inode": 3 }]
+      }
+    ],
+    "review_evidence": {
+      "path": "/usr/share/doc/faceauth/reviews/authorization.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "management": {
+    "enabled": true,
+    "operation_duration_micros": 120000000,
+    "policy_review_evidence": {
+      "path": "/usr/share/doc/faceauth/reviews/management-policy.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  "authentication_boundary": {
+    "socket_path": "/run/faceauth/auth.sock",
+    "socket_mode": 432,
+    "max_message_bytes": 16384,
+    "io_timeout_millis": 2000,
+    "transaction_duration_micros": 15000000,
+    "password_fallback_mandatory": true,
+    "recovery_test_evidence": {
+      "path": "/usr/share/doc/faceauth/reviews/password-recovery.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+}

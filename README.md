@@ -34,7 +34,7 @@ See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 [active liveness](docs/liveness.md), [enrollment](docs/enrollment.md), and
 [presence integration](docs/presence.md), [PAM boundary](docs/pam.md), and
 [management contract](docs/management.md), [deployment artifacts](docs/deployment.md), and
-[research](docs/research.md).
+[production readiness](docs/production-readiness.md), and [research](docs/research.md).
 
 ## Development
 
@@ -49,7 +49,7 @@ cargo audit
 Read-only local diagnostics:
 
 ```bash
-cargo run -p faceauth-daemon -- doctor
+cargo run -p faceauth-daemon -- doctor --config /etc/faceauth/faceauth.json
 cargo run -p faceauth-daemon -- capture-doctor --config ./cameras.json
 cargo run -p faceauth-daemon -- presence-doctor
 cargo run -p faceauth-cli -- policy

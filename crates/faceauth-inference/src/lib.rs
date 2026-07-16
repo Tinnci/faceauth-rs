@@ -69,6 +69,43 @@ impl RuntimeConfig {
     }
 }
 
+/// Verify a configured ONNX Runtime library without loading executable code from it.
+///
+/// The resolved file and every containing directory must be root-owned and not writable by group
+/// or others. This check is suitable for readiness diagnostics; session construction performs the
+/// same check again immediately before loading the library.
+///
+/// # Errors
+///
+/// Returns [`InferenceError`] when the resource policy is invalid or the configured path is
+/// missing, unsafe, or not a regular file.
+pub fn verify_runtime_installation(config: &RuntimeConfig) -> Result<(), InferenceError> {
+    config.validate()?;
+    let canonical = fs::canonicalize(&config.library_path)?;
+    verify_trusted_file(&canonical, None)
+}
+
+/// Verify one root-controlled model installation without constructing an inference session.
+///
+/// This checks trusted ownership and permissions, the configured size bound, manifest structure,
+/// and the exact artifact digest. It deliberately does not load ONNX Runtime or execute the graph.
+///
+/// # Errors
+///
+/// Returns [`InferenceError`] when configuration, filesystem trust, manifest validation, or the
+/// artifact digest check fails.
+pub fn verify_model_installation(
+    config: &RuntimeConfig,
+    manifest: &ModelManifest,
+    model_path: &Path,
+) -> Result<(), InferenceError> {
+    config.validate()?;
+    let canonical = fs::canonicalize(model_path)?;
+    verify_trusted_file(&canonical, Some(config.max_model_bytes))?;
+    manifest.verify_file(&canonical)?;
+    Ok(())
+}
+
 /// Loaded ONNX graph whose static I/O contract matches its reviewed manifest.
 pub struct OnnxSession {
     session: Session,

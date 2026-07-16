@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// USB identity used to bind configuration to one camera device.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsbIdentity {
     /// Four-character lowercase hexadecimal USB vendor identifier.
     pub vendor_id: String,
@@ -18,6 +19,7 @@ pub struct UsbIdentity {
 
 /// One V4L2 node discovered through udev.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraDevice {
     /// Device node, such as `/dev/video0`.
     pub node: PathBuf,
@@ -63,6 +65,7 @@ impl CameraDevice {
 
 /// Explicit selector stored in administrator-controlled camera configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraSelector {
     /// Required USB vendor identifier.
     pub vendor_id: String,
@@ -76,6 +79,7 @@ pub struct CameraSelector {
 
 /// Explicit selectors for the two camera modalities.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraPairSelector {
     /// Selector for the near-infrared capture node.
     pub infrared: CameraSelector,
@@ -95,6 +99,7 @@ pub enum CameraRole {
 
 /// A uniquely resolved IR and visible-light capture pair.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedCameraPair {
     /// Resolved near-infrared capture node.
     pub infrared: CameraDevice,

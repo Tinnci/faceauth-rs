@@ -131,7 +131,7 @@ Polkit, login, or sudo configuration is modified.
 
 The current `BoundaryService` implements decode → peer executable verification →
 exact authorization → session start/cancel → framed response. The installed
-production `serve` command still refuses to run until an audited model suite,
-calibrated passive-PAD orchestration, active-liveness orchestration, and enrollment
-are complete; the boundary never substitutes a scaffold response for biometric
-success.
+production `serve` command evaluates the itemized readiness gates and still refuses
+to run until the complete supervised capture, inference, authentication, enrollment,
+management, cancellation, and shutdown composition is implemented; the boundary
+never substitutes a scaffold response for biometric success.

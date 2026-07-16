@@ -13,6 +13,7 @@ pub enum CaptureModality {
 
 /// Timestamp metadata for a paired camera observation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturePair {
     /// Monotonic timestamp of the IR frame, in microseconds.
     pub infrared_timestamp_micros: u64,
@@ -22,6 +23,7 @@ pub struct CapturePair {
 
 /// Rules for accepting one IR/RGB capture pair.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturePolicy {
     /// Require an IR frame for authentication.
     pub require_infrared: bool,
@@ -91,6 +93,7 @@ pub enum LivenessLevel {
 
 /// Authentication policy evaluated after capture and inference.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthPolicy {
     /// Capture requirements.
     pub capture: CapturePolicy,

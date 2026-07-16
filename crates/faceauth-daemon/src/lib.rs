@@ -1,5 +1,13 @@
 //! Privileged daemon authentication boundary orchestration.
 
+mod production;
+
+pub use production::{
+    PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,
+    READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind, ReadinessReport,
+    inspect_production_readiness, load_production_config, readiness_from_config_path,
+};
+
 use faceauth_authz::{
     AuthorizationError, AuthorizationGrant, AuthorizationPolicy, BoundAuthorizationIssuer,
     ExecutableError, VerifiedExecutable,
