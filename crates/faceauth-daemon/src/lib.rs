@@ -1,11 +1,16 @@
 //! Privileged daemon authentication boundary orchestration.
 
 mod production;
+mod supervision;
 
 pub use production::{
     PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,
     READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind, ReadinessReport,
     inspect_production_readiness, load_production_config, readiness_from_config_path,
+};
+pub use supervision::{
+    ServiceSupervisor, ShutdownFuture, ShutdownToken, SupervisorConfig, SupervisorError,
+    SupervisorReport, run_supervised_authentication_listener,
 };
 
 use faceauth_authz::{

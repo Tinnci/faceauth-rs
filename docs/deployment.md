@@ -37,6 +37,11 @@ command evaluates the itemized [production readiness report](production-readines
 intentionally refuses to start because the full supervised service composition remains incomplete;
 installing this unit does not change that gate.
 
+The daemon library now provides bounded fail-fast supervision, a shared blocking/async shutdown
+token, graceful Manager1 name release, and exact-inode authentication socket cleanup. The remaining
+activation gate is the real capture/inference/enrollment worker composition and its isolated
+restart/recovery evidence, not thread or socket lifecycle scaffolding.
+
 Before activation, a distribution package must review device access for the selected IR/RGB nodes,
 TPM resource manager, root-owned model/runtime paths, service readiness behavior, socket group
 ownership, shutdown/restart recovery, and log privacy. Do not enable the unit on a production login

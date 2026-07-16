@@ -31,9 +31,10 @@ transport with explicit peer-credential checks.
 
 The daemon listener binds only inside an existing root-owned directory that is
 not writable by group or others. It accepts only socket modes `0600` or `0660`,
-never unlinks or replaces an existing path, and captures credentials and pidfd
-immediately after `accept`. Stale socket cleanup and optional group ownership are
-explicit service-manager operations.
+never unlinks or replaces an existing path during startup, and captures credentials and pidfd
+immediately after `accept`. On normal drop or explicit cleanup it removes only the exact socket
+device/inode it created; a replaced path is never removed. Crash-stale cleanup and optional group
+ownership remain explicit service-manager operations.
 
 The transport also provides a bounded sequential accept loop for the daemon's
 initial single-camera capacity. It uses non-blocking accept with a 1–100 ms poll

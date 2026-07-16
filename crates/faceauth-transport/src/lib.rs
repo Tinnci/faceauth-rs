@@ -6,7 +6,7 @@ use std::{
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     os::unix::net::UnixStream,
     os::unix::{
-        fs::{MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixListener,
     },
     path::{Path, PathBuf},
@@ -32,6 +32,14 @@ pub const ABSOLUTE_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub struct SecureListener {
     listener: UnixListener,
     path: PathBuf,
+    identity: SocketIdentity,
+    cleaned: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
 }
 
 impl SecureListener {
@@ -72,7 +80,17 @@ impl SecureListener {
             let _ = fs::remove_file(path);
             return Err(ListenerError::Io(error));
         }
-        Ok(Self { listener, path: path.to_owned() })
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() {
+            let _ = fs::remove_file(path);
+            return Err(ListenerError::CreatedPathInvalid { path: path.to_owned() });
+        }
+        Ok(Self {
+            listener,
+            path: path.to_owned(),
+            identity: SocketIdentity { device: metadata.dev(), inode: metadata.ino() },
+            cleaned: false,
+        })
     }
 
     /// Accept one peer and immediately capture credentials, pidfd, and I/O bounds.
@@ -115,6 +133,45 @@ impl SecureListener {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Remove only the exact socket inode created by this listener.
+    ///
+    /// A missing path is treated as already cleaned. A replaced path is never removed. Drop also
+    /// attempts this identity-checked cleanup so unwinding cannot leave an ordinary stale socket;
+    /// callers use this method when cleanup failure must be reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListenerError::OwnedPathChanged`] if the path now identifies another inode or
+    /// file type, or [`ListenerError::Io`] for a filesystem failure.
+    pub fn cleanup(mut self) -> Result<(), ListenerError> {
+        self.remove_owned_path()?;
+        self.cleaned = true;
+        Ok(())
+    }
+
+    fn remove_owned_path(&self) -> Result<(), ListenerError> {
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ListenerError::Io(error)),
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.dev() == self.identity.device
+                    && metadata.ino() == self.identity.inode =>
+            {
+                fs::remove_file(&self.path).map_err(ListenerError::Io)
+            }
+            Ok(_) => Err(ListenerError::OwnedPathChanged { path: self.path.clone() }),
+        }
+    }
+}
+
+impl Drop for SecureListener {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _cleanup_result = self.remove_owned_path();
+        }
     }
 }
 
@@ -424,6 +481,18 @@ pub enum ListenerError {
         /// Existing path.
         path: PathBuf,
     },
+    /// The kernel-created path did not resolve to a Unix socket.
+    #[error("created Unix listener path is not a socket: {path}")]
+    CreatedPathInvalid {
+        /// Invalid created path.
+        path: PathBuf,
+    },
+    /// Cleanup refused to remove a path whose type or inode no longer matches this listener.
+    #[error("owned Unix socket path changed before cleanup: {path}")]
+    OwnedPathChanged {
+        /// Replaced path.
+        path: PathBuf,
+    },
     /// Filesystem or socket operation failed.
     #[error("unable to create secure Unix listener: {0}")]
     Io(#[from] io::Error),
@@ -675,13 +744,34 @@ mod tests {
             Err(ListenerError::PathExists { .. })
         ));
         drop(listener);
-        fs::remove_file(&socket)?;
+        assert!(!socket.exists());
 
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))?;
         assert!(matches!(
             SecureListener::bind_owned(&socket, 0o600, uid),
             Err(ListenerError::UnsafeParent { .. })
         ));
+        fs::remove_dir(&directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn listener_cleanup_removes_only_its_exact_socket_inode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = temporary_directory()?;
+        let uid = fs::metadata(&directory)?.uid();
+        let socket = directory.join("auth.sock");
+        let listener = SecureListener::bind_owned(&socket, 0o600, uid)?;
+        listener.cleanup()?;
+        assert!(!socket.exists());
+
+        let listener = SecureListener::bind_owned(&socket, 0o600, uid)?;
+        fs::remove_file(&socket)?;
+        fs::write(&socket, b"replacement")?;
+        assert!(matches!(listener.cleanup(), Err(ListenerError::OwnedPathChanged { .. })));
+        assert_eq!(fs::read(&socket)?, b"replacement");
+
+        fs::remove_file(&socket)?;
         fs::remove_dir(&directory)?;
         Ok(())
     }
@@ -700,7 +790,7 @@ mod tests {
         drop(client);
         drop(server);
         drop(listener);
-        fs::remove_file(&socket)?;
+        assert!(!socket.exists());
         fs::remove_dir(&directory)?;
         Ok(())
     }

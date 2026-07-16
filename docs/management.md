@@ -70,6 +70,9 @@ subscribes to `NameOwnerChanged`, then registers `/org/faceauth/Manager1`, and o
 `org.faceauth.Manager1`. Name acquisition uses `DoNotQueue` without `ReplaceExisting`, so a second
 instance fails instead of replacing or waiting behind the active daemon. Any watcher, decoding,
 cancellation, or signal failure is service-fatal; shutdown releases the name and removes the object.
+`run_manager1_service_until_shutdown` adds an explicit future-based graceful stop path while
+preserving the same activation and fatal-error semantics. The daemon's process-local shutdown
+future can therefore release the bus name and object before its supervision grace deadline.
 
 The daemon obtains a `ManagementWorkerHandle` that uses the adapter's exact coordinator and
 monotonic clock for progress, completion, and timeout reaping. It can emit only the resulting
@@ -81,7 +84,8 @@ service startup wiring remain required before activation.
 Tests launch a private `dbus-daemon` rather than touching the host system bus. They verify the full
 Manager1 method path, exclusive name ownership, disconnect cancellation, real
 `GetConnectionUnixUser`, exact PolicyKit subject/action/flags and `(bba{ss})` result signature, plus
-both authorized and denied PolicyKit outcomes.
+both authorized and denied PolicyKit outcomes. A separate isolated-bus test proves explicit
+shutdown returns successfully and makes the well-known name immediately acquirable again.
 
 ## Authorization and identity
 

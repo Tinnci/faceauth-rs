@@ -18,7 +18,10 @@ use faceauth_management::{
     MANAGER_OBJECT_PATH, ManagementCoordinator, ManagementError, ManagementProgress,
     ManagementResult, ManagementUpdate, OperationId,
 };
-use futures_util::StreamExt;
+use futures_util::{
+    StreamExt,
+    future::{Either, select},
+};
 use zbus::{Connection, interface, message::Header, object_server::SignalContext, zvariant::Value};
 
 /// Object-safe asynchronous result returned by management backends.
@@ -860,6 +863,27 @@ pub async fn run_manager1_service(
     connection: Connection,
     manager: Manager1,
 ) -> Result<(), BackendError> {
+    run_manager1_service_until_shutdown(connection, manager, std::future::pending()).await
+}
+
+/// Run one Manager1 object until an explicit graceful shutdown future resolves.
+///
+/// Activation ordering and failure behavior match [`run_manager1_service`]. A completed shutdown
+/// future releases the well-known name, removes the object, and returns `Ok(())`; bus, ownership,
+/// disconnect-cleanup, and signal failures remain fatal.
+///
+/// # Errors
+///
+/// Returns [`BackendError`] for subscription, object registration, exclusive name acquisition,
+/// disconnect cleanup, signaling, or bus-stream failure.
+pub async fn run_manager1_service_until_shutdown<F>(
+    connection: Connection,
+    manager: Manager1,
+    shutdown: F,
+) -> Result<(), BackendError>
+where
+    F: Future<Output = ()>,
+{
     let proxy = zbus::fdo::DBusProxy::new(&connection).await.map_err(|error| {
         BackendError::new(format!("unable to create Manager1 lifecycle proxy: {error}"))
     })?;
@@ -888,8 +912,18 @@ pub async fn run_manager1_service(
         return Err(BackendError::new("Manager1 bus name is already owned"));
     }
 
+    let mut shutdown = Box::pin(shutdown);
     let result = loop {
-        let Some(change) = changes.next().await else {
+        let change = Box::pin(changes.next());
+        let (change, pending_shutdown) = match select(change, shutdown).await {
+            Either::Left((change, pending_shutdown)) => (change, pending_shutdown),
+            Either::Right(((), pending_change)) => {
+                drop(pending_change);
+                break Ok(());
+            }
+        };
+        shutdown = pending_shutdown;
+        let Some(change) = change else {
             break Err(BackendError::new("Manager1 owner-change stream ended"));
         };
         let args = match change.args() {
@@ -1585,6 +1619,62 @@ mod tests {
         let service_result = service_result_rx.recv_timeout(Duration::from_secs(5))?;
         assert!(service_result.is_err());
         service_thread.join().map_err(|_| "Manager1 service thread panicked")?;
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_bus_runner_releases_name_on_explicit_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bus = PrivateBus::start()?;
+        let manager = Manager1::new(
+            ManagementCoordinator::new(ManagementConfig::default())?,
+            AnyCallerBackend,
+            SystemMonotonicClock,
+        );
+        let service_address = bus.address.clone();
+        let (shutdown_tx, shutdown_rx) = futures_channel::oneshot::channel();
+        let (result_tx, result_rx) = test_mpsc::channel();
+        let service_thread = thread::spawn(move || {
+            let result = futures_lite::future::block_on(async move {
+                let connection = zbus::ConnectionBuilder::address(service_address.as_str())
+                    .map_err(|error| error.to_string())?
+                    .build()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                run_manager1_service_until_shutdown(connection, manager, async move {
+                    let _shutdown_result = shutdown_rx.await;
+                })
+                .await
+                .map_err(|error| error.to_string())
+            });
+            let _send_result = result_tx.send(result);
+        });
+
+        let client = zbus::blocking::connection::Builder::address(bus.address.as_str())?.build()?;
+        let proxy = zbus::blocking::Proxy::new(
+            &client,
+            MANAGER_BUS_NAME,
+            MANAGER_OBJECT_PATH,
+            faceauth_management::MANAGER_INTERFACE,
+        )?;
+        let ready_deadline = TestInstant::now() + Duration::from_secs(5);
+        loop {
+            if proxy.call::<_, _, u16>("GetVersion", &()) == Ok(MANAGEMENT_SCHEMA_VERSION) {
+                break;
+            }
+            if TestInstant::now() >= ready_deadline {
+                return Err("Manager1 service did not become ready".into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        shutdown_tx.send(()).map_err(|()| "Manager1 shutdown receiver disappeared")?;
+        assert!(result_rx.recv_timeout(Duration::from_secs(5))?.is_ok());
+        service_thread.join().map_err(|_| "Manager1 service thread panicked")?;
+        drop(proxy);
+        client.request_name(MANAGER_BUS_NAME)?;
+        client.release_name(MANAGER_BUS_NAME)?;
+        bus.stop()?;
         Ok(())
     }
 

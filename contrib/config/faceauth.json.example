@@ -183,6 +183,11 @@
       "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   },
+  "supervision": {
+    "poll_interval_millis": 25,
+    "shutdown_grace_millis": 5000,
+    "max_services": 4
+  },
   "authentication_boundary": {
     "socket_path": "/run/faceauth/auth.sock",
     "socket_mode": 432,

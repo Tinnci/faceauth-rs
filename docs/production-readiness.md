@@ -3,7 +3,8 @@
 `faceauth-daemon` uses one strict, versioned configuration for production composition. The schema
 rejects unknown fields, unsupported versions, relative security-sensitive paths, incomplete model
 roles, unbounded resources, passive-only liveness, missing visible capture, and disabled password
-fallback. The starting point is
+fallback. It also bounds supervisor polling, service count, and graceful shutdown time. The starting
+point is
 [`faceauth.json.example`](../contrib/config/faceauth.json.example); every placeholder digest,
 executable fingerprint, path, selector, threshold, and review artifact must be replaced with
 evidence from the exact packaged build and target hardware.

@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::supervision::SupervisorConfig;
+
 /// Current daemon production-configuration schema.
 pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 1;
 /// Current machine-readable readiness-report schema.
@@ -63,6 +65,8 @@ pub struct ProductionConfig {
     pub authorization: AuthorizationConfig,
     /// Stable Manager1 lifecycle policy.
     pub management: ManagementServiceConfig,
+    /// Fail-fast service supervision and bounded shutdown policy.
+    pub supervision: SupervisionPolicyConfig,
     /// Root-owned authentication socket and password-recovery invariants.
     pub authentication_boundary: AuthenticationBoundaryConfig,
 }
@@ -235,6 +239,28 @@ pub struct ManagementServiceConfig {
     pub operation_duration_micros: u64,
     /// Reviewed D-Bus and `PolicyKit` packaging/activation report.
     pub policy_review_evidence: ReviewedEvidence,
+}
+
+/// Serializable daemon supervision resource bounds.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionPolicyConfig {
+    /// Maximum delay between external shutdown checks.
+    pub poll_interval_millis: u64,
+    /// Grace period for all service threads to cooperate and join.
+    pub shutdown_grace_millis: u64,
+    /// Maximum independently supervised service tasks.
+    pub max_services: usize,
+}
+
+impl SupervisionPolicyConfig {
+    const fn supervisor(&self) -> SupervisorConfig {
+        SupervisorConfig {
+            poll_interval: Duration::from_millis(self.poll_interval_millis),
+            shutdown_grace: Duration::from_millis(self.shutdown_grace_millis),
+            max_services: self.max_services,
+        }
+    }
 }
 
 /// Authentication socket bounds and mandatory recovery behavior.
@@ -424,6 +450,9 @@ impl ProductionConfig {
                 ProductionConfigError::Invalid(format!("invalid Manager1 policy: {error}"))
             })?;
         validate_evidence_config(&self.management.policy_review_evidence)?;
+        self.supervision.supervisor().validate().map_err(|error| {
+            ProductionConfigError::Invalid(format!("invalid service supervision policy: {error}"))
+        })?;
         validate_authentication_boundary(&self.authentication_boundary)?;
         Ok(())
     }
@@ -1003,6 +1032,11 @@ mod tests {
                 operation_duration_micros: 120_000_000,
                 policy_review_evidence: evidence("management-policy.json"),
             },
+            supervision: SupervisionPolicyConfig {
+                poll_interval_millis: 25,
+                shutdown_grace_millis: 5_000,
+                max_services: 4,
+            },
             authentication_boundary: AuthenticationBoundaryConfig {
                 socket_path: PathBuf::from("/run/faceauth/auth.sock"),
                 socket_mode: 0o660,
@@ -1087,6 +1121,9 @@ mod tests {
         config.runtime.max_run_millis = 1_000;
         config.authentication_boundary.max_message_bytes =
             faceauth_transport::ABSOLUTE_MAX_MESSAGE_BYTES + 1;
+        assert!(config.validate().is_err());
+        config.authentication_boundary.max_message_bytes = 16 * 1024;
+        config.supervision.shutdown_grace_millis = 9;
         assert!(config.validate().is_err());
         Ok(())
     }

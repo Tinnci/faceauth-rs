@@ -106,6 +106,15 @@ in [enrollment.md](enrollment.md).
 The optional HPD contract and its fail-open semantics are described in
 [presence.md](presence.md).
 
+Daemon blocking boundaries run under a bounded fail-fast supervisor. Each named service receives
+one process-local shutdown token; any error, panic, event-channel loss, or clean exit before an
+explicit stop requests shutdown for every peer. Cooperative services must join within a configured
+10 ms–30 s grace period or the supervisor reports the remaining names and fails closed. The same
+token exposes an async future for Manager1 and a polling check for the authentication accept loop.
+The authentication listener removes only its own exact socket device/inode on return or unwind;
+replacement paths are preserved and reported. This establishes restart and shutdown ownership, but
+does not yet claim the final capture/inference/enrollment service composition.
+
 Landmark models provide bounded eye-openness, yaw, and face-count measurements to
 the active-challenge state machine. They do not decide challenge success. The
 state machine requires a neutral baseline, randomized action, neutral recovery,
