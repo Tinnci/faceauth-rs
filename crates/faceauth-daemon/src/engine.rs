@@ -12,8 +12,8 @@ use std::{
 use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
 use faceauth_core::CapturePair;
 use faceauth_inference::{
-    FaceEmbedding, FaceRegion, ImageFacialLandmarks, ImageView, InferenceError, InputTensor,
-    OnnxSession, PassiveLivenessScore,
+    FaceEmbedding, FaceRegion, FacialLandmarks, ImageFacialLandmarks, ImageView, InferenceError,
+    InputTensor, OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
@@ -162,6 +162,34 @@ impl AuthenticationJob {
         assess_cancellable(image, geometry, config, || self.is_cancelled())
     }
 
+    /// Assess image quality using geometry and confidence derived by the exact landmark model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualityError`] for invalid model-derived geometry, cancellation, malformed image
+    /// data, invalid calibration, or bounded scan failure.
+    pub fn assess_landmark_quality(
+        &self,
+        image: QualityImageView<'_>,
+        landmarks: &FacialLandmarks,
+        config: QualityConfig,
+    ) -> Result<QualityReport, QualityError> {
+        let bounds = landmarks.region().bounds();
+        let measurements = landmarks.measurements();
+        let geometry = FaceGeometry {
+            center_x: (bounds.left() + bounds.right()) * 0.5,
+            center_y: (bounds.top() + bounds.bottom()) * 0.5,
+            width: bounds.right() - bounds.left(),
+            height: bounds.bottom() - bounds.top(),
+            yaw_degrees: measurements.yaw_degrees(),
+            pitch_degrees: measurements.pitch_degrees(),
+            roll_degrees: measurements.roll_degrees(),
+            landmark_confidence: measurements.landmark_confidence(),
+            visible_fraction: measurements.visible_fraction(),
+        };
+        self.assess_quality(image, geometry, config)
+    }
+
     /// Process one active-liveness observation with session and daemon cancellation.
     ///
     /// # Errors
@@ -173,6 +201,34 @@ impl AuthenticationJob {
         observation: ChallengeObservation,
     ) -> Result<ChallengeProgress, ChallengeError> {
         challenge.observe_cancellable(observation, || self.is_cancelled())
+    }
+
+    /// Process active liveness using eye openness and yaw emitted by the exact landmark model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChallengeError`] for cancellation, invalid paired timing, repeated frames,
+    /// malformed model measurements, deadline expiry, or a failed challenge transition.
+    pub fn observe_landmark_liveness(
+        &self,
+        challenge: &mut ChallengeSession,
+        timing: CapturePair,
+        infrared_sequence: u32,
+        visible_sequence: u32,
+        landmarks: &FacialLandmarks,
+    ) -> Result<ChallengeProgress, ChallengeError> {
+        let measurements = landmarks.measurements();
+        self.observe_liveness(
+            challenge,
+            ChallengeObservation {
+                timing,
+                infrared_sequence,
+                visible_sequence,
+                face_count: 1,
+                eye_openness: measurements.eye_openness(),
+                yaw_degrees: measurements.yaw_degrees(),
+            },
+        )
     }
 }
 

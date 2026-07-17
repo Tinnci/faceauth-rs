@@ -1,7 +1,7 @@
 # Model acceptance policy
 
 No model weights are bundled or downloaded merely because they are technically
-compatible with ONNX Runtime. Every artifact must have a schema-v7 reviewed
+compatible with ONNX Runtime. Every artifact must have a schema-v8 reviewed
 manifest with an HTTPS provenance URL, valid SPDX license expression, exact
 SHA-256 digest, pipeline role, and exact static input and output contracts.
 
@@ -9,7 +9,7 @@ The initial runtime admits exactly one fixed-shape float32 input and a bounded,
 non-empty list of fixed-shape float32 outputs. Tensor names, ranks, dimensions,
 and element counts are bounded. Dynamic dimensions, unexpected graph inputs or
 outputs, duplicate outputs, and name/type/shape mismatches fail closed.
-Schema v7 binds the resize filter, finite per-channel affine normalization
+Schema v8 binds the resize filter, finite per-channel affine normalization
 (`pixel * scale + bias`), and security-relevant output semantics to the model and
 its calibration record. Detector roles require exact normalized `[1,N,4]` box and `[1,N]`
 confidence outputs; landmark roles require exact normalized `[1,L,2]` points. Embedding roles
@@ -29,6 +29,9 @@ Landmark manifests additionally bind the detector-box crop contract. The initial
 a calibrated square region using a bounded scale and center offset. It rejects regions outside the
 image instead of introducing unspecified padding, and the derived region provenance is carried by
 the landmark result so callers cannot substitute an unrelated box during full-image mapping.
+They must expose same-invocation per-point confidence, pose degrees, and bilateral eye-openness
+outputs. The manifest binds the visibility threshold and admitted pose ranges; missing, non-finite,
+out-of-range, or shape-incompatible measurements fail closed.
 
 ## Intended pipeline
 

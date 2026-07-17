@@ -106,7 +106,7 @@ impl RuntimePolicyConfig {
 pub struct ModelInstallation {
     /// Pipeline role this entry must provide.
     pub role: ModelRole,
-    /// Root-controlled schema-v7 manifest.
+    /// Root-controlled schema-v8 manifest.
     pub manifest_path: PathBuf,
     /// Root-controlled ONNX artifact.
     pub artifact_path: PathBuf,

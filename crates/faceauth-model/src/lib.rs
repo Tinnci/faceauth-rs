@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 7;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 8;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -115,6 +115,37 @@ pub struct FaceCropContract {
     pub center_offset_x: f32,
     /// Vertical center shift as a multiple of the detector box height; positive moves down.
     pub center_offset_y: f32,
+}
+
+/// Calibrated semantic outputs required from a landmark model used for quality and active PAD.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandmarkMeasurementContract {
+    /// Point confidence at or above this value contributes to the visible fraction.
+    pub minimum_visible_confidence: f32,
+    /// Maximum admitted absolute yaw in degrees.
+    pub maximum_absolute_yaw_degrees: f32,
+    /// Maximum admitted absolute pitch in degrees.
+    pub maximum_absolute_pitch_degrees: f32,
+    /// Maximum admitted absolute roll in degrees.
+    pub maximum_absolute_roll_degrees: f32,
+}
+
+impl LandmarkMeasurementContract {
+    fn validate(self) -> Result<(), ModelError> {
+        if !self.minimum_visible_confidence.is_finite()
+            || !(0.0..=1.0).contains(&self.minimum_visible_confidence)
+            || !self.maximum_absolute_yaw_degrees.is_finite()
+            || !(1.0..=90.0).contains(&self.maximum_absolute_yaw_degrees)
+            || !self.maximum_absolute_pitch_degrees.is_finite()
+            || !(1.0..=90.0).contains(&self.maximum_absolute_pitch_degrees)
+            || !self.maximum_absolute_roll_degrees.is_finite()
+            || !(1.0..=180.0).contains(&self.maximum_absolute_roll_degrees)
+        {
+            return Err(ModelError::InvalidLandmarkMeasurementContract);
+        }
+        Ok(())
+    }
 }
 
 impl FaceCropContract {
@@ -262,6 +293,12 @@ pub enum OutputSemantic {
     FaceDetectionScores,
     /// Normalized landmark points in `[1, landmarks, 2]` `x, y` order for one face crop.
     FaceLandmarks,
+    /// Per-point landmark confidence in `[1, landmarks]`, in topology order.
+    FaceLandmarkConfidence,
+    /// Model-estimated yaw, pitch, and roll degrees in `[1,3]` order.
+    FacePoseDegrees,
+    /// Model-estimated left and right eye openness in `[1,2]`, each normalized to `0..=1`.
+    EyeOpenness,
     /// Face embedding vector used only by the embedding adapter.
     Embedding,
     /// Scalar probability that the observation is live, in the inclusive range 0..=1.
@@ -292,6 +329,8 @@ pub struct ModelManifest {
     pub input: InputContract,
     /// Required detector-region derivation for landmark model inputs.
     pub face_crop: Option<FaceCropContract>,
+    /// Required calibrated measurement semantics for landmark roles.
+    pub landmark_measurement: Option<LandmarkMeasurementContract>,
     /// Required landmark-bound geometry preprocessing for roles that consume an aligned face.
     pub face_alignment: Option<FaceAlignmentContract>,
     /// Exact bounded output tensors expected from the graph.
@@ -354,6 +393,13 @@ impl ModelManifest {
             (ModelRole::FaceLandmarks, Some(crop)) => crop.validate()?,
             (ModelRole::FaceLandmarks, None) | (_, Some(_)) => {
                 return Err(ModelError::InvalidFaceCropContract);
+            }
+            (_, None) => {}
+        }
+        match (self.role, self.landmark_measurement) {
+            (ModelRole::FaceLandmarks, Some(contract)) => contract.validate()?,
+            (ModelRole::FaceLandmarks, None) | (_, Some(_)) => {
+                return Err(ModelError::InvalidLandmarkMeasurementContract);
             }
             (_, None) => {}
         }
@@ -495,6 +541,9 @@ pub enum ModelError {
     /// Landmark crop policy is absent, attached to the wrong role, or malformed.
     #[error("model face-crop contract is invalid")]
     InvalidFaceCropContract,
+    /// Landmark measurement calibration is absent, attached to the wrong role, or malformed.
+    #[error("model landmark-measurement contract is invalid")]
+    InvalidLandmarkMeasurementContract,
     /// Tensor name is empty, excessive, or contains unsupported bytes.
     #[error("model tensor name is invalid")]
     InvalidTensorName,
@@ -605,6 +654,9 @@ fn validate_output_semantics(
             OutputSemantic::FaceDetectionBoxes
             | OutputSemantic::FaceDetectionScores
             | OutputSemantic::FaceLandmarks
+            | OutputSemantic::FaceLandmarkConfidence
+            | OutputSemantic::FacePoseDegrees
+            | OutputSemantic::EyeOpenness
             | OutputSemantic::Auxiliary => {}
         }
     }
@@ -632,14 +684,23 @@ fn validate_face_detector_outputs(outputs: &[OutputContract]) -> Result<(), Mode
 }
 
 fn validate_face_landmark_outputs(outputs: &[OutputContract]) -> Result<(), ModelError> {
-    if outputs.len() != 1 {
+    if outputs.len() != 4 {
         return Err(ModelError::OutputSemanticMismatch);
     }
     let landmarks = unique_semantic_output(outputs, OutputSemantic::FaceLandmarks)?;
+    let confidence = unique_semantic_output(outputs, OutputSemantic::FaceLandmarkConfidence)?;
+    let pose = unique_semantic_output(outputs, OutputSemantic::FacePoseDegrees)?;
+    let eye_openness = unique_semantic_output(outputs, OutputSemantic::EyeOpenness)?;
     let [1, landmark_count, 2] = landmarks.dimensions.as_slice() else {
         return Err(ModelError::OutputSemanticMismatch);
     };
     if !(MIN_FACE_LANDMARKS..=MAX_FACE_LANDMARKS).contains(landmark_count) {
+        return Err(ModelError::OutputSemanticMismatch);
+    }
+    if confidence.dimensions.as_slice() != [1, *landmark_count]
+        || pose.dimensions.as_slice() != [1, 3]
+        || eye_openness.dimensions.as_slice() != [1, 2]
+    {
         return Err(ModelError::OutputSemanticMismatch);
     }
     Ok(())
@@ -665,6 +726,9 @@ fn detector_and_landmark_semantics_absent(outputs: &[OutputContract]) -> bool {
             OutputSemantic::FaceDetectionBoxes
                 | OutputSemantic::FaceDetectionScores
                 | OutputSemantic::FaceLandmarks
+                | OutputSemantic::FaceLandmarkConfidence
+                | OutputSemantic::FacePoseDegrees
+                | OutputSemantic::EyeOpenness
         )
     })
 }
@@ -719,6 +783,7 @@ mod tests {
                 },
             },
             face_crop: None,
+            landmark_measurement: None,
             face_alignment: None,
             outputs: vec![
                 OutputContract {
@@ -735,6 +800,35 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn landmark_outputs(count: u32) -> Vec<OutputContract> {
+        vec![
+            OutputContract {
+                name: "landmarks".to_owned(),
+                dimensions: vec![1, count, 2],
+                element_type: TensorElementType::Float32,
+                semantic: OutputSemantic::FaceLandmarks,
+            },
+            OutputContract {
+                name: "confidence".to_owned(),
+                dimensions: vec![1, count],
+                element_type: TensorElementType::Float32,
+                semantic: OutputSemantic::FaceLandmarkConfidence,
+            },
+            OutputContract {
+                name: "pose".to_owned(),
+                dimensions: vec![1, 3],
+                element_type: TensorElementType::Float32,
+                semantic: OutputSemantic::FacePoseDegrees,
+            },
+            OutputContract {
+                name: "eyes".to_owned(),
+                dimensions: vec![1, 2],
+                element_type: TensorElementType::Float32,
+                semantic: OutputSemantic::EyeOpenness,
+            },
+        ]
     }
 
     #[test]
@@ -925,17 +1019,18 @@ mod tests {
     }
 
     #[test]
-    fn landmark_role_requires_one_bounded_xy_tensor() {
+    fn landmark_role_requires_bounded_geometry_and_measurement_outputs() {
         let mut landmarks = manifest();
         landmarks.role = ModelRole::FaceLandmarks;
         landmarks.face_crop =
             Some(FaceCropContract { scale: 1.25, center_offset_x: 0.0, center_offset_y: 0.1 });
-        landmarks.outputs = vec![OutputContract {
-            name: "landmarks".to_owned(),
-            dimensions: vec![1, 5, 2],
-            element_type: TensorElementType::Float32,
-            semantic: OutputSemantic::FaceLandmarks,
-        }];
+        landmarks.landmark_measurement = Some(LandmarkMeasurementContract {
+            minimum_visible_confidence: 0.5,
+            maximum_absolute_yaw_degrees: 75.0,
+            maximum_absolute_pitch_degrees: 60.0,
+            maximum_absolute_roll_degrees: 90.0,
+        });
+        landmarks.outputs = landmark_outputs(5);
         assert!(landmarks.validate().is_ok());
 
         landmarks.outputs[0].dimensions = vec![1, 4, 2];
@@ -949,6 +1044,14 @@ mod tests {
         landmarks.face_crop =
             Some(FaceCropContract { scale: 3.1, center_offset_x: 0.0, center_offset_y: 0.0 });
         assert!(matches!(landmarks.validate(), Err(ModelError::InvalidFaceCropContract)));
+
+        landmarks.face_crop =
+            Some(FaceCropContract { scale: 1.25, center_offset_x: 0.0, center_offset_y: 0.0 });
+        landmarks.landmark_measurement = None;
+        assert!(matches!(
+            landmarks.validate(),
+            Err(ModelError::InvalidLandmarkMeasurementContract)
+        ));
     }
 
     #[test]
@@ -993,19 +1096,25 @@ mod tests {
 
         let mut landmarks = manifest();
         landmarks.role = ModelRole::FaceLandmarks;
-        landmarks.outputs = vec![OutputContract {
-            name: "landmarks".to_owned(),
-            dimensions: vec![1, 5, 2],
-            element_type: TensorElementType::Float32,
-            semantic: OutputSemantic::FaceLandmarks,
-        }];
+        landmarks.outputs = landmark_outputs(5);
         landmarks.face_crop =
             Some(FaceCropContract { scale: 1.25, center_offset_x: 0.0, center_offset_y: 0.0 });
+        landmarks.landmark_measurement = Some(LandmarkMeasurementContract {
+            minimum_visible_confidence: 0.5,
+            maximum_absolute_yaw_degrees: 75.0,
+            maximum_absolute_pitch_degrees: 60.0,
+            maximum_absolute_roll_degrees: 90.0,
+        });
         let crop_digest = landmarks.compatibility_sha256()?;
         if let Some(crop) = landmarks.face_crop.as_mut() {
             crop.center_offset_y = 0.1;
         }
         assert_ne!(landmarks.compatibility_sha256()?, crop_digest);
+        let measurement_digest = landmarks.compatibility_sha256()?;
+        if let Some(measurement) = landmarks.landmark_measurement.as_mut() {
+            measurement.minimum_visible_confidence = 0.6;
+        }
+        assert_ne!(landmarks.compatibility_sha256()?, measurement_digest);
         Ok(())
     }
 }

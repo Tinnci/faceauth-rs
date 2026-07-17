@@ -380,6 +380,56 @@ pub struct FacialLandmarks {
     compatibility_sha256: String,
     region: FaceRegion,
     points: Vec<NormalizedLandmark>,
+    measurements: LandmarkMeasurements,
+}
+
+/// Calibrated model-derived measurements used by quality and active-liveness policy.
+#[derive(Clone, Copy, PartialEq, Zeroize)]
+pub struct LandmarkMeasurements {
+    landmark_confidence: f32,
+    visible_fraction: f32,
+    yaw_degrees: f32,
+    pitch_degrees: f32,
+    roll_degrees: f32,
+    eye_openness: f32,
+}
+
+impl LandmarkMeasurements {
+    /// Mean confidence across the fixed landmark topology.
+    #[must_use]
+    pub const fn landmark_confidence(self) -> f32 {
+        self.landmark_confidence
+    }
+
+    /// Fraction of topology points meeting the manifest's visibility confidence threshold.
+    #[must_use]
+    pub const fn visible_fraction(self) -> f32 {
+        self.visible_fraction
+    }
+
+    /// Model-derived yaw degrees; negative is the user's left and positive the user's right.
+    #[must_use]
+    pub const fn yaw_degrees(self) -> f32 {
+        self.yaw_degrees
+    }
+
+    /// Model-derived pitch degrees.
+    #[must_use]
+    pub const fn pitch_degrees(self) -> f32 {
+        self.pitch_degrees
+    }
+
+    /// Model-derived in-plane roll degrees.
+    #[must_use]
+    pub const fn roll_degrees(self) -> f32 {
+        self.roll_degrees
+    }
+
+    /// Conservative openness of both eyes, computed as the lower model output.
+    #[must_use]
+    pub const fn eye_openness(self) -> f32 {
+        self.eye_openness
+    }
 }
 
 impl FacialLandmarks {
@@ -393,6 +443,18 @@ impl FacialLandmarks {
     #[must_use]
     pub fn points(&self) -> &[NormalizedLandmark] {
         &self.points
+    }
+
+    /// Calibrated semantic measurements emitted by the same landmark invocation.
+    #[must_use]
+    pub const fn measurements(&self) -> LandmarkMeasurements {
+        self.measurements
+    }
+
+    /// Exact manifest-derived full-image region used for this landmark invocation.
+    #[must_use]
+    pub const fn region(&self) -> &FaceRegion {
+        &self.region
     }
 
     /// Map crop-relative landmark output back into normalized full-image coordinates.
@@ -965,7 +1027,7 @@ fn extract_face_landmark_output(
     if manifest.role != ModelRole::FaceLandmarks {
         return Err(InferenceError::ModelRoleMismatch);
     }
-    if !valid_compatibility_sha256(compatibility_sha256) || outputs.len() != 1 {
+    if !valid_compatibility_sha256(compatibility_sha256) || outputs.len() != 4 {
         return Err(InferenceError::FaceLandmarkOutputInvalid);
     }
     let contract = semantic_output(manifest, OutputSemantic::FaceLandmarks)
@@ -994,7 +1056,85 @@ fn extract_face_landmark_output(
         }
         points.push(NormalizedLandmark { x: *x, y: *y });
     }
-    Ok(FacialLandmarks { compatibility_sha256: compatibility_sha256.to_owned(), region, points })
+    let measurements = extract_landmark_measurements(manifest, outputs, count)?;
+    Ok(FacialLandmarks {
+        compatibility_sha256: compatibility_sha256.to_owned(),
+        region,
+        points,
+        measurements,
+    })
+}
+
+fn extract_landmark_measurements(
+    manifest: &ModelManifest,
+    outputs: &[OutputTensor],
+    count: usize,
+) -> Result<LandmarkMeasurements, InferenceError> {
+    let confidence_contract = semantic_output(manifest, OutputSemantic::FaceLandmarkConfidence)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let confidence =
+        exact_output(outputs, &confidence_contract.name, &confidence_contract.dimensions)
+            .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let pose_contract = semantic_output(manifest, OutputSemantic::FacePoseDegrees)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let pose = exact_output(outputs, &pose_contract.name, &pose_contract.dimensions)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let eyes_contract = semantic_output(manifest, OutputSemantic::EyeOpenness)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let eyes = exact_output(outputs, &eyes_contract.name, &eyes_contract.dimensions)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    if confidence.values.len() != count
+        || confidence.values.iter().any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    let measurement =
+        manifest.landmark_measurement.ok_or(InferenceError::FaceLandmarkOutputInvalid)?;
+    let [yaw_degrees, pitch_degrees, roll_degrees] = pose.values.as_slice() else {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    };
+    if !yaw_degrees.is_finite()
+        || !pitch_degrees.is_finite()
+        || !roll_degrees.is_finite()
+        || yaw_degrees.abs() > measurement.maximum_absolute_yaw_degrees
+        || pitch_degrees.abs() > measurement.maximum_absolute_pitch_degrees
+        || roll_degrees.abs() > measurement.maximum_absolute_roll_degrees
+    {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    let [left_eye, right_eye] = eyes.values.as_slice() else {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    };
+    if !left_eye.is_finite()
+        || !right_eye.is_finite()
+        || !(0.0..=1.0).contains(left_eye)
+        || !(0.0..=1.0).contains(right_eye)
+    {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    let count_f32 =
+        f32::from(u16::try_from(count).map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?);
+    let landmark_confidence = confidence.values.iter().sum::<f32>() / count_f32;
+    let visible_count = confidence
+        .values
+        .iter()
+        .filter(|value| **value >= measurement.minimum_visible_confidence)
+        .count();
+    let visible_fraction = f32::from(
+        u16::try_from(visible_count).map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?,
+    ) / count_f32;
+    let measurements = LandmarkMeasurements {
+        landmark_confidence,
+        visible_fraction,
+        yaw_degrees: *yaw_degrees,
+        pitch_degrees: *pitch_degrees,
+        roll_degrees: *roll_degrees,
+        eye_openness: left_eye.min(*right_eye),
+    };
+    if [landmark_confidence, visible_fraction].iter().any(|value| !value.is_finite()) {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    Ok(measurements)
 }
 
 fn derive_face_region(
@@ -1910,6 +2050,14 @@ mod tests {
                 center_offset_x: 0.0,
                 center_offset_y: 0.0,
             }),
+            landmark_measurement: (role == ModelRole::FaceLandmarks).then_some(
+                faceauth_model::LandmarkMeasurementContract {
+                    minimum_visible_confidence: 0.5,
+                    maximum_absolute_yaw_degrees: 90.0,
+                    maximum_absolute_pitch_degrees: 90.0,
+                    maximum_absolute_roll_degrees: 180.0,
+                },
+            ),
             face_alignment: (role == ModelRole::FaceEmbedding).then(test_alignment),
             outputs: vec![OutputContract {
                 name: "output".to_owned(),
@@ -1953,11 +2101,42 @@ mod tests {
     }
 
     fn landmark_manifest(landmark_count: u32) -> ModelManifest {
-        model_manifest(
+        let mut manifest = model_manifest(
             ModelRole::FaceLandmarks,
             OutputSemantic::FaceLandmarks,
             vec![1, landmark_count, 2],
-        )
+        );
+        manifest.outputs.extend([
+            OutputContract {
+                name: "confidence".to_owned(),
+                dimensions: vec![1, landmark_count],
+                element_type: ManifestElementType::Float32,
+                semantic: OutputSemantic::FaceLandmarkConfidence,
+            },
+            OutputContract {
+                name: "pose".to_owned(),
+                dimensions: vec![1, 3],
+                element_type: ManifestElementType::Float32,
+                semantic: OutputSemantic::FacePoseDegrees,
+            },
+            OutputContract {
+                name: "eyes".to_owned(),
+                dimensions: vec![1, 2],
+                element_type: ManifestElementType::Float32,
+                semantic: OutputSemantic::EyeOpenness,
+            },
+        ]);
+        manifest
+    }
+
+    fn landmark_outputs(points: Vec<f32>) -> Vec<OutputTensor> {
+        let count = u32::try_from(points.len() / 2).unwrap_or_default();
+        vec![
+            output("output", vec![1, count, 2], points),
+            output("confidence", vec![1, count], vec![0.8; count as usize]),
+            output("pose", vec![1, 3], vec![10.0, -5.0, 2.0]),
+            output("eyes", vec![1, 2], vec![0.7, 0.6]),
+        ]
     }
 
     fn output(name: &str, dimensions: Vec<u32>, values: Vec<f32>) -> OutputTensor {
@@ -2281,11 +2460,7 @@ mod tests {
     fn landmark_adapter_returns_fixed_normalized_topology() -> Result<(), InferenceError> {
         let compatibility = "ef".repeat(32);
         let manifest = landmark_manifest(5);
-        let outputs = vec![output(
-            "output",
-            vec![1, 5, 2],
-            vec![0.2, 0.3, 0.8, 0.3, 0.5, 0.5, 0.3, 0.8, 0.7, 0.8],
-        )];
+        let outputs = landmark_outputs(vec![0.2, 0.3, 0.8, 0.3, 0.5, 0.5, 0.3, 0.8, 0.7, 0.8]);
         let landmarks = extract_face_landmark_output(
             &manifest,
             &compatibility,
@@ -2296,6 +2471,10 @@ mod tests {
         assert_eq!(landmarks.points().len(), 5);
         assert!((landmarks.points()[2].x() - 0.5).abs() < f32::EPSILON);
         assert!((landmarks.points()[2].y() - 0.5).abs() < f32::EPSILON);
+        assert!((landmarks.measurements().landmark_confidence() - 0.8).abs() < f32::EPSILON);
+        assert!((landmarks.measurements().visible_fraction() - 1.0).abs() < f32::EPSILON);
+        assert!((landmarks.measurements().eye_openness() - 0.6).abs() < f32::EPSILON);
+        assert!((landmarks.measurements().yaw_degrees() - 10.0).abs() < f32::EPSILON);
         Ok(())
     }
 
@@ -2306,7 +2485,7 @@ mod tests {
         for invalid_coordinate in [f32::NAN, -0.1, 1.1] {
             let mut values = vec![0.5; 10];
             values[3] = invalid_coordinate;
-            let outputs = vec![output("output", vec![1, 5, 2], values)];
+            let outputs = landmark_outputs(values);
             assert!(matches!(
                 extract_face_landmark_output(
                     &manifest,
@@ -2318,7 +2497,8 @@ mod tests {
             ));
         }
 
-        let wrong_shape = vec![output("output", vec![5, 2], vec![0.5; 10])];
+        let mut wrong_shape = landmark_outputs(vec![0.5; 10]);
+        wrong_shape[0].dimensions = vec![5, 2];
         assert!(matches!(
             extract_face_landmark_output(
                 &manifest,
@@ -2329,7 +2509,7 @@ mod tests {
             Err(InferenceError::FaceLandmarkOutputInvalid)
         ));
         let too_few = landmark_manifest(4);
-        let output = vec![output("output", vec![1, 4, 2], vec![0.5; 8])];
+        let output = landmark_outputs(vec![0.5; 8]);
         assert!(matches!(
             extract_face_landmark_output(
                 &too_few,
@@ -2349,6 +2529,40 @@ mod tests {
                 &[],
             ),
             Err(InferenceError::ModelRoleMismatch)
+        ));
+
+        let mut bad_confidence = landmark_outputs(vec![0.5; 10]);
+        bad_confidence[1].values[0] = f32::NAN;
+        assert!(matches!(
+            extract_face_landmark_output(
+                &manifest,
+                &compatibility,
+                test_region(&compatibility),
+                &bad_confidence,
+            ),
+            Err(InferenceError::FaceLandmarkOutputInvalid)
+        ));
+        let mut excessive_pose = landmark_outputs(vec![0.5; 10]);
+        excessive_pose[2].values[0] = 91.0;
+        assert!(matches!(
+            extract_face_landmark_output(
+                &manifest,
+                &compatibility,
+                test_region(&compatibility),
+                &excessive_pose,
+            ),
+            Err(InferenceError::FaceLandmarkOutputInvalid)
+        ));
+        let mut bad_eye = landmark_outputs(vec![0.5; 10]);
+        bad_eye[3].values[1] = 1.1;
+        assert!(matches!(
+            extract_face_landmark_output(
+                &manifest,
+                &compatibility,
+                test_region(&compatibility),
+                &bad_eye,
+            ),
+            Err(InferenceError::FaceLandmarkOutputInvalid)
         ));
     }
 
@@ -2375,6 +2589,14 @@ mod tests {
                 NormalizedLandmark { x: 0.0, y: 0.0 },
                 NormalizedLandmark { x: 1.0, y: 1.0 },
             ],
+            measurements: LandmarkMeasurements {
+                landmark_confidence: 1.0,
+                visible_fraction: 1.0,
+                yaw_degrees: 0.0,
+                pitch_degrees: 0.0,
+                roll_degrees: 0.0,
+                eye_openness: 1.0,
+            },
         };
         let mapped = landmarks.map_to_image()?;
         assert!((mapped.points()[0].x() - 0.2).abs() < f32::EPSILON);

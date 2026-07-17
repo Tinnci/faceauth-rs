@@ -31,8 +31,8 @@ use faceauth_core::{
 };
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
 use faceauth_inference::{
-    FaceEmbedding, FaceRegion, ImageFacialLandmarks, ImageView, InferenceError, InputTensor,
-    OnnxSession, PassiveLivenessScore,
+    FaceEmbedding, FaceRegion, FacialLandmarks, ImageFacialLandmarks, ImageView, InferenceError,
+    InputTensor, OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
@@ -401,6 +401,34 @@ impl AuthenticationWorker {
         observation: ChallengeObservation,
     ) -> Result<ChallengeProgress, ChallengeError> {
         challenge.observe_cancellable(observation, || self.cancellation.is_cancelled())
+    }
+
+    /// Process active liveness using eye openness and yaw from the exact landmark invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded challenge error, including cancellation, invalid timing or model
+    /// measurements, repeated frames, and deadline expiry.
+    pub fn observe_landmark_liveness(
+        &self,
+        challenge: &mut ChallengeSession,
+        timing: CapturePair,
+        infrared_sequence: u32,
+        visible_sequence: u32,
+        landmarks: &FacialLandmarks,
+    ) -> Result<ChallengeProgress, ChallengeError> {
+        let measurements = landmarks.measurements();
+        self.observe_liveness(
+            challenge,
+            ChallengeObservation {
+                timing,
+                infrared_sequence,
+                visible_sequence,
+                face_count: 1,
+                eye_openness: measurements.eye_openness(),
+                yaw_degrees: measurements.yaw_degrees(),
+            },
+        )
     }
 }
 
