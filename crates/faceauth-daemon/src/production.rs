@@ -22,18 +22,22 @@ use faceauth_management::{
     ENROLLMENT_POLKIT_ACTION, ENROLLMENT_SERVICE, MANAGER_BUS_NAME, MANAGER_OBJECT_PATH,
     ManagementConfig,
 };
+use faceauth_management_dbus::{MonotonicClock, SystemMonotonicClock};
 use faceauth_model::{ModelManifest, ModelRole};
 use faceauth_protocol::AuthenticationPurpose;
 use faceauth_quality::QualityConfig;
-use faceauth_session::SessionConfig;
+use faceauth_session::{ConnectionToken, SessionConfig, SessionManager};
 use faceauth_storage::{EncryptedTemplateStore, TpmKeyProvider};
-use faceauth_transport::{SecureListener, TransportConfig};
+use faceauth_transport::{AcceptLoopConfig, SecureListener, TransportConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    DetectionPolicy, ProductionAuthenticationEngine, ProductionAuthenticationEngineError,
+    AuthenticationConnectionPolicy, AuthenticationEngineService, BiometricResourceArbiter,
+    BoundaryService, DetectionPolicy, PassivePadPolicy, ProductionAuthenticationEngine,
+    ProductionAuthenticationEngineError, ServiceSupervisor, SupervisorError, SupervisorReport,
+    coordinate_authentication_connection, run_supervised_authentication_listener,
     supervision::SupervisorConfig,
 };
 
@@ -700,6 +704,101 @@ pub fn build_production_authentication_boundary(
             ProductionConfigError::Invalid(format!("authorization assembly failed: {error}"))
         })?;
     Ok(ProductionAuthenticationBoundary { listener, transport, authorization, sessions })
+}
+
+/// Run the real authentication-side resources under one fail-fast supervisor.
+///
+/// Enrollment and Manager1 remain outside this partial composition, so the main `serve` readiness
+/// gate stays closed.
+///
+/// # Errors
+///
+/// Returns [`ProductionAuthenticationRunError`] for construction or lifecycle failure.
+pub fn run_production_authentication_composition(
+    config: &ProductionConfig,
+    external_shutdown: impl FnMut() -> bool,
+) -> Result<SupervisorReport, ProductionAuthenticationRunError> {
+    let engine = build_production_authentication_engine(config)?;
+    let templates = build_production_template_store(config)?;
+    let boundary_resources = build_production_authentication_boundary(config)?;
+    let mut supervisor = ServiceSupervisor::new(config.supervision.supervisor())?;
+    let (engine_client, engine_service) =
+        AuthenticationEngineService::with_arbiter(engine, BiometricResourceArbiter::default());
+    supervisor.spawn("authentication-engine", move |shutdown| {
+        engine_service.run(&shutdown).map_err(|error| error.to_string())
+    })?;
+
+    let pad = &config.calibration.passive_pad;
+    let passive_pad = PassivePadPolicy {
+        infrared_compatibility_sha256: pad.infrared_compatibility_sha256.clone(),
+        minimum_infrared_probability: pad.minimum_infrared_probability,
+        visible_compatibility_sha256: pad.visible_compatibility_sha256.clone(),
+        minimum_visible_probability: pad.minimum_visible_probability,
+        fusion: Some((pad.fusion_compatibility_sha256.clone(), pad.minimum_fusion_probability)),
+    };
+    let authentication = config.calibration.recognition.policy;
+    let ProductionAuthenticationBoundary { listener, transport, authorization, sessions } =
+        boundary_resources;
+    supervisor.spawn("authentication-listener", move |shutdown| {
+        let mut boundary = BoundaryService::new(
+            authorization,
+            SessionManager::new(sessions).map_err(|error| error.to_string())?,
+        );
+        let fatal = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let handler_fatal = std::sync::Arc::clone(&fatal);
+        let handler_shutdown = shutdown.clone();
+        let clock = SystemMonotonicClock;
+        run_supervised_authentication_listener(
+            listener,
+            transport,
+            AcceptLoopConfig::default(),
+            &shutdown,
+            move |mut stream| {
+                let result = ConnectionToken::generate()
+                    .map_err(|error| error.to_string())
+                    .and_then(|connection| {
+                        coordinate_authentication_connection(
+                            &mut boundary,
+                            &mut stream,
+                            connection,
+                            &engine_client,
+                            &templates,
+                            AuthenticationConnectionPolicy {
+                                authentication,
+                                passive_pad: &passive_pad,
+                            },
+                            || clock.now_micros(),
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = result {
+                    if let Ok(mut stored) = handler_fatal.lock() {
+                        *stored = Some(error);
+                    }
+                    let _first = handler_shutdown.request();
+                }
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        fatal
+            .lock()
+            .map_err(|_| "authentication listener fatal state poisoned".to_owned())?
+            .take()
+            .map_or(Ok(()), Err)
+    })?;
+    Ok(supervisor.run_until(external_shutdown)?)
+}
+
+/// Authentication-side production construction or supervision failure.
+#[derive(Debug, Error)]
+pub enum ProductionAuthenticationRunError {
+    /// Trusted resources could not be constructed.
+    #[error("production authentication construction failed: {0}")]
+    Construction(#[from] ProductionConfigError),
+    /// A supervised service failed, panicked, exited early, or exceeded shutdown grace.
+    #[error("production authentication supervision failed: {0}")]
+    Supervision(#[from] SupervisorError),
 }
 
 #[allow(clippy::too_many_arguments)]

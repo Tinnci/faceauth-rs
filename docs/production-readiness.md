@@ -46,8 +46,8 @@ it can never satisfy the production storage gate.
 The current build deliberately reports the service-composition gate as false: capture, inference,
 authentication, enrollment, and Manager1 are not yet wired into one audited production runner. The
 single-capacity authentication engine and shutdown supervision boundaries now exist, but no
-complete runner yet constructs the V4L2/ONNX `ProductionAuthenticationEngine`, socket coordinator,
-template store, enrollment engine, and Manager1 under one supervisor. Consequently
+complete runner yet combines the now-supervised authentication composition with the enrollment
+engine and Manager1 under one supervisor. Consequently
 `faceauth-daemon serve` still refuses startup even if all external files appear complete. This
 prevents configuration from claiming capabilities the binary does not yet compose and verify.
 
@@ -61,3 +61,7 @@ Separate explicit builders self-test the TPM-unsealed machine key before returni
 template store, and bind the authentication socket without unlinking any existing path before
 returning its exact authorization, framing, and transaction policies. Diagnostic file keys cannot
 enter this production construction path.
+The authentication-side composition now runs the V4L2/ONNX engine worker and secure listener under
+one fail-fast supervisor; a connection-coordination failure requests global shutdown and is
+reported as a service failure. This partial runner is not the main `serve` entry point and does not
+weaken its blocked readiness gate.
