@@ -94,6 +94,11 @@ fits one finite non-reflecting similarity transform, and inverse-samples directl
 zeroizing model tensor with per-row cancellation. No aligned raw-image buffer is returned or
 persisted.
 
+Landmark preprocessing likewise consumes the exact admitted detector box. It maps each landmark
+input pixel center through that normalized box and samples the borrowed full frame directly into a
+zeroizing tensor, so detector geometry cannot be replaced by an implicit whole-frame resize and no
+cropped raw-image buffer is created.
+
 `faceauth-quality` converts one borrowed, tightly packed Gray8 or RGB8 view plus an admitted
 normalized face/pose summary into derived quality evidence. It scans only the rasterized face
 region and retains no image: a fixed 256-bin luma histogram provides mean exposure, clipping, and percentile

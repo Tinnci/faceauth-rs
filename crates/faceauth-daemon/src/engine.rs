@@ -12,8 +12,8 @@ use std::{
 use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
 use faceauth_core::CapturePair;
 use faceauth_inference::{
-    FaceEmbedding, ImageFacialLandmarks, ImageView, InferenceError, InputTensor, OnnxSession,
-    PassiveLivenessScore,
+    FaceEmbedding, ImageFacialLandmarks, ImageView, InferenceError, InputTensor, NormalizedFaceBox,
+    OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
@@ -129,6 +129,21 @@ impl AuthenticationJob {
         landmarks: &ImageFacialLandmarks,
     ) -> Result<InputTensor, InferenceError> {
         session.preprocess_aligned(image, landmarks, || self.is_cancelled())
+    }
+
+    /// Directly sample an exact detector region into a landmark tensor with job cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded landmark preprocessing error, including cancellation and invalid crop
+    /// geometry.
+    pub fn preprocess_face_region(
+        &self,
+        session: &OnnxSession,
+        image: ImageView<'_>,
+        region: &NormalizedFaceBox,
+    ) -> Result<InputTensor, InferenceError> {
+        session.preprocess_face_region(image, region, || self.is_cancelled())
     }
 
     /// Assess one borrowed face region without retaining image pixels, while mapping exact job

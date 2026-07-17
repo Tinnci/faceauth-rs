@@ -666,6 +666,28 @@ impl OnnxSession {
         preprocess_image_cancellable(&self.manifest.input, image, should_cancel)
     }
 
+    /// Sample the exact detector face region directly into a landmark-model tensor.
+    ///
+    /// This preserves the detector coordinate contract without allocating or retaining a cropped
+    /// byte image. Sampling uses the manifest's half-pixel convention and checks cancellation
+    /// before allocation and before every output row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for a non-landmark session, invalid source or region geometry,
+    /// cancellation, or tensor construction failure.
+    pub fn preprocess_face_region(
+        &self,
+        image: ImageView<'_>,
+        region: &NormalizedFaceBox,
+        should_cancel: impl FnMut() -> bool,
+    ) -> Result<InputTensor, InferenceError> {
+        if self.manifest.role != ModelRole::FaceLandmarks {
+            return Err(InferenceError::ModelRoleMismatch);
+        }
+        preprocess_image_region(&self.manifest.input, image, region, should_cancel)
+    }
+
     /// Align a face from full-image landmarks directly into the model's zeroizing float tensor.
     ///
     /// No intermediate aligned byte image is created. The exact five landmark indices, destination
@@ -1092,6 +1114,55 @@ fn validate_preprocess_inputs(
         return Err(InferenceError::SourceImageInvalid);
     }
     Ok(channels)
+}
+
+fn preprocess_image_region(
+    contract: &InputContract,
+    image: ImageView<'_>,
+    region: &NormalizedFaceBox,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<InputTensor, InferenceError> {
+    let channels = validate_preprocess_inputs(contract, image)?;
+    let left = f64::from(region.left);
+    let top = f64::from(region.top);
+    let width = f64::from(region.right - region.left);
+    let height = f64::from(region.bottom - region.top);
+    if !left.is_finite()
+        || !top.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || left < 0.0
+        || top < 0.0
+        || width <= 0.0
+        || height <= 0.0
+        || left + width > 1.0
+        || top + height > 1.0
+    {
+        return Err(InferenceError::FaceRegionInvalid);
+    }
+    check_cancelled(&mut should_cancel)?;
+    let dimensions = contract.dimensions();
+    let mut values = Zeroizing::new(vec![0.0_f32; tensor_element_count(&dimensions)?]);
+    for target_y in 0..contract.height {
+        check_cancelled(&mut should_cancel)?;
+        let crop_y = (f64::from(target_y) + 0.5) / f64::from(contract.height);
+        let source_y = crop_y.mul_add(height, top);
+        for target_x in 0..contract.width {
+            let crop_x = (f64::from(target_x) + 0.5) / f64::from(contract.width);
+            let source_x = crop_x.mul_add(width, left);
+            for channel in 0..channels {
+                let pixel = sample_normalized_channel(
+                    image,
+                    source_x,
+                    source_y,
+                    channel,
+                    contract.color_space,
+                )?;
+                write_tensor_value(contract, &mut values, target_x, target_y, channel, pixel)?;
+            }
+        }
+    }
+    Ok(InputTensor { dimensions, values })
 }
 
 fn write_tensor_value(
@@ -1668,6 +1739,9 @@ pub enum InferenceError {
     /// The aligned output would sample beyond the source image.
     #[error("aligned face extends outside the source image")]
     FaceAlignmentOutsideImage,
+    /// A detector crop supplied to direct landmark preprocessing was malformed.
+    #[error("face region is invalid")]
+    FaceRegionInvalid,
     /// Face embedding is empty, excessive, degenerate, or numerically invalid.
     #[error("face embedding output is invalid")]
     EmbeddingInvalid,
@@ -2193,6 +2267,41 @@ mod tests {
         assert_eq!(regular.dimensions(), aligned.dimensions());
         assert_eq!(regular.values(), aligned.values());
         Ok(())
+    }
+
+    #[test]
+    fn detector_region_samples_landmark_tensor_without_crop_buffer() -> Result<(), InferenceError> {
+        let contract = input_contract(2, 2, TensorLayout::Nhwc, ColorSpace::Grayscale);
+        let bytes = (0_u8..16).collect::<Vec<_>>();
+        let image = ImageView { width: 4, height: 4, format: ImageFormat::Gray8, bytes: &bytes };
+        let region = NormalizedFaceBox { left: 0.25, top: 0.25, right: 0.75, bottom: 0.75 };
+        let sampled = preprocess_image_region(&contract, image, &region, || false)?;
+        let expected = [5.0_f32, 6.0, 9.0, 10.0].map(|value| value / 255.0);
+        assert!(
+            sampled
+                .values()
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() <= f32::EPSILON)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detector_region_rejects_invalid_geometry_and_observes_cancellation() {
+        let contract = input_contract(2, 2, TensorLayout::Nhwc, ColorSpace::Grayscale);
+        let image =
+            ImageView { width: 4, height: 4, format: ImageFormat::Gray8, bytes: &[0_u8; 16] };
+        let invalid = NormalizedFaceBox { left: 0.75, top: 0.25, right: 0.25, bottom: 0.75 };
+        assert!(matches!(
+            preprocess_image_region(&contract, image, &invalid, || false),
+            Err(InferenceError::FaceRegionInvalid)
+        ));
+        let valid = NormalizedFaceBox { left: 0.25, top: 0.25, right: 0.75, bottom: 0.75 };
+        assert!(matches!(
+            preprocess_image_region(&contract, image, &valid, || true),
+            Err(InferenceError::Cancelled)
+        ));
     }
 
     #[test]
