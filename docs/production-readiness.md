@@ -1,6 +1,6 @@
 # Production configuration and readiness
 
-`faceauth-daemon` uses strict production-configuration schema 2 for production composition. The
+`faceauth-daemon` uses strict production-configuration schema 3 for production composition. The
 machine-readable readiness report remains schema 1. The configuration schema
 rejects unknown fields, unsupported versions, relative security-sensitive paths, incomplete model
 roles, unbounded resources, passive-only liveness, missing visible capture, and disabled password
@@ -43,9 +43,10 @@ it can never satisfy the production storage gate.
 The current build deliberately reports the service-composition gate as false: capture, inference,
 authentication, enrollment, and Manager1 are not yet wired into one audited production runner. The
 single-capacity authentication engine and shutdown supervision boundaries now exist, but no
-reviewed model implementation has yet populated that engine. Consequently `faceauth-daemon serve`
-still refuses startup even if all external files appear complete. This prevents configuration from
-claiming capabilities the binary does not yet implement.
+complete runner yet constructs the V4L2/ONNX `ProductionAuthenticationEngine`, socket coordinator,
+template store, enrollment engine, and Manager1 under one supervisor. Consequently
+`faceauth-daemon serve` still refuses startup even if all external files appear complete. This
+prevents configuration from claiming capabilities the binary does not yet compose and verify.
 
 Neither `doctor` nor readiness inspection opens cameras, creates TPM keys, binds the authentication
 socket, claims a D-Bus name, installs policy, enables a service, or changes PAM configuration.

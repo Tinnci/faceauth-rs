@@ -11,6 +11,7 @@ use std::{
 
 use faceauth_capture::{
     CaptureError, CapturedFrame, FrameSource, PairedFrames, PairingPolicy, PixelFormat,
+    V4l2CaptureDevice,
 };
 use faceauth_core::CapturePair;
 use faceauth_inference::{
@@ -18,8 +19,10 @@ use faceauth_inference::{
     InferenceError, InputTensor, OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
-    ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
+    ChallengeAction, ChallengeConfig, ChallengeError, ChallengeObservation, ChallengeProgress,
+    ChallengeSession,
 };
+use faceauth_model::ModelRole;
 use faceauth_protocol::{ProgressCode, TransactionId};
 use faceauth_quality::{
     FaceGeometry, Gray8View, ImageView as QualityImageView, QualityConfig, QualityError,
@@ -409,6 +412,334 @@ pub trait AuthenticationEngine: Send + 'static {
     ) -> Result<DerivedAuthenticationEvidence, AuthenticationEngineFailure>;
 }
 
+/// Calibrated detector decoding and overlap-suppression policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetectionPolicy {
+    /// Minimum detector confidence admitted before NMS.
+    pub minimum_confidence: f32,
+    /// Maximum intersection-over-union treated as the same face.
+    pub maximum_iou: f32,
+    /// Hard ceiling for distinct faces after NMS; overflow fails closed.
+    pub maximum_faces: usize,
+}
+
+impl DetectionPolicy {
+    pub(crate) fn validate(self) -> Result<(), AuthenticationEngineFailure> {
+        if !self.minimum_confidence.is_finite()
+            || !(0.0..=1.0).contains(&self.minimum_confidence)
+            || !self.maximum_iou.is_finite()
+            || !(0.0..=1.0).contains(&self.maximum_iou)
+            || !(1..=64).contains(&self.maximum_faces)
+        {
+            return Err(AuthenticationEngineFailure::InvalidEvidence);
+        }
+        Ok(())
+    }
+}
+
+/// Real V4L2/ONNX authentication engine.
+///
+/// Devices and mutable sessions remain owned by the single supervised engine worker. Each
+/// transaction creates short-lived mmap streams on the worker stack, and only
+/// [`DerivedAuthenticationEvidence`] leaves this boundary.
+pub struct ProductionAuthenticationEngine {
+    infrared_device: V4l2CaptureDevice,
+    visible_device: V4l2CaptureDevice,
+    detector: OnnxSession,
+    landmarks: OnnxSession,
+    embedding: OnnxSession,
+    passive_infrared: OnnxSession,
+    passive_visible: OnnxSession,
+    passive_fusion: OnnxSession,
+    pairing: PairingPolicy,
+    detection: DetectionPolicy,
+    quality: QualityConfig,
+    challenge: ChallengeConfig,
+}
+
+impl ProductionAuthenticationEngine {
+    /// Assemble an engine from already admitted devices, models, and reviewed calibration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProductionAuthenticationEngineError`] when a policy is structurally invalid or
+    /// any loaded graph is supplied in the wrong pipeline slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        infrared_device: V4l2CaptureDevice,
+        visible_device: V4l2CaptureDevice,
+        detector: OnnxSession,
+        landmarks: OnnxSession,
+        embedding: OnnxSession,
+        passive_infrared: OnnxSession,
+        passive_visible: OnnxSession,
+        passive_fusion: OnnxSession,
+        pairing: PairingPolicy,
+        detection: DetectionPolicy,
+        quality: QualityConfig,
+        challenge: ChallengeConfig,
+    ) -> Result<Self, ProductionAuthenticationEngineError> {
+        pairing.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
+        detection.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
+        quality.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
+        challenge.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
+        for (session, expected) in [
+            (&detector, ModelRole::FaceDetector),
+            (&landmarks, ModelRole::FaceLandmarks),
+            (&embedding, ModelRole::FaceEmbedding),
+            (&passive_infrared, ModelRole::PassiveLivenessInfrared),
+            (&passive_visible, ModelRole::PassiveLivenessVisible),
+            (&passive_fusion, ModelRole::PassiveLivenessFusion),
+        ] {
+            if session.role() != expected {
+                return Err(ProductionAuthenticationEngineError::ModelRoleMismatch {
+                    expected,
+                    actual: session.role(),
+                });
+            }
+        }
+        Ok(Self {
+            infrared_device,
+            visible_device,
+            detector,
+            landmarks,
+            embedding,
+            passive_infrared,
+            passive_visible,
+            passive_fusion,
+            pairing,
+            detection,
+            quality,
+            challenge,
+        })
+    }
+
+    fn process_pair(
+        job: &AuthenticationJob,
+        pair: &PairedFrames,
+        detector: &mut OnnxSession,
+        landmarks_session: &mut OnnxSession,
+        detection: DetectionPolicy,
+    ) -> Result<FacialLandmarks, AuthenticationEngineFailure> {
+        let detector_input =
+            job.preprocess_frame(detector, &pair.visible).map_err(|_| inference_failure(job))?;
+        ensure_active(job)?;
+        let detector_outputs = detector.run(&detector_input).map_err(|_| inference_failure(job))?;
+        ensure_active(job)?;
+        let detections = detector
+            .extract_face_detections(&detector_outputs, detection.minimum_confidence)
+            .and_then(|faces| {
+                faces.suppress_overlaps(detection.maximum_iou, detection.maximum_faces)
+            })
+            .map_err(|_| inference_failure(job))?;
+        let face = detections.require_single_face().map_err(|_| inference_failure(job))?;
+        let region = landmarks_session
+            .derive_face_region(face.bounds())
+            .map_err(|_| inference_failure(job))?;
+        let visible_image =
+            inference_frame_view(&pair.visible).map_err(|_| inference_failure(job))?;
+        let landmark_input = job
+            .preprocess_face_region(landmarks_session, visible_image, &region)
+            .map_err(|_| inference_failure(job))?;
+        ensure_active(job)?;
+        let outputs = landmarks_session.run(&landmark_input).map_err(|_| inference_failure(job))?;
+        ensure_active(job)?;
+        landmarks_session
+            .extract_face_landmarks(&outputs, &region)
+            .map_err(|_| inference_failure(job))
+    }
+}
+
+/// Production engine construction failure before any camera stream is started.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ProductionAuthenticationEngineError {
+    /// Capture, detection, quality, or challenge policy is structurally invalid.
+    #[error("production authentication engine policy is invalid")]
+    InvalidPolicy,
+    /// A loaded graph was supplied in the wrong pipeline slot.
+    #[error("production model role mismatch: expected {expected:?}, received {actual:?}")]
+    ModelRoleMismatch {
+        /// Required role for this engine slot.
+        expected: ModelRole,
+        /// Actual loaded graph role.
+        actual: ModelRole,
+    },
+}
+
+impl AuthenticationEngine for ProductionAuthenticationEngine {
+    #[allow(clippy::too_many_lines)]
+    fn authenticate(
+        &mut self,
+        job: &AuthenticationJob,
+        progress: &mut dyn FnMut(ProgressCode) -> Result<(), AuthenticationEngineFailure>,
+    ) -> Result<DerivedAuthenticationEvidence, AuthenticationEngineFailure> {
+        self.pairing.validate().map_err(|_| AuthenticationEngineFailure::Capture)?;
+        self.detection.validate()?;
+        self.quality.validate().map_err(|_| AuthenticationEngineFailure::InvalidEvidence)?;
+        self.challenge.validate().map_err(|_| AuthenticationEngineFailure::Liveness)?;
+        ensure_active(job)?;
+
+        let mut infrared = self.infrared_device.stream().map_err(|_| capture_failure(job))?;
+        let mut visible = self.visible_device.stream().map_err(|_| capture_failure(job))?;
+        progress(ProgressCode::PositionFace)?;
+
+        let mut challenge: Option<ChallengeSession> = None;
+        let mut last_public_progress: Option<ProgressCode> = None;
+        loop {
+            let pair = job
+                .capture_pair(&mut infrared, &mut visible, self.pairing)
+                .map_err(|_| capture_failure(job))?;
+            let landmarks = Self::process_pair(
+                job,
+                &pair,
+                &mut self.detector,
+                &mut self.landmarks,
+                self.detection,
+            )?;
+            let timing = pair.timing();
+            let observation_time = timing
+                .visible_timestamp_micros
+                .map_or(timing.infrared_timestamp_micros, |visible| {
+                    timing.infrared_timestamp_micros.max(visible)
+                });
+            let challenge = match challenge.as_mut() {
+                Some(challenge) => challenge,
+                None => challenge.insert(
+                    ChallengeSession::begin(self.challenge, observation_time)
+                        .map_err(|_| AuthenticationEngineFailure::Liveness)?,
+                ),
+            };
+            let challenge_progress = job
+                .observe_landmark_liveness(
+                    challenge,
+                    timing,
+                    pair.infrared.summary().sequence,
+                    pair.visible.summary().sequence,
+                    &landmarks,
+                )
+                .map_err(|_| liveness_failure(job))?;
+            if challenge_progress != ChallengeProgress::Passed {
+                let public = challenge_progress_code(challenge_progress);
+                if last_public_progress != Some(public) {
+                    progress(public)?;
+                    last_public_progress = Some(public);
+                }
+                continue;
+            }
+
+            progress(ProgressCode::Processing)?;
+            let quality = job
+                .assess_landmark_frame_quality(&pair.visible, &landmarks, self.quality)
+                .map_err(|_| invalid_evidence_failure(job))?;
+            let image_landmarks = landmarks.map_to_image().map_err(|_| inference_failure(job))?;
+            let visible_image =
+                inference_frame_view(&pair.visible).map_err(|_| inference_failure(job))?;
+            let embedding_input = job
+                .preprocess_aligned(&self.embedding, visible_image, &image_landmarks)
+                .map_err(|_| inference_failure(job))?;
+            ensure_active(job)?;
+            let embedding_outputs =
+                self.embedding.run(&embedding_input).map_err(|_| inference_failure(job))?;
+            let embedding = self
+                .embedding
+                .extract_embedding(&embedding_outputs)
+                .map_err(|_| inference_failure(job))?;
+
+            let infrared_input = job
+                .preprocess_frame(&self.passive_infrared, &pair.infrared)
+                .map_err(|_| inference_failure(job))?;
+            let visible_input = job
+                .preprocess_frame(&self.passive_visible, &pair.visible)
+                .map_err(|_| inference_failure(job))?;
+            let fusion_infrared = job
+                .preprocess_named_frame(&self.passive_fusion, "infrared", &pair.infrared)
+                .map_err(|_| inference_failure(job))?;
+            let fusion_visible = job
+                .preprocess_named_frame(&self.passive_fusion, "visible", &pair.visible)
+                .map_err(|_| inference_failure(job))?;
+            ensure_active(job)?;
+            let infrared_outputs =
+                self.passive_infrared.run(&infrared_input).map_err(|_| inference_failure(job))?;
+            ensure_active(job)?;
+            let visible_outputs =
+                self.passive_visible.run(&visible_input).map_err(|_| inference_failure(job))?;
+            ensure_active(job)?;
+            let fusion_outputs = self
+                .passive_fusion
+                .run_named(&[("infrared", &fusion_infrared), ("visible", &fusion_visible)])
+                .map_err(|_| inference_failure(job))?;
+            ensure_active(job)?;
+            let passive_liveness = vec![
+                self.passive_infrared
+                    .extract_passive_liveness(&infrared_outputs)
+                    .map_err(|_| inference_failure(job))?,
+                self.passive_visible
+                    .extract_passive_liveness(&visible_outputs)
+                    .map_err(|_| inference_failure(job))?,
+                self.passive_fusion
+                    .extract_passive_liveness(&fusion_outputs)
+                    .map_err(|_| inference_failure(job))?,
+            ];
+            return Ok(DerivedAuthenticationEvidence::new(
+                job.transaction_id(),
+                timing,
+                quality.aggregate,
+                embedding,
+                passive_liveness,
+                ChallengeProgress::Passed,
+                observation_time,
+            ));
+        }
+    }
+}
+
+const fn challenge_progress_code(progress: ChallengeProgress) -> ProgressCode {
+    match progress {
+        ChallengeProgress::BaselineRequired => ProgressCode::HoldStill,
+        ChallengeProgress::ActionRequired(ChallengeAction::Blink) => ProgressCode::Blink,
+        ChallengeProgress::ActionRequired(ChallengeAction::TurnLeft) => ProgressCode::TurnLeft,
+        ChallengeProgress::ActionRequired(ChallengeAction::TurnRight) => ProgressCode::TurnRight,
+        ChallengeProgress::RecoveryRequired => ProgressCode::ReturnToCenter,
+        ChallengeProgress::Passed => ProgressCode::Processing,
+    }
+}
+
+fn ensure_active(job: &AuthenticationJob) -> Result<(), AuthenticationEngineFailure> {
+    if job.is_cancelled() { Err(AuthenticationEngineFailure::Cancelled) } else { Ok(()) }
+}
+
+fn capture_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
+    if job.is_cancelled() {
+        AuthenticationEngineFailure::Cancelled
+    } else {
+        AuthenticationEngineFailure::Capture
+    }
+}
+
+fn inference_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
+    if job.is_cancelled() {
+        AuthenticationEngineFailure::Cancelled
+    } else {
+        AuthenticationEngineFailure::Inference
+    }
+}
+
+fn liveness_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
+    if job.is_cancelled() {
+        AuthenticationEngineFailure::Cancelled
+    } else {
+        AuthenticationEngineFailure::Liveness
+    }
+}
+
+fn invalid_evidence_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
+    if job.is_cancelled() {
+        AuthenticationEngineFailure::Cancelled
+    } else {
+        AuthenticationEngineFailure::InvalidEvidence
+    }
+}
+
 /// One bounded update from the engine worker.
 pub enum AuthenticationEngineUpdate {
     /// Non-biometric, transaction-bound user guidance.
@@ -724,6 +1055,28 @@ mod tests {
             shutdown_grace: Duration::from_secs(1),
             max_services: 2,
         })
+    }
+
+    #[test]
+    fn detection_policy_and_challenge_guidance_are_fail_closed() {
+        assert!(
+            DetectionPolicy { minimum_confidence: 0.8, maximum_iou: 0.4, maximum_faces: 4 }
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            DetectionPolicy { minimum_confidence: f32::NAN, maximum_iou: 0.4, maximum_faces: 4 }
+                .validate(),
+            Err(AuthenticationEngineFailure::InvalidEvidence)
+        ));
+        assert_eq!(
+            challenge_progress_code(ChallengeProgress::ActionRequired(ChallengeAction::Blink)),
+            ProgressCode::Blink
+        );
+        assert_eq!(
+            challenge_progress_code(ChallengeProgress::RecoveryRequired),
+            ProgressCode::ReturnToCenter
+        );
     }
 
     #[test]

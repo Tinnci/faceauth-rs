@@ -679,6 +679,18 @@ impl OutputTensor {
 }
 
 impl OnnxSession {
+    /// Reviewed pipeline role of the loaded graph.
+    #[must_use]
+    pub const fn role(&self) -> ModelRole {
+        self.manifest.role
+    }
+
+    /// Complete manifest/preprocessing compatibility digest of the loaded graph.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
     /// Verify runtime and model files, create a CPU session with bounded threading, and require an
     /// exact static float32 I/O contract.
     ///

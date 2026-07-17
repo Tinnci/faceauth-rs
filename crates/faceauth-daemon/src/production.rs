@@ -27,10 +27,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::supervision::SupervisorConfig;
+use crate::{DetectionPolicy, supervision::SupervisorConfig};
 
 /// Current daemon production-configuration schema.
-pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 2;
+pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 3;
 /// Current machine-readable readiness-report schema.
 pub const READINESS_REPORT_SCHEMA_VERSION: u16 = 1;
 
@@ -148,10 +148,28 @@ pub struct QualityCalibration {
     pub detector_compatibility_sha256: String,
     /// Full compatibility digest of the admitted landmark manifest.
     pub landmarks_compatibility_sha256: String,
+    /// Minimum calibrated detector confidence admitted before NMS.
+    pub minimum_detection_confidence: f32,
+    /// Maximum calibrated `IoU` treated as the same detected face.
+    pub maximum_detection_iou: f32,
+    /// Hard ceiling for distinct faces after NMS.
+    pub maximum_detected_faces: usize,
     /// Resource-bounded image and geometry quality policy.
     pub policy: QualityConfig,
     /// Camera, lighting, pose, occlusion, and operating-threshold evaluation report.
     pub evidence: ReviewedEvidence,
+}
+
+impl QualityCalibration {
+    /// Convert reviewed detector calibration into the production engine policy.
+    #[must_use]
+    pub const fn detection_policy(&self) -> DetectionPolicy {
+        DetectionPolicy {
+            minimum_confidence: self.minimum_detection_confidence,
+            maximum_iou: self.maximum_detection_iou,
+            maximum_faces: self.maximum_detected_faces,
+        }
+    }
 }
 
 /// Recognition policy bound to one embedding model and measured operating point.
@@ -578,6 +596,11 @@ fn validate_calibration(config: &CalibrationConfig) -> Result<(), ProductionConf
     {
         return invalid("quality calibration model compatibility digests are invalid");
     }
+    config
+        .quality
+        .detection_policy()
+        .validate()
+        .map_err(|_| ProductionConfigError::Invalid("invalid detector calibration".to_owned()))?;
     config.quality.policy.validate().map_err(|error| {
         ProductionConfigError::Invalid(format!("invalid quality calibration: {error}"))
     })?;
@@ -969,6 +992,9 @@ mod tests {
             quality: QualityCalibration {
                 detector_compatibility_sha256: digest('1'),
                 landmarks_compatibility_sha256: digest('f'),
+                minimum_detection_confidence: 0.8,
+                maximum_detection_iou: 0.4,
+                maximum_detected_faces: 4,
                 policy: QualityConfig::engineering_baseline(),
                 evidence: evidence("quality.json"),
             },

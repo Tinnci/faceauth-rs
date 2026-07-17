@@ -10,7 +10,8 @@ pub use engine::{
     AuthenticationEngine, AuthenticationEngineClient, AuthenticationEngineFailure,
     AuthenticationEngineHandle, AuthenticationEngineService, AuthenticationEngineServiceError,
     AuthenticationEngineSubmitError, AuthenticationEngineUpdate, AuthenticationJob,
-    DerivedAuthenticationEvidence,
+    DerivedAuthenticationEvidence, DetectionPolicy, ProductionAuthenticationEngine,
+    ProductionAuthenticationEngineError,
 };
 pub use enrollment_engine::{
     EnrollmentCancellation, EnrollmentControllerBridge, EnrollmentEngine, EnrollmentEngineClient,

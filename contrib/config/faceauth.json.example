@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "cameras": {
     "infrared": {
       "vendor_id": "04f2",
@@ -99,6 +99,9 @@
     "quality": {
       "detector_compatibility_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "landmarks_compatibility_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "minimum_detection_confidence": 0.8,
+      "maximum_detection_iou": 0.4,
+      "maximum_detected_faces": 4,
       "policy": {
         "max_image_pixels": 8294400,
         "minimum_face_width_pixels": 32,
