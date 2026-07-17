@@ -11,6 +11,7 @@ use std::{
 
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
 use faceauth_management::{AuthorizedEnrollment, ManagementProgress, OperationId};
+use faceauth_management_dbus::{BackendError, EnrollmentOperationController};
 use faceauth_storage::{EncryptedTemplateStore, KeyProvider, StorageError, TemplateRecord};
 use thiserror::Error;
 
@@ -233,6 +234,120 @@ impl EnrollmentEngineClient {
 pub struct EnrollmentEngineHandle {
     operation_id: OperationId,
     receiver: mpsc::Receiver<EnrollmentEngineUpdate>,
+}
+
+struct ControlledOperation {
+    operation_id: OperationId,
+    cancellation: EnrollmentCancellation,
+    handle: Option<EnrollmentEngineHandle>,
+}
+
+/// Manager1 controller that submits exact operations and preserves cancellation ownership.
+///
+/// A daemon coordinator takes the worker handle once, relays its closed updates through
+/// `ManagementWorkerHandle`, and calls [`Self::finish`] after the terminal update. The private
+/// cancellation signal remains registered throughout that relay.
+#[derive(Clone)]
+pub struct EnrollmentControllerBridge {
+    client: EnrollmentEngineClient,
+    config: EnrollmentConfig,
+    active: Arc<std::sync::Mutex<Option<ControlledOperation>>>,
+}
+
+impl EnrollmentControllerBridge {
+    /// Bind Manager1 operation starts to one enrollment engine client and calibrated policy.
+    #[must_use]
+    pub fn new(client: EnrollmentEngineClient, config: EnrollmentConfig) -> Self {
+        Self { client, config, active: Arc::new(std::sync::Mutex::new(None)) }
+    }
+
+    /// Take the worker update handle exactly once for the expected operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] for an absent, mismatched, or already-taken handle.
+    pub fn take_handle(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<EnrollmentEngineHandle, BackendError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BackendError::new("enrollment controller lock is poisoned"))?;
+        let operation = active
+            .as_mut()
+            .filter(|operation| operation.operation_id == operation_id)
+            .ok_or_else(|| BackendError::new("enrollment operation is not active"))?;
+        let handle = operation
+            .handle
+            .take()
+            .ok_or_else(|| BackendError::new("enrollment operation handle was already taken"))?;
+        drop(active);
+        Ok(handle)
+    }
+
+    /// Clear private cancellation state after the exact terminal result was relayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] for an absent or mismatched operation.
+    pub fn finish(&self, operation_id: OperationId) -> Result<(), BackendError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BackendError::new("enrollment controller lock is poisoned"))?;
+        if active.as_ref().is_none_or(|operation| operation.operation_id != operation_id) {
+            return Err(BackendError::new("enrollment operation is not active"));
+        }
+        *active = None;
+        drop(active);
+        Ok(())
+    }
+}
+
+impl EnrollmentOperationController for EnrollmentControllerBridge {
+    fn start(
+        &self,
+        authorization: AuthorizedEnrollment,
+        operation_id: OperationId,
+        issued_at_micros: u64,
+    ) -> Result<(), BackendError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BackendError::new("enrollment controller lock is poisoned"))?;
+        if active.is_some() {
+            return Err(BackendError::new("another enrollment operation is active"));
+        }
+        let cancellation = EnrollmentCancellation::default();
+        let job = EnrollmentJob::new(
+            operation_id,
+            authorization,
+            self.config,
+            issued_at_micros,
+            cancellation.clone(),
+        );
+        let handle =
+            self.client.submit(job).map_err(|error| BackendError::new(error.to_string()))?;
+        *active = Some(ControlledOperation { operation_id, cancellation, handle: Some(handle) });
+        drop(active);
+        Ok(())
+    }
+
+    fn cancel(&self, operation_id: OperationId) -> Result<(), BackendError> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| BackendError::new("enrollment controller lock is poisoned"))?;
+        let cancellation = active
+            .as_ref()
+            .filter(|operation| operation.operation_id == operation_id)
+            .map(|operation| operation.cancellation.clone())
+            .ok_or_else(|| BackendError::new("enrollment operation is not active"))?;
+        drop(active);
+        cancellation.cancel();
+        Ok(())
+    }
 }
 
 impl EnrollmentEngineHandle {
@@ -545,6 +660,36 @@ mod tests {
             Err(EnrollmentEngineSubmitError::Busy)
         ));
         drop(authentication);
+        Ok(())
+    }
+
+    #[test]
+    fn manager_bridge_preserves_private_cancellation_until_terminal_relay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (client, service) = EnrollmentEngineService::new(
+            SuccessfulEngine,
+            RecordingSink::default(),
+            BiometricResourceArbiter::default(),
+        );
+        let bridge = EnrollmentControllerBridge::new(client, config());
+        let operation = operation()?;
+        EnrollmentOperationController::start(&bridge, authorization()?, operation, 1_000_000)?;
+        let handle = bridge.take_handle(operation)?;
+        EnrollmentOperationController::cancel(&bridge, operation)?;
+
+        let shutdown = ShutdownToken::default();
+        let worker_shutdown = shutdown.clone();
+        let worker = thread::spawn(move || service.run(&worker_shutdown));
+        assert!(matches!(
+            handle.recv()?,
+            EnrollmentEngineUpdate::Completed {
+                result: Err(EnrollmentEngineFailure::Cancelled),
+                ..
+            }
+        ));
+        bridge.finish(operation)?;
+        assert!(shutdown.request());
+        worker.join().map_err(|_| "worker panicked")??;
         Ok(())
     }
 }

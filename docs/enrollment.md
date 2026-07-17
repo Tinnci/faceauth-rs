@@ -64,3 +64,8 @@ template sink. Only after storage succeeds does the worker channel emit an empty
 completion. Cancellation and storage failure can therefore never be presented as enrolled. Worker
 updates contain only closed management progress or sanitized failure categories; raw frames,
 landmarks, tensors, embeddings, and template contents have no channel representation.
+
+The Manager1 adapter invokes a dependency-inverted operation controller rather than depending on
+daemon internals. The daemon bridge submits the authorized job, exposes its update handle exactly
+once to the service coordinator, preserves private cancellation ownership, and clears it only after
+the exact terminal update has been relayed.

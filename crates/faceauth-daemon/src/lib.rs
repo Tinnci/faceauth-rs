@@ -13,9 +13,10 @@ pub use engine::{
     DerivedAuthenticationEvidence,
 };
 pub use enrollment_engine::{
-    EnrollmentCancellation, EnrollmentEngine, EnrollmentEngineClient, EnrollmentEngineFailure,
-    EnrollmentEngineHandle, EnrollmentEngineService, EnrollmentEngineServiceError,
-    EnrollmentEngineSubmitError, EnrollmentEngineUpdate, EnrollmentJob, EnrollmentTemplateSink,
+    EnrollmentCancellation, EnrollmentControllerBridge, EnrollmentEngine, EnrollmentEngineClient,
+    EnrollmentEngineFailure, EnrollmentEngineHandle, EnrollmentEngineService,
+    EnrollmentEngineServiceError, EnrollmentEngineSubmitError, EnrollmentEngineUpdate,
+    EnrollmentJob, EnrollmentTemplateSink,
 };
 pub use production::{
     PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,

@@ -55,6 +55,33 @@ pub trait AuthorizationBackend: Send + Sync + 'static {
     ) -> BackendFuture<'a, AuthorizedEnrollment>;
 }
 
+/// Daemon-side bridge invoked after Manager1 accepts or cancels an operation.
+///
+/// The D-Bus adapter knows only the authorized UID, operation ID, and monotonic issue time. A
+/// daemon implements this interface to construct the real capture/inference worker without making
+/// the management crate depend on daemon internals.
+pub trait EnrollmentOperationController: Send + Sync + 'static {
+    /// Start the exact operation-bound worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when shared resources are busy, the worker is stopped, or the
+    /// operation cannot be constructed.
+    fn start(
+        &self,
+        authorization: AuthorizedEnrollment,
+        operation_id: OperationId,
+        issued_at_micros: u64,
+    ) -> Result<(), BackendError>;
+
+    /// Signal private cancellation before Manager1 emits its public terminal update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] only when the worker cannot receive cancellation.
+    fn cancel(&self, operation_id: OperationId) -> Result<(), BackendError>;
+}
+
 /// Encrypted-template state lookup used by the system-bus backend.
 pub trait EnrollmentStateSource: Send + Sync + 'static {
     /// Return whether the target UID has an authenticated encrypted template.
@@ -403,6 +430,7 @@ pub struct Manager1 {
     state: Arc<Mutex<ManagementState>>,
     backend: Arc<dyn AuthorizationBackend>,
     clock: Arc<dyn MonotonicClock>,
+    controller: Option<Arc<dyn EnrollmentOperationController>>,
 }
 
 struct OperationOwner {
@@ -491,12 +519,14 @@ impl ManagementWorkerHandle {
 }
 
 /// Management-worker lifecycle failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerError {
     /// Core management lifecycle rejected the update.
     Management(ManagementError),
     /// A previous panic poisoned the coordinator lock.
     CoordinatorPoisoned,
+    /// The daemon-side enrollment worker rejected cancellation.
+    Controller(String),
 }
 
 impl std::fmt::Display for WorkerError {
@@ -506,6 +536,9 @@ impl std::fmt::Display for WorkerError {
             Self::CoordinatorPoisoned => {
                 formatter.write_str("management coordinator lock is poisoned")
             }
+            Self::Controller(error) => {
+                write!(formatter, "enrollment worker controller failed: {error}")
+            }
         }
     }
 }
@@ -514,7 +547,7 @@ impl std::error::Error for WorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Management(error) => Some(error),
-            Self::CoordinatorPoisoned => None,
+            Self::CoordinatorPoisoned | Self::Controller(_) => None,
         }
     }
 }
@@ -524,6 +557,7 @@ impl std::error::Error for WorkerError {
 pub struct ManagementDisconnectHandle {
     state: Arc<Mutex<ManagementState>>,
     clock: Arc<dyn MonotonicClock>,
+    controller: Option<Arc<dyn EnrollmentOperationController>>,
 }
 
 impl ManagementDisconnectHandle {
@@ -535,15 +569,23 @@ impl ManagementDisconnectHandle {
     ///
     /// Returns [`WorkerError`] if the coordinator lock or lifecycle invariant fails.
     pub fn cancel_sender(&self, sender: &str) -> Result<Option<ManagementUpdate>, WorkerError> {
-        let mut state = self.state.lock().map_err(|_| WorkerError::CoordinatorPoisoned)?;
-        let Some(owner) = state.owner.as_ref() else {
+        let owned = self
+            .state
+            .lock()
+            .map_err(|_| WorkerError::CoordinatorPoisoned)?
+            .owner
+            .as_ref()
+            .filter(|owner| owner.sender == sender)
+            .map(|owner| (owner.target_uid, owner.operation_id));
+        let Some((target_uid, operation_id)) = owned else {
             return Ok(None);
         };
-        if owner.sender != sender {
-            return Ok(None);
+        if let Some(controller) = &self.controller {
+            controller
+                .cancel(operation_id)
+                .map_err(|error| WorkerError::Controller(error.to_string()))?;
         }
-        let target_uid = owner.target_uid;
-        let operation_id = owner.operation_id;
+        let mut state = self.state.lock().map_err(|_| WorkerError::CoordinatorPoisoned)?;
         let update = state
             .coordinator
             .cancel(target_uid, operation_id, self.clock.now_micros())
@@ -617,6 +659,23 @@ impl Manager1 {
             state: Arc::new(Mutex::new(ManagementState { coordinator, owner: None })),
             backend: Arc::new(backend),
             clock: Arc::new(clock),
+            controller: None,
+        }
+    }
+
+    /// Construct Manager1 with a daemon-side enrollment worker bridge.
+    #[must_use]
+    pub fn with_controller(
+        coordinator: ManagementCoordinator,
+        backend: impl AuthorizationBackend,
+        clock: impl MonotonicClock,
+        controller: impl EnrollmentOperationController,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ManagementState { coordinator, owner: None })),
+            backend: Arc::new(backend),
+            clock: Arc::new(clock),
+            controller: Some(Arc::new(controller)),
         }
     }
 
@@ -632,6 +691,7 @@ impl Manager1 {
         ManagementDisconnectHandle {
             state: Arc::clone(&self.state),
             clock: Arc::clone(&self.clock),
+            controller: self.controller.clone(),
         }
     }
 
@@ -732,6 +792,16 @@ impl Manager1 {
                 ));
             }
         };
+        if let Some(controller) = &self.controller
+            && let Err(error) =
+                controller.start(authorization, operation_id, self.clock.now_micros())
+        {
+            let mut state = self.state.lock().map_err(|_| lock_error())?;
+            let _ = state.coordinator.cancel(target_uid, operation_id, self.clock.now_micros());
+            state.owner = None;
+            drop(state);
+            return Err(map_backend_error(&error));
+        }
         Ok((operation_id, progress))
     }
 
@@ -743,6 +813,9 @@ impl Manager1 {
     ) -> Result<(OperationId, ManagementResult), zbus::fdo::Error> {
         self.require_target(sender, target_uid).await?;
         let operation_id = OperationId::parse(operation_id).map_err(map_management_error)?;
+        if let Some(controller) = &self.controller {
+            controller.cancel(operation_id).map_err(|error| map_backend_error(&error))?;
+        }
         let update = {
             let mut state = self.state.lock().map_err(|_| lock_error())?;
             let owner = state
@@ -1236,6 +1309,38 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingController {
+        started: Arc<Mutex<Vec<OperationId>>>,
+        cancelled: Arc<Mutex<Vec<OperationId>>>,
+    }
+
+    impl EnrollmentOperationController for RecordingController {
+        fn start(
+            &self,
+            authorization: AuthorizedEnrollment,
+            operation_id: OperationId,
+            _issued_at_micros: u64,
+        ) -> Result<(), BackendError> {
+            if authorization.target_uid() != 1000 {
+                return Err(BackendError::new("wrong target"));
+            }
+            self.started
+                .lock()
+                .map_err(|_| BackendError::new("controller poisoned"))?
+                .push(operation_id);
+            Ok(())
+        }
+
+        fn cancel(&self, operation_id: OperationId) -> Result<(), BackendError> {
+            self.cancelled
+                .lock()
+                .map_err(|_| BackendError::new("controller poisoned"))?
+                .push(operation_id);
+            Ok(())
+        }
+    }
+
     struct MockAuthority {
         uid: u32,
         authorized: bool,
@@ -1355,6 +1460,31 @@ mod tests {
             )),
             Err(zbus::fdo::Error::InvalidArgs(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_operations_start_and_cancel_the_daemon_controller()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let controller = RecordingController::default();
+        let started = Arc::clone(&controller.started);
+        let cancelled = Arc::clone(&controller.cancelled);
+        let manager = Manager1::with_controller(
+            ManagementCoordinator::new(ManagementConfig::default())?,
+            Backend,
+            TestClock(AtomicU64::new(1_000_000)),
+            controller,
+        );
+        let (operation, _) =
+            futures_lite::future::block_on(manager.begin_enrollment_impl(":1.7", 1000))?;
+        assert_eq!(*started.lock().map_err(|_| "controller poisoned")?, vec![operation]);
+        let (_, result) = futures_lite::future::block_on(manager.cancel_enrollment_impl(
+            ":1.7",
+            1000,
+            &operation.to_string(),
+        ))?;
+        assert_eq!(result, ManagementResult::Cancelled);
+        assert_eq!(*cancelled.lock().map_err(|_| "controller poisoned")?, vec![operation]);
         Ok(())
     }
 

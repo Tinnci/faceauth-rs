@@ -14,6 +14,12 @@ asynchronous replies after service restart, cancellation, completion, or a newer
 completion-before-method-reply race is handled without leaving the page permanently busy. Unknown
 operation IDs, progress values, or terminal results fail closed as a protocol mismatch.
 
+Manager1 can be constructed with a daemon-side `EnrollmentOperationController`. After Polkit and
+UID authorization succeeds and the coordinator allocates an operation ID, the controller submits
+that exact enrollment job. Explicit cancellation and unique-sender disconnect notify the
+controller before Manager1 consumes and broadcasts the public terminal state. The daemon bridge
+retains the private cancellation token; QML never receives it or a worker handle.
+
 The operation ID remains private to the C++ adapter and is not exposed as a QML property. QML maps
 only stable safe codes to localized instructions. Password fallback and the fact that raw images are
 not retained remain visible in the primary setup experience.
