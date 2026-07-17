@@ -10,8 +10,13 @@ use std::{
 };
 
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
-use faceauth_management::{AuthorizedEnrollment, ManagementProgress, OperationId};
-use faceauth_management_dbus::{BackendError, EnrollmentOperationController};
+use faceauth_management::{
+    AuthorizedEnrollment, ManagementError, ManagementProgress, ManagementResult, ManagementUpdate,
+    OperationId,
+};
+use faceauth_management_dbus::{
+    BackendError, EnrollmentOperationController, ManagementWorkerHandle, WorkerError,
+};
 use faceauth_storage::{EncryptedTemplateStore, KeyProvider, StorageError, TemplateRecord};
 use thiserror::Error;
 
@@ -303,6 +308,69 @@ impl EnrollmentControllerBridge {
         drop(active);
         Ok(())
     }
+
+    /// Relay the exact worker stream through the management coordinator and a safe signal sink.
+    ///
+    /// The coordinator rechecks UID, operation ID, and deadline before every emitted update. If a
+    /// client cancellation already consumed the public operation, the worker's late update is
+    /// discarded and private cancellation state is cleared without a duplicate terminal signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] for worker-channel loss, invalid lifecycle transitions, or signal
+    /// sink failure.
+    pub fn relay(
+        &self,
+        target_uid: u32,
+        operation_id: OperationId,
+        management: &ManagementWorkerHandle,
+        mut emit: impl FnMut(ManagementUpdate) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let handle = self.take_handle(operation_id)?;
+        loop {
+            let update = handle
+                .recv()
+                .map_err(|_| BackendError::new("enrollment worker update channel closed"))?;
+            let public = match update {
+                EnrollmentEngineUpdate::Progress { operation_id: actual, progress }
+                    if actual == operation_id =>
+                {
+                    match management.progress(target_uid, operation_id, progress) {
+                        Ok(update) => update,
+                        Err(WorkerError::Management(ManagementError::NoActiveOperation)) => {
+                            self.finish(operation_id)?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(BackendError::new(error.to_string())),
+                    }
+                }
+                EnrollmentEngineUpdate::Completed { operation_id: actual, result }
+                    if actual == operation_id =>
+                {
+                    let result = match result {
+                        Ok(()) => ManagementResult::Completed,
+                        Err(EnrollmentEngineFailure::Cancelled) => ManagementResult::Cancelled,
+                        Err(_) => ManagementResult::Failed,
+                    };
+                    match management.complete(target_uid, operation_id, result) {
+                        Ok(update) => update,
+                        Err(WorkerError::Management(ManagementError::NoActiveOperation)) => {
+                            self.finish(operation_id)?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(BackendError::new(error.to_string())),
+                    }
+                }
+                _ => return Err(BackendError::new("enrollment worker update is misbound")),
+            };
+            let terminal = matches!(public, ManagementUpdate::Completed { .. });
+            emit(public)?;
+            if terminal {
+                self.finish(operation_id)?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 impl EnrollmentOperationController for EnrollmentControllerBridge {
@@ -493,6 +561,8 @@ mod tests {
     use std::{sync::Mutex, thread};
 
     use faceauth_authz::{AuthorizationGrant, ExecutableFingerprint};
+    use faceauth_management::{ManagementConfig, ManagementCoordinator};
+    use faceauth_management_dbus::{AuthorizationBackend, BackendFuture, Manager1, MonotonicClock};
     use faceauth_protocol::{AuthenticationPurpose, ServiceName, TransactionId};
     use faceauth_transport::PeerIdentity;
 
@@ -567,6 +637,38 @@ mod tests {
             progress(ManagementProgress::PositionFace)?;
             progress(ManagementProgress::Processing)?;
             Ok(record(job.target_uid()))
+        }
+    }
+
+    struct UnusedBackend;
+
+    impl AuthorizationBackend for UnusedBackend {
+        fn caller_uid<'a>(&'a self, _sender: &'a str) -> BackendFuture<'a, u32> {
+            Box::pin(async { Err(BackendError::new("unused")) })
+        }
+
+        fn enrollment_state<'a>(
+            &'a self,
+            _sender: &'a str,
+            _target_uid: u32,
+        ) -> BackendFuture<'a, bool> {
+            Box::pin(async { Err(BackendError::new("unused")) })
+        }
+
+        fn authorize_enrollment<'a>(
+            &'a self,
+            _sender: &'a str,
+            _target_uid: u32,
+        ) -> BackendFuture<'a, AuthorizedEnrollment> {
+            Box::pin(async { Err(BackendError::new("unused")) })
+        }
+    }
+
+    struct FixedClock;
+
+    impl MonotonicClock for FixedClock {
+        fn now_micros(&self) -> u64 {
+            2_000_000
         }
     }
 
@@ -688,6 +790,43 @@ mod tests {
             }
         ));
         bridge.finish(operation)?;
+        assert!(shutdown.request());
+        worker.join().map_err(|_| "worker panicked")??;
+        Ok(())
+    }
+
+    #[test]
+    fn relay_revalidates_and_emits_closed_management_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let authorization = authorization()?;
+        let mut coordinator = ManagementCoordinator::new(ManagementConfig::default())?;
+        let started = coordinator.start(authorization, 1_000_000)?;
+        let ManagementUpdate::Progress { operation_id, .. } = started else {
+            return Err("unexpected terminal start".into());
+        };
+        let manager = Manager1::new(coordinator, UnusedBackend, FixedClock);
+        let management = manager.worker_handle();
+
+        let (client, service) = EnrollmentEngineService::new(
+            SuccessfulEngine,
+            RecordingSink::default(),
+            BiometricResourceArbiter::default(),
+        );
+        let bridge = EnrollmentControllerBridge::new(client, config());
+        EnrollmentOperationController::start(&bridge, authorization, operation_id, 1_000_000)?;
+        let shutdown = ShutdownToken::default();
+        let worker_shutdown = shutdown.clone();
+        let worker = thread::spawn(move || service.run(&worker_shutdown));
+        let mut emitted = Vec::new();
+        bridge.relay(1000, operation_id, &management, |update| {
+            emitted.push(update);
+            Ok(())
+        })?;
+        assert_eq!(emitted.len(), 3);
+        assert!(matches!(
+            emitted.last(),
+            Some(ManagementUpdate::Completed { result: ManagementResult::Completed, .. })
+        ));
         assert!(shutdown.request());
         worker.join().map_err(|_| "worker panicked")??;
         Ok(())

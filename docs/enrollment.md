@@ -69,3 +69,9 @@ The Manager1 adapter invokes a dependency-inverted operation controller rather t
 daemon internals. The daemon bridge submits the authorized job, exposes its update handle exactly
 once to the service coordinator, preserves private cancellation ownership, and clears it only after
 the exact terminal update has been relayed.
+
+The relay passes every worker update back through `ManagementWorkerHandle`, which revalidates the
+target UID, operation ID, and deadline before a signal sink can emit it. Worker failures collapse
+to `failed`; cancellation maps to `cancelled`. If the public operation was already consumed by a
+client cancellation, a late worker terminal performs private cleanup only and is never broadcast a
+second time.
