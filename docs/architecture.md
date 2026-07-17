@@ -147,6 +147,8 @@ unexpected, or incompatible PAD evidence fails closed. This boundary contains no
 raw image type and therefore cannot persist capture frames.
 Multi-sample registration and its dedicated root Polkit-broker grant are described
 in [enrollment.md](enrollment.md).
+Its supervised worker shares the authentication resource arbiter, binds cancellation to one exact
+management operation, and reports success only after authenticated atomic template storage.
 The optional HPD contract and its fail-open semantics are described in
 [presence.md](presence.md).
 

@@ -1,6 +1,7 @@
 //! Privileged daemon authentication boundary orchestration.
 
 mod engine;
+mod enrollment_engine;
 mod production;
 mod resource;
 mod supervision;
@@ -10,6 +11,11 @@ pub use engine::{
     AuthenticationEngineHandle, AuthenticationEngineService, AuthenticationEngineServiceError,
     AuthenticationEngineSubmitError, AuthenticationEngineUpdate, AuthenticationJob,
     DerivedAuthenticationEvidence,
+};
+pub use enrollment_engine::{
+    EnrollmentCancellation, EnrollmentEngine, EnrollmentEngineClient, EnrollmentEngineFailure,
+    EnrollmentEngineHandle, EnrollmentEngineService, EnrollmentEngineServiceError,
+    EnrollmentEngineSubmitError, EnrollmentEngineUpdate, EnrollmentJob, EnrollmentTemplateSink,
 };
 pub use production::{
     PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,

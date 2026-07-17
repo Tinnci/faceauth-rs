@@ -51,3 +51,16 @@ aggregate buffers are zeroized on drop.
 Thresholds in tests demonstrate invariants only. Production values require
 evaluation on the exact camera, model suite, preprocessing contract, lighting,
 and target population.
+
+## Worker and commit boundary
+
+The daemon enrollment service is single-capacity and shares the global camera/model arbiter with
+authentication. Submission is non-queueing and bound to the exact Manager1 operation ID, root
+broker authorization, target UID, private cancellation signal, and daemon shutdown token. The
+engine owns capture and inference and may return only a validated derived `TemplateRecord`.
+
+The service rechecks the record UID and structure, then commits it through the authenticated atomic
+template sink. Only after storage succeeds does the worker channel emit an empty successful
+completion. Cancellation and storage failure can therefore never be presented as enrolled. Worker
+updates contain only closed management progress or sanitized failure categories; raw frames,
+landmarks, tensors, embeddings, and template contents have no channel representation.
