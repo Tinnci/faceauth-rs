@@ -10,11 +10,13 @@ use std::{
 
 use faceauth_authz::{AuthorizationPolicy, AuthorizationRule, CallerRelation};
 use faceauth_camera::{CameraPairSelector, CameraSelector};
-use faceauth_capture::{CaptureSpec, PairingPolicy};
+use faceauth_capture::{CaptureSpec, PairingPolicy, V4l2CaptureDevice};
 use faceauth_core::CaptureModality;
 use faceauth_core::{AuthPolicy, LivenessLevel};
 use faceauth_enrollment::EnrollmentConfig;
-use faceauth_inference::{RuntimeConfig, verify_model_installation, verify_runtime_installation};
+use faceauth_inference::{
+    OnnxSession, RuntimeConfig, verify_model_installation, verify_runtime_installation,
+};
 use faceauth_liveness::ChallengeConfig;
 use faceauth_management::{
     ENROLLMENT_POLKIT_ACTION, ENROLLMENT_SERVICE, MANAGER_BUS_NAME, MANAGER_OBJECT_PATH,
@@ -29,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{DetectionPolicy, supervision::SupervisorConfig};
+use crate::{
+    DetectionPolicy, ProductionAuthenticationEngine, ProductionAuthenticationEngineError,
+    supervision::SupervisorConfig,
+};
 
 /// Current daemon production-configuration schema.
 pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 4;
@@ -533,6 +538,133 @@ impl ProductionConfig {
         validate_authentication_boundary(&self.authentication_boundary)?;
         Ok(())
     }
+}
+
+/// Construct the real dual-camera, six-model authentication engine from a validated production
+/// configuration.
+///
+/// This function opens V4L2 nodes and loads ONNX Runtime/model code. Callers must invoke it only
+/// during explicit service startup, never from readiness inspection.
+///
+/// # Errors
+///
+/// Returns [`ProductionConfigError`] for discovery, device negotiation, manifest/model loading,
+/// role mismatch, or calibration identity mismatch.
+pub fn build_production_authentication_engine(
+    config: &ProductionConfig,
+) -> Result<ProductionAuthenticationEngine, ProductionConfigError> {
+    config.validate()?;
+    let model_identities = inspect_models(config).map_err(ProductionConfigError::Invalid)?;
+    inspect_calibration(config, Some(&model_identities)).map_err(ProductionConfigError::Invalid)?;
+    let devices = faceauth_camera::discover().map_err(|error| {
+        ProductionConfigError::Invalid(format!("camera discovery failed: {error}"))
+    })?;
+    let resolved =
+        faceauth_camera::resolve_pair(&devices, &config.cameras.selectors()).map_err(|error| {
+            ProductionConfigError::Invalid(format!("camera selection failed: {error}"))
+        })?;
+    let infrared_device = V4l2CaptureDevice::open(
+        &resolved.infrared.node,
+        CaptureModality::Infrared,
+        config.cameras.infrared.capture,
+    )
+    .map_err(|error| ProductionConfigError::Invalid(format!("IR camera open failed: {error}")))?;
+    let visible_device = V4l2CaptureDevice::open(
+        &resolved.visible.node,
+        CaptureModality::Visible,
+        config.cameras.visible.capture,
+    )
+    .map_err(|error| {
+        ProductionConfigError::Invalid(format!("visible camera open failed: {error}"))
+    })?;
+
+    let runtime = config.runtime.runtime();
+    let mut sessions = Vec::with_capacity(REQUIRED_MODEL_ROLES.len());
+    for installation in &config.models {
+        let manifest_path = trusted_regular_file(&installation.manifest_path, MAX_MANIFEST_BYTES)?;
+        let bytes = fs::read(manifest_path)?;
+        let manifest: ModelManifest = serde_json::from_slice(&bytes)?;
+        if manifest.role != installation.role {
+            return invalid("configured model role differs from its manifest role");
+        }
+        let session = OnnxSession::load(&runtime, &manifest, &installation.artifact_path).map_err(
+            |error| ProductionConfigError::Invalid(format!("model load failed: {error}")),
+        )?;
+        sessions.push((installation.role, session));
+    }
+    let mut take = |role| {
+        let index = sessions
+            .iter()
+            .position(|(candidate, _)| *candidate == role)
+            .ok_or_else(|| ProductionConfigError::Invalid(format!("missing {role:?} session")))?;
+        Ok::<_, ProductionConfigError>(sessions.swap_remove(index).1)
+    };
+    let detector = take(ModelRole::FaceDetector)?;
+    let landmarks = take(ModelRole::FaceLandmarks)?;
+    let embedding = take(ModelRole::FaceEmbedding)?;
+    let passive_infrared = take(ModelRole::PassiveLivenessInfrared)?;
+    let passive_visible = take(ModelRole::PassiveLivenessVisible)?;
+    let passive_fusion = take(ModelRole::PassiveLivenessFusion)?;
+    validate_loaded_calibration(
+        config,
+        &detector,
+        &landmarks,
+        &embedding,
+        &passive_infrared,
+        &passive_visible,
+        &passive_fusion,
+    )?;
+    ProductionAuthenticationEngine::new(
+        infrared_device,
+        visible_device,
+        detector,
+        landmarks,
+        embedding,
+        passive_infrared,
+        passive_visible,
+        passive_fusion,
+        config.cameras.pairing,
+        config.calibration.quality.detection_policy(),
+        config.calibration.quality.policy,
+        config.calibration.active_liveness.challenge,
+    )
+    .map_err(|error| match error {
+        ProductionAuthenticationEngineError::InvalidPolicy
+        | ProductionAuthenticationEngineError::ModelRoleMismatch { .. } => {
+            ProductionConfigError::Invalid(format!(
+                "authentication engine assembly failed: {error}"
+            ))
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_loaded_calibration(
+    config: &ProductionConfig,
+    detector: &OnnxSession,
+    landmarks: &OnnxSession,
+    embedding: &OnnxSession,
+    passive_infrared: &OnnxSession,
+    passive_visible: &OnnxSession,
+    passive_fusion: &OnnxSession,
+) -> Result<(), ProductionConfigError> {
+    let calibration = &config.calibration;
+    if detector.compatibility_sha256() != calibration.quality.detector_compatibility_sha256
+        || landmarks.compatibility_sha256() != calibration.quality.landmarks_compatibility_sha256
+        || landmarks.compatibility_sha256()
+            != calibration.active_liveness.landmarks_compatibility_sha256
+        || embedding.compatibility_sha256()
+            != calibration.recognition.embedding_compatibility_sha256
+        || passive_infrared.compatibility_sha256()
+            != calibration.passive_pad.infrared_compatibility_sha256
+        || passive_visible.compatibility_sha256()
+            != calibration.passive_pad.visible_compatibility_sha256
+        || passive_fusion.compatibility_sha256()
+            != calibration.passive_pad.fusion_compatibility_sha256
+    {
+        return invalid("loaded model compatibility identities differ from calibration");
+    }
+    Ok(())
 }
 
 /// Load a bounded, root-controlled configuration file and validate it strictly.
