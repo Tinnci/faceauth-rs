@@ -69,6 +69,53 @@ pub struct Rgb8View<'a> {
     pixels: &'a [u8],
 }
 
+/// A borrowed, tightly packed YUYV 4:2:2 image.
+#[derive(Clone, Copy)]
+pub struct YuyvView<'a> {
+    width: u32,
+    height: u32,
+    pixels: &'a [u8],
+}
+
+impl fmt::Debug for YuyvView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("YuyvView")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pixels", &"<redacted>")
+            .finish()
+    }
+}
+
+impl<'a> YuyvView<'a> {
+    /// Construct a tightly packed YUYV view without converting or copying the source frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualityError`] when dimensions are empty, excessive, odd-width, or do not match
+    /// exactly two bytes per pixel.
+    pub fn new(width: u32, height: u32, pixels: &'a [u8]) -> Result<Self, QualityError> {
+        if !width.is_multiple_of(2) {
+            return Err(QualityError::InvalidYuyvDimensions { width });
+        }
+        validate_image_layout(width, height, pixels.len(), 2)?;
+        Ok(Self { width, height, pixels })
+    }
+
+    /// Image width in pixels.
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Image height in pixels.
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
 impl fmt::Debug for Rgb8View<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -112,6 +159,8 @@ pub enum ImageView<'a> {
     Gray8(Gray8View<'a>),
     /// Interleaved red, green, and blue bytes per pixel.
     Rgb8(Rgb8View<'a>),
+    /// Packed YUYV 4:2:2; quality uses the native luma samples without an RGB copy.
+    Yuyv(YuyvView<'a>),
 }
 
 impl ImageView<'_> {
@@ -119,6 +168,7 @@ impl ImageView<'_> {
         match self {
             Self::Gray8(view) => (view.width, view.height),
             Self::Rgb8(view) => (view.width, view.height),
+            Self::Yuyv(view) => (view.width, view.height),
         }
     }
 
@@ -136,6 +186,10 @@ impl ImageView<'_> {
                 let luma = (77 * red + 150 * green + 29 * blue + 128) >> 8;
                 u8::try_from(luma).unwrap_or(u8::MAX)
             }
+            Self::Yuyv(view) => {
+                let index = (y * view.width as usize + x) * 2;
+                view.pixels[index]
+            }
         }
     }
 }
@@ -149,6 +203,12 @@ impl<'a> From<Gray8View<'a>> for ImageView<'a> {
 impl<'a> From<Rgb8View<'a>> for ImageView<'a> {
     fn from(value: Rgb8View<'a>) -> Self {
         Self::Rgb8(value)
+    }
+}
+
+impl<'a> From<YuyvView<'a>> for ImageView<'a> {
+    fn from(value: YuyvView<'a>) -> Self {
+        Self::Yuyv(value)
     }
 }
 
@@ -921,6 +981,15 @@ fn check_cancelled(should_cancel: &mut impl FnMut() -> bool) -> Result<(), Quali
 /// Quality assessment failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum QualityError {
+    /// The caller supplied a compressed or otherwise unsupported pixel encoding.
+    #[error("unsupported image format for direct quality assessment")]
+    UnsupportedImageFormat,
+    /// Packed YUYV requires an even number of pixels in every row.
+    #[error("YUYV image width {width} is not even")]
+    InvalidYuyvDimensions {
+        /// Rejected image width.
+        width: u32,
+    },
     /// Image dimensions are empty or exceed the hard per-axis bound.
     #[error("invalid image dimensions {width}x{height}")]
     InvalidImageDimensions {
@@ -1062,6 +1131,14 @@ mod tests {
             Gray8View::new(0, 2, &[]),
             Err(QualityError::InvalidImageDimensions { .. })
         ));
+        assert!(matches!(
+            YuyvView::new(3, 2, &[0; 12]),
+            Err(QualityError::InvalidYuyvDimensions { width: 3 })
+        ));
+        assert!(matches!(
+            YuyvView::new(2, 2, &[0; 7]),
+            Err(QualityError::ImageLengthMismatch { expected: 8, actual: 7 })
+        ));
     }
 
     #[test]
@@ -1075,6 +1152,25 @@ mod tests {
         let rgb_debug = format!("{:?}", Rgb8View::new(2, 1, &rgb)?);
         assert!(rgb_debug.contains("<redacted>"));
         assert!(!rgb_debug.contains("17, 23, 91, 204"));
+
+        let yuyv_debug = format!("{:?}", YuyvView::new(2, 1, &secret)?);
+        assert!(yuyv_debug.contains("<redacted>"));
+        assert!(!yuyv_debug.contains("17, 23, 91, 204"));
+        Ok(())
+    }
+
+    #[test]
+    fn yuyv_quality_uses_native_luma_without_rgb_conversion() -> Result<(), QualityError> {
+        let gray = checkerboard();
+        let mut yuyv = Vec::with_capacity(gray.len() * 2);
+        for pair in gray.chunks_exact(2) {
+            yuyv.extend_from_slice(&[pair[0], 90, pair[1], 170]);
+        }
+        let gray_report =
+            assess(Gray8View::new(WIDTH, HEIGHT, &gray)?.into(), geometry(), permissive_config())?;
+        let yuyv_report =
+            assess(YuyvView::new(WIDTH, HEIGHT, &yuyv)?.into(), geometry(), permissive_config())?;
+        assert_eq!(gray_report, yuyv_report);
         Ok(())
     }
 

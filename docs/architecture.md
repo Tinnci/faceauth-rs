@@ -109,9 +109,11 @@ openness outputs. The adapter validates every confidence and eye value, applies 
 ceilings, derives mean topology confidence and the visible-point fraction, and conservatively uses
 the less-open eye for active challenges. Callers cannot inject placeholder pose or blink values.
 
-`faceauth-quality` converts one borrowed, tightly packed Gray8 or RGB8 view plus an admitted
+`faceauth-quality` converts one borrowed, tightly packed Gray8, RGB8, or YUYV view plus an admitted
 normalized face/pose summary into derived quality evidence. It scans only the rasterized face
-region and retains no image: a fixed 256-bin luma histogram provides mean exposure, clipping, and percentile
+region. Packed YUYV is assessed from its native luma samples without allocating an RGB frame,
+keeping the original camera buffer borrowed and short-lived.
+It retains no image: a fixed 256-bin luma histogram provides mean exposure, clipping, and percentile
 dynamic range, while a bounded second pass computes four-neighbor Laplacian variance. Face scale,
 centering, yaw/pitch/roll, estimated unoccluded fraction, and landmark confidence are independently
 calibrated. A weighted harmonic mean is capped near the weakest component so one strong signal

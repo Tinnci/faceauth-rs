@@ -9,19 +9,21 @@ use std::{
     time::Duration,
 };
 
-use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
+use faceauth_capture::{
+    CaptureError, CapturedFrame, FrameSource, PairedFrames, PairingPolicy, PixelFormat,
+};
 use faceauth_core::CapturePair;
 use faceauth_inference::{
-    FaceEmbedding, FaceRegion, FacialLandmarks, ImageFacialLandmarks, ImageView, InferenceError,
-    InputTensor, OnnxSession, PassiveLivenessScore,
+    FaceEmbedding, FaceRegion, FacialLandmarks, ImageFacialLandmarks, ImageFormat, ImageView,
+    InferenceError, InputTensor, OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
 };
 use faceauth_protocol::{ProgressCode, TransactionId};
 use faceauth_quality::{
-    FaceGeometry, ImageView as QualityImageView, QualityConfig, QualityError, QualityReport,
-    assess_cancellable,
+    FaceGeometry, Gray8View, ImageView as QualityImageView, QualityConfig, QualityError,
+    QualityReport, YuyvView, assess_cancellable,
 };
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
 use thiserror::Error;
@@ -115,6 +117,36 @@ impl AuthenticationJob {
         session.preprocess_cancellable(image, || self.is_cancelled())
     }
 
+    /// Preprocess one captured frame without copying or retaining its pixel buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for unsupported MJPEG input, cancellation, malformed frame
+    /// layout, or a model preprocessing mismatch.
+    pub fn preprocess_frame(
+        &self,
+        session: &OnnxSession,
+        frame: &CapturedFrame,
+    ) -> Result<InputTensor, InferenceError> {
+        self.preprocess(session, inference_frame_view(frame)?)
+    }
+
+    /// Preprocess a captured frame for an exact named IR/RGB fusion input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for a wrong model role/name, unsupported MJPEG input,
+    /// cancellation, malformed frame layout, or a preprocessing mismatch.
+    pub fn preprocess_named_frame(
+        &self,
+        session: &OnnxSession,
+        name: &str,
+        frame: &CapturedFrame,
+    ) -> Result<InputTensor, InferenceError> {
+        let image = inference_frame_view(frame)?;
+        session.preprocess_named_cancellable(name, image, || self.is_cancelled())
+    }
+
     /// Align a full-frame face into an embedding tensor while mapping exact job cancellation.
     ///
     /// The session manifest binds the landmark model digest, five topology indices, reference
@@ -193,6 +225,23 @@ impl AuthenticationJob {
         self.assess_quality(image, geometry, config)
     }
 
+    /// Assess a captured frame directly using exact model-derived geometry without an RGB copy.
+    ///
+    /// Gray8 and YUYV frames are borrowed in place; YUYV quality reads native luma samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualityError`] for unsupported MJPEG, malformed frame layout, invalid geometry,
+    /// cancellation, or a calibrated quality failure.
+    pub fn assess_landmark_frame_quality(
+        &self,
+        frame: &CapturedFrame,
+        landmarks: &FacialLandmarks,
+        config: QualityConfig,
+    ) -> Result<QualityReport, QualityError> {
+        self.assess_landmark_quality(quality_frame_view(frame)?, landmarks, config)
+    }
+
     /// Process one active-liveness observation with session and daemon cancellation.
     ///
     /// # Errors
@@ -232,6 +281,34 @@ impl AuthenticationJob {
                 yaw_degrees: measurements.yaw_degrees(),
             },
         )
+    }
+}
+
+fn inference_frame_view(frame: &CapturedFrame) -> Result<ImageView<'_>, InferenceError> {
+    let summary = frame.summary();
+    let format = match summary.format.pixel_format {
+        PixelFormat::Gray8 => ImageFormat::Gray8,
+        PixelFormat::Yuyv => ImageFormat::Yuyv,
+        PixelFormat::Mjpeg => return Err(InferenceError::SourceImageInvalid),
+    };
+    Ok(ImageView {
+        width: summary.format.width,
+        height: summary.format.height,
+        format,
+        bytes: frame.bytes(),
+    })
+}
+
+fn quality_frame_view(frame: &CapturedFrame) -> Result<QualityImageView<'_>, QualityError> {
+    let summary = frame.summary();
+    match summary.format.pixel_format {
+        PixelFormat::Gray8 => {
+            Ok(Gray8View::new(summary.format.width, summary.format.height, frame.bytes())?.into())
+        }
+        PixelFormat::Yuyv => {
+            Ok(YuyvView::new(summary.format.width, summary.format.height, frame.bytes())?.into())
+        }
+        PixelFormat::Mjpeg => Err(QualityError::UnsupportedImageFormat),
     }
 }
 
