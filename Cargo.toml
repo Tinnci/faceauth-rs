@@ -36,7 +36,7 @@ chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 clap = { version = "4.5.54", features = ["derive"] }
 getrandom = "0.4.3"
 libc = "0.2.180"
-nix = { version = "0.31.3", features = ["socket"] }
+nix = { version = "0.31.3", features = ["poll", "socket"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "api-24"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

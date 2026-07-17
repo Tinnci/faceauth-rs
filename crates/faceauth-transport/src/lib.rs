@@ -15,6 +15,7 @@ use std::{
 };
 
 use faceauth_protocol::{Envelope, ProtocolError};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::socket::{
     getsockopt,
     sockopt::{PeerCredentials, PeerPidfd},
@@ -320,6 +321,23 @@ pub struct PeerStream {
 }
 
 impl PeerStream {
+    /// Check whether at least one byte or an orderly disconnect is pending without consuming data.
+    ///
+    /// The stream is switched to non-blocking mode only for the duration of `peek`; complete frame
+    /// reads retain the configured bounded timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when socket mode or peeking fails.
+    pub fn has_pending_input(&self) -> Result<bool, TransportError> {
+        let mut descriptors = [PollFd::new(
+            self.stream.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        poll(&mut descriptors, PollTimeout::ZERO).map_err(TransportError::Poll)?;
+        Ok(descriptors[0].revents().is_some_and(|events| !events.is_empty()))
+    }
+
     /// Capture `SO_PEERCRED` and apply blocking I/O bounds before reading any caller bytes.
     ///
     /// # Errors
@@ -417,6 +435,9 @@ impl PeerStream {
 /// Local transport failure.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// Kernel polling failed while checking whether a peer sent data or disconnected.
+    #[error("unable to poll local transport: {0}")]
+    Poll(#[source] nix::errno::Errno),
     /// Configured frame or timeout bounds are invalid.
     #[error("invalid local transport configuration")]
     InvalidConfig,
@@ -645,6 +666,21 @@ mod tests {
         let actual: Envelope<Request> = reader.read_message()?;
 
         assert_eq!(actual, Envelope::current(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_input_poll_detects_data_and_disconnect_without_consuming()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (left, right) = UnixStream::pair()?;
+        let mut writer = PeerStream::connect(left, TransportConfig::default())?;
+        let mut reader = PeerStream::connect(right, TransportConfig::default())?;
+        assert!(!reader.has_pending_input()?);
+        writer.write_message("ready")?;
+        assert!(reader.has_pending_input()?);
+        assert_eq!(reader.read_message::<String>()?.message, "ready");
+        drop(writer);
+        assert!(reader.has_pending_input()?);
         Ok(())
     }
 

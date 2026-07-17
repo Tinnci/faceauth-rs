@@ -118,6 +118,13 @@ preprocessing, every graph invocation, and final evidence assembly. Frames, tens
 and model scores remain inside the worker; only derived transaction-bound evidence crosses its
 channel.
 
+The authentication socket coordinator owns the complete per-connection protocol sequence. It
+admits one authorized request, submits the exact transaction-bound job, relays only closed progress
+codes, polls for client cancellation or disconnect without consuming partial frames, and emits one
+terminal response. Cancellation consumes the session before the engine result is drained; a broken
+connection cannot replay a result, and foreign transaction updates terminate coordination rather
+than reaching another client.
+
 `faceauth-quality` converts one borrowed, tightly packed Gray8, RGB8, or YUYV view plus an admitted
 normalized face/pose summary into derived quality evidence. It scans only the rasterized face
 region. Packed YUYV is assessed from its native luma samples without allocating an RGB frame,

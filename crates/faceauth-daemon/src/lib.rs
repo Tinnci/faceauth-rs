@@ -66,6 +66,9 @@ use faceauth_storage::{
 use faceauth_transport::{PeerIdentity, PeerStream, TransportError};
 use thiserror::Error;
 
+const CONNECTION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const MAX_CANCEL_DRAIN_POLLS: usize = 400;
+
 /// Start enrollment only from an exact root broker grant dedicated to Polkit enrollment.
 ///
 /// # Errors
@@ -751,6 +754,185 @@ impl BoundaryService {
             },
         )
     }
+
+    /// Consume an active transaction with a sanitized internal failure and write its terminal
+    /// response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundaryError`] for invalid binding or terminal response delivery failure.
+    pub fn send_engine_failure(
+        &mut self,
+        stream: &mut PeerStream,
+        connection: ConnectionToken,
+        transaction_id: TransactionId,
+        now_micros: u64,
+    ) -> Result<Response, BoundaryError> {
+        let response = self.sessions.complete(
+            connection,
+            transaction_id,
+            DecisionCode::InternalError,
+            now_micros,
+        )?;
+        stream.write_message(response.clone())?;
+        Ok(response)
+    }
+}
+
+/// Policies required to evaluate one engine result at the socket boundary.
+#[derive(Clone, Copy)]
+pub struct AuthenticationConnectionPolicy<'a> {
+    /// Final recognition, capture, quality, and fallback policy.
+    pub authentication: AuthPolicy,
+    /// Exact calibrated passive PAD model identities and thresholds.
+    pub passive_pad: &'a PassivePadPolicy,
+}
+
+/// Run one complete authenticated socket transaction through the biometric engine.
+///
+/// Client cancellation and disconnect signal the exact session token before the coordinator drains
+/// the bounded engine terminal update. Only one terminal response is ever written.
+///
+/// # Errors
+///
+/// Returns [`BoundaryError`] for transport, session binding, engine submission, or unexpected
+/// engine-worker termination.
+pub fn coordinate_authentication_connection<S, F>(
+    boundary: &mut BoundaryService,
+    stream: &mut PeerStream,
+    connection: ConnectionToken,
+    engine: &AuthenticationEngineClient,
+    templates: &S,
+    policy: AuthenticationConnectionPolicy<'_>,
+    mut now_micros: F,
+) -> Result<Response, BoundaryError>
+where
+    S: TemplateSource,
+    F: FnMut() -> u64,
+{
+    let admission = boundary.handle_one(stream, connection, now_micros())?;
+    let Response::Started { transaction_id } = admission else {
+        return Ok(admission);
+    };
+    coordinate_started_authentication(
+        boundary,
+        stream,
+        connection,
+        transaction_id,
+        engine,
+        templates,
+        policy,
+        now_micros,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coordinate_started_authentication<S, F>(
+    boundary: &mut BoundaryService,
+    stream: &mut PeerStream,
+    connection: ConnectionToken,
+    transaction_id: TransactionId,
+    engine: &AuthenticationEngineClient,
+    templates: &S,
+    policy: AuthenticationConnectionPolicy<'_>,
+    mut now_micros: F,
+) -> Result<Response, BoundaryError>
+where
+    S: TemplateSource,
+    F: FnMut() -> u64,
+{
+    let job = boundary.authentication_job(connection, transaction_id)?;
+    let Ok(handle) = engine.submit(job) else {
+        return boundary.send_engine_failure(stream, connection, transaction_id, now_micros());
+    };
+
+    loop {
+        match handle.recv_timeout(CONNECTION_POLL_INTERVAL) {
+            Ok(AuthenticationEngineUpdate::Progress {
+                transaction_id: update_transaction,
+                progress,
+            }) if update_transaction == transaction_id => {
+                let response = boundary.send_progress(
+                    stream,
+                    connection,
+                    transaction_id,
+                    progress,
+                    now_micros(),
+                )?;
+                if matches!(response, Response::Completed { .. }) {
+                    drain_cancelled_engine(&handle)?;
+                    return Ok(response);
+                }
+            }
+            Ok(AuthenticationEngineUpdate::Completed {
+                transaction_id: update_transaction,
+                result,
+            }) if update_transaction == transaction_id => {
+                return match result {
+                    Ok(evidence) => boundary.send_derived_completion(
+                        stream,
+                        templates,
+                        connection,
+                        policy.authentication,
+                        policy.passive_pad,
+                        &evidence,
+                    ),
+                    Err(_) => boundary.send_engine_failure(
+                        stream,
+                        connection,
+                        transaction_id,
+                        now_micros(),
+                    ),
+                };
+            }
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return boundary.send_engine_failure(
+                    stream,
+                    connection,
+                    transaction_id,
+                    now_micros(),
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        match stream.has_pending_input() {
+            Ok(false) => {}
+            Ok(true) => match boundary.handle_one(stream, connection, now_micros()) {
+                Ok(response @ Response::Completed { .. }) => {
+                    drain_cancelled_engine(&handle)?;
+                    return Ok(response);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _cancel_result =
+                        boundary.sessions().cancel(connection, transaction_id, now_micros());
+                    drain_cancelled_engine(&handle)?;
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                let _cancel_result =
+                    boundary.sessions().cancel(connection, transaction_id, now_micros());
+                drain_cancelled_engine(&handle)?;
+                return Err(BoundaryError::Transport(error));
+            }
+        }
+    }
+}
+
+fn drain_cancelled_engine(handle: &AuthenticationEngineHandle) -> Result<(), BoundaryError> {
+    for _ in 0..MAX_CANCEL_DRAIN_POLLS {
+        match handle.recv_timeout(CONNECTION_POLL_INTERVAL) {
+            Ok(AuthenticationEngineUpdate::Completed { .. }) => return Ok(()),
+            Ok(AuthenticationEngineUpdate::Progress { .. })
+            | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BoundaryError::EngineStopped);
+            }
+        }
+    }
+    Err(BoundaryError::EngineStopped)
 }
 
 enum ExecutableOrAuthorizationError {
@@ -773,11 +955,20 @@ pub enum BoundaryError {
     /// Authentication transaction binding or lifecycle failed.
     #[error("daemon authentication session failed: {0}")]
     Session(#[from] SessionError),
+    /// The engine could not admit this exact transaction.
+    #[error("daemon authentication engine submission failed: {0}")]
+    EngineSubmit(AuthenticationEngineSubmitError),
+    /// The engine worker ended or failed to terminate within its cancellation bound.
+    #[error("daemon authentication engine stopped unexpectedly")]
+    EngineStopped,
+    /// An engine update was not bound to the submitted transaction.
+    #[error("daemon authentication engine returned a foreign transaction update")]
+    UnexpectedEngineUpdate,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, os::unix::net::UnixStream};
+    use std::{cell::Cell, os::unix::net::UnixStream, thread};
 
     use faceauth_authz::{
         AuthorizationGrant, AuthorizationRule, CallerRelation, ExecutableFingerprint,
@@ -836,6 +1027,35 @@ mod tests {
                 visible,
             )?,
         ])
+    }
+
+    struct CoordinatorEngine;
+
+    impl AuthenticationEngine for CoordinatorEngine {
+        fn authenticate(
+            &mut self,
+            job: &AuthenticationJob,
+            progress: &mut dyn FnMut(ProgressCode) -> Result<(), AuthenticationEngineFailure>,
+        ) -> Result<DerivedAuthenticationEvidence, AuthenticationEngineFailure> {
+            progress(ProgressCode::HoldStill)?;
+            progress(ProgressCode::Processing)?;
+            let embedding =
+                test_embedding(0xaa).map_err(|_| AuthenticationEngineFailure::Internal)?;
+            let scores =
+                pad_scores(0.99, 0.99).map_err(|_| AuthenticationEngineFailure::Internal)?;
+            Ok(DerivedAuthenticationEvidence::new(
+                job.transaction_id(),
+                CapturePair {
+                    infrared_timestamp_micros: 2_000_000,
+                    visible_timestamp_micros: Some(2_010_000),
+                },
+                0.95,
+                embedding,
+                scores,
+                ChallengeProgress::Passed,
+                2_100_000,
+            ))
+        }
     }
 
     struct TestTemplateSource {
@@ -1158,6 +1378,74 @@ mod tests {
             Response::Completed { transaction_id, decision: DecisionCode::Accepted }
         );
         assert!(!service.sessions().is_busy());
+        Ok(())
+    }
+
+    #[test]
+    fn connection_coordinator_relays_engine_updates_and_one_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let embedding = test_embedding(0xaa)?;
+        let source = TestTemplateSource {
+            record: Some(template_from_embedding(1000, &embedding)),
+            requested_uid: Cell::new(None),
+        };
+        let rule = AuthorizationRule {
+            service: ServiceName::parse("faceauth-test")?,
+            purpose: AuthenticationPurpose::Test,
+            caller: CallerRelation::RootOnly,
+            executables: vec![ExecutableFingerprint { device: 1, inode: 1 }],
+        };
+        let mut boundary = BoundaryService::new(
+            AuthorizationPolicy::new(vec![rule])?,
+            SessionManager::new(SessionConfig::default())?,
+        );
+        let connection = ConnectionToken::generate()?;
+        let transaction_id = TransactionId::generate();
+        let grant = AuthorizationGrant {
+            transaction_id,
+            peer: faceauth_transport::PeerIdentity { pid: 123, uid: 0, gid: 0 },
+            target_uid: 1000,
+            service: ServiceName::parse("faceauth-test")?,
+            purpose: AuthenticationPurpose::Test,
+            executable: ExecutableFingerprint { device: 1, inode: 1 },
+        };
+        let _started = boundary.sessions().start(grant, connection, 1_000_000)?;
+        let (client, server) = UnixStream::pair()?;
+        let mut client = PeerStream::connect(client, TransportConfig::default())?;
+        let mut server = PeerStream::connect(server, TransportConfig::default())?;
+        let (engine, service) = AuthenticationEngineService::new(CoordinatorEngine);
+        let shutdown = ShutdownToken::default();
+        let worker_shutdown = shutdown.clone();
+        let worker = thread::spawn(move || service.run(&worker_shutdown));
+        let terminal = coordinate_started_authentication(
+            &mut boundary,
+            &mut server,
+            connection,
+            transaction_id,
+            &engine,
+            &source,
+            AuthenticationConnectionPolicy {
+                authentication: AuthPolicy::default(),
+                passive_pad: &pad_policy(),
+            },
+            || 2_050_000,
+        )?;
+        assert_eq!(
+            terminal,
+            Response::Completed { transaction_id, decision: DecisionCode::Accepted }
+        );
+        assert_eq!(
+            client.read_message::<Response>()?.message,
+            Response::Progress { transaction_id, progress: ProgressCode::HoldStill }
+        );
+        assert_eq!(
+            client.read_message::<Response>()?.message,
+            Response::Progress { transaction_id, progress: ProgressCode::Processing }
+        );
+        assert_eq!(client.read_message::<Response>()?.message, terminal);
+        assert!(!boundary.sessions().is_busy());
+        let _first = shutdown.request();
+        worker.join().map_err(|_| "engine worker panicked")??;
         Ok(())
     }
 
