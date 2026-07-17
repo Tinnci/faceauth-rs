@@ -31,7 +31,7 @@ use faceauth_core::{
 };
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
 use faceauth_inference::{
-    FaceEmbedding, ImageFacialLandmarks, ImageView, InferenceError, InputTensor, NormalizedFaceBox,
+    FaceEmbedding, FaceRegion, ImageFacialLandmarks, ImageView, InferenceError, InputTensor,
     OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
@@ -385,7 +385,7 @@ impl AuthenticationWorker {
         &self,
         session: &OnnxSession,
         image: ImageView<'_>,
-        region: &NormalizedFaceBox,
+        region: &FaceRegion,
     ) -> Result<InputTensor, InferenceError> {
         session.preprocess_face_region(image, region, || self.cancellation.is_cancelled())
     }

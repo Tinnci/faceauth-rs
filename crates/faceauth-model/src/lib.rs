@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 6;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 7;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -100,6 +100,36 @@ pub enum TensorElementType {
 pub enum ResizeFilter {
     /// Bilinear interpolation with half-pixel center coordinates and clamped edges.
     BilinearHalfPixel,
+}
+
+/// Manifest-bound detector-box expansion used to create a landmark model input.
+///
+/// The expanded region is always square and is rejected if any edge would leave the image. This
+/// avoids model-dependent implicit padding and aspect-ratio behavior.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaceCropContract {
+    /// Square side length as a multiple of the detector box's larger dimension.
+    pub scale: f32,
+    /// Horizontal center shift as a multiple of the detector box width; positive moves right.
+    pub center_offset_x: f32,
+    /// Vertical center shift as a multiple of the detector box height; positive moves down.
+    pub center_offset_y: f32,
+}
+
+impl FaceCropContract {
+    fn validate(self) -> Result<(), ModelError> {
+        if !self.scale.is_finite()
+            || !(1.0..=3.0).contains(&self.scale)
+            || !self.center_offset_x.is_finite()
+            || !self.center_offset_y.is_finite()
+            || !(-0.5..=0.5).contains(&self.center_offset_x)
+            || !(-0.5..=0.5).contains(&self.center_offset_y)
+        {
+            return Err(ModelError::InvalidFaceCropContract);
+        }
+        Ok(())
+    }
 }
 
 /// One normalized destination point in an aligned model input.
@@ -260,6 +290,8 @@ pub struct ModelManifest {
     pub sha256: String,
     /// Static input tensor contract.
     pub input: InputContract,
+    /// Required detector-region derivation for landmark model inputs.
+    pub face_crop: Option<FaceCropContract>,
     /// Required landmark-bound geometry preprocessing for roles that consume an aligned face.
     pub face_alignment: Option<FaceAlignmentContract>,
     /// Exact bounded output tensors expected from the graph.
@@ -317,6 +349,13 @@ impl ModelManifest {
             }
             (_, None) => {}
             (_, Some(_)) => return Err(ModelError::InvalidAlignmentContract),
+        }
+        match (self.role, self.face_crop) {
+            (ModelRole::FaceLandmarks, Some(crop)) => crop.validate()?,
+            (ModelRole::FaceLandmarks, None) | (_, Some(_)) => {
+                return Err(ModelError::InvalidFaceCropContract);
+            }
+            (_, None) => {}
         }
         let channel_count = usize::from(self.input.channels);
         if self.input.normalization.scale.len() != channel_count
@@ -453,6 +492,9 @@ pub enum ModelError {
     /// Face alignment is absent, attached to the wrong role, malformed, or degenerate.
     #[error("model face-alignment contract is invalid")]
     InvalidAlignmentContract,
+    /// Landmark crop policy is absent, attached to the wrong role, or malformed.
+    #[error("model face-crop contract is invalid")]
+    InvalidFaceCropContract,
     /// Tensor name is empty, excessive, or contains unsupported bytes.
     #[error("model tensor name is invalid")]
     InvalidTensorName,
@@ -676,6 +718,7 @@ mod tests {
                     bias: vec![0.0; 3],
                 },
             },
+            face_crop: None,
             face_alignment: None,
             outputs: vec![
                 OutputContract {
@@ -885,6 +928,8 @@ mod tests {
     fn landmark_role_requires_one_bounded_xy_tensor() {
         let mut landmarks = manifest();
         landmarks.role = ModelRole::FaceLandmarks;
+        landmarks.face_crop =
+            Some(FaceCropContract { scale: 1.25, center_offset_x: 0.0, center_offset_y: 0.1 });
         landmarks.outputs = vec![OutputContract {
             name: "landmarks".to_owned(),
             dimensions: vec![1, 5, 2],
@@ -899,6 +944,11 @@ mod tests {
         assert!(matches!(landmarks.validate(), Err(ModelError::OutputSemanticMismatch)));
         landmarks.outputs[0].dimensions = vec![5, 2];
         assert!(matches!(landmarks.validate(), Err(ModelError::OutputSemanticMismatch)));
+
+        landmarks.outputs[0].dimensions = vec![1, 5, 2];
+        landmarks.face_crop =
+            Some(FaceCropContract { scale: 3.1, center_offset_x: 0.0, center_offset_y: 0.0 });
+        assert!(matches!(landmarks.validate(), Err(ModelError::InvalidFaceCropContract)));
     }
 
     #[test]
@@ -940,6 +990,22 @@ mod tests {
             alignment.reference_points[0].x += 0.01;
         }
         assert_ne!(embedding.compatibility_sha256()?, embedding_digest);
+
+        let mut landmarks = manifest();
+        landmarks.role = ModelRole::FaceLandmarks;
+        landmarks.outputs = vec![OutputContract {
+            name: "landmarks".to_owned(),
+            dimensions: vec![1, 5, 2],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::FaceLandmarks,
+        }];
+        landmarks.face_crop =
+            Some(FaceCropContract { scale: 1.25, center_offset_x: 0.0, center_offset_y: 0.0 });
+        let crop_digest = landmarks.compatibility_sha256()?;
+        if let Some(crop) = landmarks.face_crop.as_mut() {
+            crop.center_offset_y = 0.1;
+        }
+        assert_ne!(landmarks.compatibility_sha256()?, crop_digest);
         Ok(())
     }
 }

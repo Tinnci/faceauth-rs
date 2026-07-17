@@ -10,7 +10,7 @@ use std::{
 };
 
 use faceauth_model::{
-    ColorSpace, FACE_ALIGNMENT_LANDMARKS, FaceAlignmentContract, InputContract,
+    ColorSpace, FACE_ALIGNMENT_LANDMARKS, FaceAlignmentContract, FaceCropContract, InputContract,
     MAX_FACE_DETECTION_CANDIDATES, MAX_FACE_LANDMARKS, MIN_FACE_LANDMARKS, ModelManifest,
     ModelRole, OutputSemantic, ResizeFilter, TensorElementType as ManifestElementType,
     TensorLayout,
@@ -180,6 +180,30 @@ pub struct NormalizedFaceBox {
     top: f32,
     right: f32,
     bottom: f32,
+}
+
+/// Manifest-derived full-image region used by one landmark model invocation.
+///
+/// Callers cannot construct or alter this value. It binds the detector box transformation to the
+/// landmark model compatibility digest and retains derived geometry only.
+#[derive(Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct FaceRegion {
+    compatibility_sha256: String,
+    bounds: NormalizedFaceBox,
+}
+
+impl FaceRegion {
+    /// Landmark model compatibility digest that defines this crop.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
+    /// Derived normalized full-image bounds.
+    #[must_use]
+    pub const fn bounds(&self) -> &NormalizedFaceBox {
+        &self.bounds
+    }
 }
 
 impl NormalizedFaceBox {
@@ -354,6 +378,7 @@ impl NormalizedLandmark {
 #[derive(PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct FacialLandmarks {
     compatibility_sha256: String,
+    region: FaceRegion,
     points: Vec<NormalizedLandmark>,
 }
 
@@ -372,15 +397,11 @@ impl FacialLandmarks {
 
     /// Map crop-relative landmark output back into normalized full-image coordinates.
     ///
-    /// The region must be the exact full-image crop used to create the landmark model input.
-    ///
     /// # Errors
     ///
     /// Returns [`InferenceError::FaceLandmarkOutputInvalid`] if mapped coordinates become invalid.
-    pub fn map_to_image(
-        &self,
-        region: &NormalizedFaceBox,
-    ) -> Result<ImageFacialLandmarks, InferenceError> {
+    pub fn map_to_image(&self) -> Result<ImageFacialLandmarks, InferenceError> {
+        let region = &self.region.bounds;
         let width = region.right - region.left;
         let height = region.bottom - region.top;
         let points = self
@@ -679,13 +700,33 @@ impl OnnxSession {
     pub fn preprocess_face_region(
         &self,
         image: ImageView<'_>,
-        region: &NormalizedFaceBox,
+        region: &FaceRegion,
         should_cancel: impl FnMut() -> bool,
     ) -> Result<InputTensor, InferenceError> {
         if self.manifest.role != ModelRole::FaceLandmarks {
             return Err(InferenceError::ModelRoleMismatch);
         }
-        preprocess_image_region(&self.manifest.input, image, region, should_cancel)
+        if region.compatibility_sha256 != self.compatibility_sha256 {
+            return Err(InferenceError::FaceRegionIncompatible);
+        }
+        preprocess_image_region(&self.manifest.input, image, &region.bounds, should_cancel)
+    }
+
+    /// Derive the exact square landmark region required by this model from one detector result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for a non-landmark role, a missing crop contract, malformed
+    /// detector geometry, or an expanded region that would leave the source image.
+    pub fn derive_face_region(
+        &self,
+        detection: &NormalizedFaceBox,
+    ) -> Result<FaceRegion, InferenceError> {
+        if self.manifest.role != ModelRole::FaceLandmarks {
+            return Err(InferenceError::ModelRoleMismatch);
+        }
+        let crop = self.manifest.face_crop.ok_or(InferenceError::FaceRegionInvalid)?;
+        derive_face_region(crop, detection, &self.compatibility_sha256)
     }
 
     /// Align a face from full-image landmarks directly into the model's zeroizing float tensor.
@@ -805,8 +846,17 @@ impl OnnxSession {
     pub fn extract_face_landmarks(
         &self,
         outputs: &[OutputTensor],
+        region: &FaceRegion,
     ) -> Result<FacialLandmarks, InferenceError> {
-        extract_face_landmark_output(&self.manifest, &self.compatibility_sha256, outputs)
+        if region.compatibility_sha256 != self.compatibility_sha256 {
+            return Err(InferenceError::FaceRegionIncompatible);
+        }
+        extract_face_landmark_output(
+            &self.manifest,
+            &self.compatibility_sha256,
+            region.clone(),
+            outputs,
+        )
     }
 
     /// Convert the semantic embedding output into a normalized, compatibility-bound template.
@@ -909,6 +959,7 @@ fn extract_face_detection_outputs(
 fn extract_face_landmark_output(
     manifest: &ModelManifest,
     compatibility_sha256: &str,
+    region: FaceRegion,
     outputs: &[OutputTensor],
 ) -> Result<FacialLandmarks, InferenceError> {
     if manifest.role != ModelRole::FaceLandmarks {
@@ -943,7 +994,44 @@ fn extract_face_landmark_output(
         }
         points.push(NormalizedLandmark { x: *x, y: *y });
     }
-    Ok(FacialLandmarks { compatibility_sha256: compatibility_sha256.to_owned(), points })
+    Ok(FacialLandmarks { compatibility_sha256: compatibility_sha256.to_owned(), region, points })
+}
+
+fn derive_face_region(
+    crop: FaceCropContract,
+    detection: &NormalizedFaceBox,
+    compatibility_sha256: &str,
+) -> Result<FaceRegion, InferenceError> {
+    let width = detection.right - detection.left;
+    let height = detection.bottom - detection.top;
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || detection.left < 0.0
+        || detection.top < 0.0
+        || detection.right > 1.0
+        || detection.bottom > 1.0
+    {
+        return Err(InferenceError::FaceRegionInvalid);
+    }
+    let center_x = (detection.left + detection.right).mul_add(0.5, crop.center_offset_x * width);
+    let center_y = (detection.top + detection.bottom).mul_add(0.5, crop.center_offset_y * height);
+    let half_side = width.max(height) * crop.scale * 0.5;
+    let bounds = NormalizedFaceBox {
+        left: center_x - half_side,
+        top: center_y - half_side,
+        right: center_x + half_side,
+        bottom: center_y + half_side,
+    };
+    if !valid_compatibility_sha256(compatibility_sha256)
+        || [bounds.left, bounds.top, bounds.right, bounds.bottom]
+            .iter()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(InferenceError::FaceRegionOutsideImage);
+    }
+    Ok(FaceRegion { compatibility_sha256: compatibility_sha256.to_owned(), bounds })
 }
 
 fn extract_embedding_output(
@@ -1742,6 +1830,12 @@ pub enum InferenceError {
     /// A detector crop supplied to direct landmark preprocessing was malformed.
     #[error("face region is invalid")]
     FaceRegionInvalid,
+    /// A face region was produced by a different landmark model contract.
+    #[error("face region is incompatible with the landmark model")]
+    FaceRegionIncompatible,
+    /// The manifest-derived landmark crop would leave the source image.
+    #[error("face region extends outside the source image")]
+    FaceRegionOutsideImage,
     /// Face embedding is empty, excessive, degenerate, or numerically invalid.
     #[error("face embedding output is invalid")]
     EmbeddingInvalid,
@@ -1811,6 +1905,11 @@ mod tests {
             license_spdx: "Apache-2.0".to_owned(),
             sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             input: input_contract(1, 1, TensorLayout::Nchw, ColorSpace::Rgb),
+            face_crop: (role == ModelRole::FaceLandmarks).then_some(FaceCropContract {
+                scale: 1.0,
+                center_offset_x: 0.0,
+                center_offset_y: 0.0,
+            }),
             face_alignment: (role == ModelRole::FaceEmbedding).then(test_alignment),
             outputs: vec![OutputContract {
                 name: "output".to_owned(),
@@ -2187,7 +2286,12 @@ mod tests {
             vec![1, 5, 2],
             vec![0.2, 0.3, 0.8, 0.3, 0.5, 0.5, 0.3, 0.8, 0.7, 0.8],
         )];
-        let landmarks = extract_face_landmark_output(&manifest, &compatibility, &outputs)?;
+        let landmarks = extract_face_landmark_output(
+            &manifest,
+            &compatibility,
+            test_region(&compatibility),
+            &outputs,
+        )?;
         assert_eq!(landmarks.compatibility_sha256(), compatibility);
         assert_eq!(landmarks.points().len(), 5);
         assert!((landmarks.points()[2].x() - 0.5).abs() < f32::EPSILON);
@@ -2204,26 +2308,46 @@ mod tests {
             values[3] = invalid_coordinate;
             let outputs = vec![output("output", vec![1, 5, 2], values)];
             assert!(matches!(
-                extract_face_landmark_output(&manifest, &compatibility, &outputs),
+                extract_face_landmark_output(
+                    &manifest,
+                    &compatibility,
+                    test_region(&compatibility),
+                    &outputs,
+                ),
                 Err(InferenceError::FaceLandmarkOutputInvalid)
             ));
         }
 
         let wrong_shape = vec![output("output", vec![5, 2], vec![0.5; 10])];
         assert!(matches!(
-            extract_face_landmark_output(&manifest, &compatibility, &wrong_shape),
+            extract_face_landmark_output(
+                &manifest,
+                &compatibility,
+                test_region(&compatibility),
+                &wrong_shape,
+            ),
             Err(InferenceError::FaceLandmarkOutputInvalid)
         ));
         let too_few = landmark_manifest(4);
         let output = vec![output("output", vec![1, 4, 2], vec![0.5; 8])];
         assert!(matches!(
-            extract_face_landmark_output(&too_few, &compatibility, &output),
+            extract_face_landmark_output(
+                &too_few,
+                &compatibility,
+                test_region(&compatibility),
+                &output,
+            ),
             Err(InferenceError::FaceLandmarkOutputInvalid)
         ));
         let wrong_role =
             model_manifest(ModelRole::FaceEmbedding, OutputSemantic::Embedding, vec![1, 32]);
         assert!(matches!(
-            extract_face_landmark_output(&wrong_role, &compatibility, &[]),
+            extract_face_landmark_output(
+                &wrong_role,
+                &compatibility,
+                test_region(&compatibility),
+                &[],
+            ),
             Err(InferenceError::ModelRoleMismatch)
         ));
     }
@@ -2235,17 +2359,24 @@ mod tests {
         }
     }
 
+    fn test_region(digest: &str) -> FaceRegion {
+        FaceRegion {
+            compatibility_sha256: digest.to_owned(),
+            bounds: NormalizedFaceBox { left: 0.2, top: 0.3, right: 0.8, bottom: 0.9 },
+        }
+    }
+
     #[test]
     fn crop_landmarks_map_back_to_full_image_without_pixels() -> Result<(), InferenceError> {
         let landmarks = FacialLandmarks {
             compatibility_sha256: "ef".repeat(32),
+            region: test_region(&"ef".repeat(32)),
             points: vec![
                 NormalizedLandmark { x: 0.0, y: 0.0 },
                 NormalizedLandmark { x: 1.0, y: 1.0 },
             ],
         };
-        let region = NormalizedFaceBox { left: 0.2, top: 0.3, right: 0.8, bottom: 0.9 };
-        let mapped = landmarks.map_to_image(&region)?;
+        let mapped = landmarks.map_to_image()?;
         assert!((mapped.points()[0].x() - 0.2).abs() < f32::EPSILON);
         assert!((mapped.points()[0].y() - 0.3).abs() < f32::EPSILON);
         assert!((mapped.points()[1].x() - 0.8).abs() < f32::EPSILON);
@@ -2302,6 +2433,27 @@ mod tests {
             preprocess_image_region(&contract, image, &valid, || true),
             Err(InferenceError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn manifest_crop_derives_square_offset_region_and_rejects_edges() -> Result<(), InferenceError>
+    {
+        let digest = "ab".repeat(32);
+        let crop = FaceCropContract { scale: 1.5, center_offset_x: 0.0, center_offset_y: 0.1 };
+        let detection = NormalizedFaceBox { left: 0.3, top: 0.3, right: 0.7, bottom: 0.5 };
+        let region = derive_face_region(crop, &detection, &digest)?;
+        assert_eq!(region.compatibility_sha256(), digest);
+        assert!((region.bounds().left() - 0.2).abs() <= f32::EPSILON);
+        assert!((region.bounds().right() - 0.8).abs() <= f32::EPSILON);
+        assert!((region.bounds().top() - 0.12).abs() <= f32::EPSILON * 2.0);
+        assert!((region.bounds().bottom() - 0.72).abs() <= f32::EPSILON * 2.0);
+
+        let edge = NormalizedFaceBox { left: 0.0, top: 0.0, right: 0.2, bottom: 0.2 };
+        assert!(matches!(
+            derive_face_region(crop, &edge, &digest),
+            Err(InferenceError::FaceRegionOutsideImage)
+        ));
+        Ok(())
     }
 
     #[test]

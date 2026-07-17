@@ -12,7 +12,7 @@ use std::{
 use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
 use faceauth_core::CapturePair;
 use faceauth_inference::{
-    FaceEmbedding, ImageFacialLandmarks, ImageView, InferenceError, InputTensor, NormalizedFaceBox,
+    FaceEmbedding, FaceRegion, ImageFacialLandmarks, ImageView, InferenceError, InputTensor,
     OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
@@ -141,7 +141,7 @@ impl AuthenticationJob {
         &self,
         session: &OnnxSession,
         image: ImageView<'_>,
-        region: &NormalizedFaceBox,
+        region: &FaceRegion,
     ) -> Result<InputTensor, InferenceError> {
         session.preprocess_face_region(image, region, || self.is_cancelled())
     }

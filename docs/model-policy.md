@@ -1,7 +1,7 @@
 # Model acceptance policy
 
 No model weights are bundled or downloaded merely because they are technically
-compatible with ONNX Runtime. Every artifact must have a schema-v6 reviewed
+compatible with ONNX Runtime. Every artifact must have a schema-v7 reviewed
 manifest with an HTTPS provenance URL, valid SPDX license expression, exact
 SHA-256 digest, pipeline role, and exact static input and output contracts.
 
@@ -9,7 +9,7 @@ The initial runtime admits exactly one fixed-shape float32 input and a bounded,
 non-empty list of fixed-shape float32 outputs. Tensor names, ranks, dimensions,
 and element counts are bounded. Dynamic dimensions, unexpected graph inputs or
 outputs, duplicate outputs, and name/type/shape mismatches fail closed.
-Schema v6 binds the resize filter, finite per-channel affine normalization
+Schema v7 binds the resize filter, finite per-channel affine normalization
 (`pixel * scale + bias`), and security-relevant output semantics to the model and
 its calibration record. Detector roles require exact normalized `[1,N,4]` box and `[1,N]`
 confidence outputs; landmark roles require exact normalized `[1,L,2]` points. Embedding roles
@@ -24,6 +24,11 @@ reference points, and a calibrated maximum fit residual. Full-image landmarks ar
 exact detector crop, then the embedding input is sampled directly into a zeroizing float tensor.
 No intermediate aligned byte image is created. A mismatched landmark model, missing topology point,
 degenerate transform, excessive residual, out-of-frame mapping, or cancellation fails closed.
+
+Landmark manifests additionally bind the detector-box crop contract. The initial contract creates
+a calibrated square region using a bounded scale and center offset. It rejects regions outside the
+image instead of introducing unspecified padding, and the derived region provenance is carried by
+the landmark result so callers cannot substitute an unrelated box during full-image mapping.
 
 ## Intended pipeline
 
