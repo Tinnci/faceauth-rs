@@ -29,6 +29,12 @@ The repository does not yet claim a production OSD host. A real host must bind t
 authentication transaction, filter stale updates, stop observing after the one-shot terminal
 result, preserve the existing password path, and never accept UI-originated success.
 
+The shared status ring uses a restrained outward breathing pulse while capture is active, short
+theme-color and scale transitions for terminal feedback, and cue-specific icons for positioning,
+blink, turn, recovery, processing, cancellation, and timeout. Both shared components expose a
+`reducedMotion` property so a production host can disable nonessential motion while preserving the
+same state and accessibility text.
+
 `faceauth-ui-model` provides the desktop-independent reference state machine for exact flow binding,
 safe cues, sanitized outcomes, and password-fallback visibility. The next integration step is a
 generated or typed Qt adapter so the Rust presentation tokens become the single source of truth for

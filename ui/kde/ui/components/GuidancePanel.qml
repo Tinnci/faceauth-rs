@@ -14,6 +14,30 @@ ColumnLayout {
     property string outcome: ""
     property bool running: false
     property string mode: "authentication"
+    property bool reducedMotion: false
+
+    readonly property string guidanceIcon: {
+        if (root.outcome === "succeeded")
+            return "dialog-ok-apply";
+        if (root.outcome === "timed-out")
+            return "chronometer";
+        if (root.outcome === "cancelled")
+            return "dialog-cancel";
+        if (root.outcome.length > 0)
+            return "data-warning";
+        const icons = {
+            "preparing": "view-refresh",
+            "position-face": "edit-image-face-recognize",
+            "hold-still": "media-playback-pause",
+            "active-challenge": "system-run",
+            "blink": "face-smile",
+            "turn-left": "go-previous",
+            "turn-right": "go-next",
+            "return-to-center": "go-home",
+            "processing": "document-encrypt"
+        };
+        return icons[root.cue] || "edit-image-face-recognize";
+    }
 
     function titleForCue(value) {
         const titles = {
@@ -64,6 +88,28 @@ ColumnLayout {
     }
 
     spacing: Kirigami.Units.smallSpacing
+
+    Kirigami.Icon {
+        Layout.alignment: Qt.AlignHCenter
+        Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+        Layout.preferredHeight: Layout.preferredWidth
+        source: root.guidanceIcon
+        opacity: root.cue.length > 0 || root.outcome.length > 0 ? 1 : 0
+        scale: root.running ? 0.94 : 1
+
+        Behavior on opacity {
+            NumberAnimation {
+                duration: root.reducedMotion ? 0 : 140
+            }
+        }
+
+        Behavior on scale {
+            NumberAnimation {
+                duration: root.reducedMotion ? 0 : 180
+                easing.type: Easing.OutCubic
+            }
+        }
+    }
 
     QQC2.Label {
         Layout.fillWidth: true
