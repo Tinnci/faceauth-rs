@@ -10,9 +10,10 @@ use std::{
 };
 
 use faceauth_model::{
-    ColorSpace, InputContract, MAX_FACE_DETECTION_CANDIDATES, MAX_FACE_LANDMARKS,
-    MIN_FACE_LANDMARKS, ModelManifest, ModelRole, OutputSemantic, ResizeFilter,
-    TensorElementType as ManifestElementType, TensorLayout,
+    ColorSpace, FACE_ALIGNMENT_LANDMARKS, FaceAlignmentContract, InputContract,
+    MAX_FACE_DETECTION_CANDIDATES, MAX_FACE_LANDMARKS, MIN_FACE_LANDMARKS, ModelManifest,
+    ModelRole, OutputSemantic, ResizeFilter, TensorElementType as ManifestElementType,
+    TensorLayout,
 };
 use ort::{
     session::{RunOptions, Session, builder::GraphOptimizationLevel},
@@ -325,7 +326,7 @@ fn intersection_over_union(left: &NormalizedFaceBox, right: &NormalizedFaceBox) 
     if union > 0.0 { intersection / union } else { 0.0 }
 }
 
-/// One normalized facial landmark point in a single face crop.
+/// One normalized facial landmark point in its owning coordinate space.
 #[derive(Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct NormalizedLandmark {
     x: f32,
@@ -364,6 +365,61 @@ impl FacialLandmarks {
     }
 
     /// Validated points in the exact model-defined topology order.
+    #[must_use]
+    pub fn points(&self) -> &[NormalizedLandmark] {
+        &self.points
+    }
+
+    /// Map crop-relative landmark output back into normalized full-image coordinates.
+    ///
+    /// The region must be the exact full-image crop used to create the landmark model input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::FaceLandmarkOutputInvalid`] if mapped coordinates become invalid.
+    pub fn map_to_image(
+        &self,
+        region: &NormalizedFaceBox,
+    ) -> Result<ImageFacialLandmarks, InferenceError> {
+        let width = region.right - region.left;
+        let height = region.bottom - region.top;
+        let points = self
+            .points
+            .iter()
+            .map(|point| {
+                let x = point.x.mul_add(width, region.left);
+                let y = point.y.mul_add(height, region.top);
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || !(0.0..=1.0).contains(&x)
+                    || !(0.0..=1.0).contains(&y)
+                {
+                    return Err(InferenceError::FaceLandmarkOutputInvalid);
+                }
+                Ok(NormalizedLandmark { x, y })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ImageFacialLandmarks { compatibility_sha256: self.compatibility_sha256.clone(), points })
+    }
+}
+
+/// Landmark points mapped into normalized full-image coordinates.
+///
+/// This derived geometry retains no source pixels and is zeroized on drop.
+#[derive(PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct ImageFacialLandmarks {
+    compatibility_sha256: String,
+    points: Vec<NormalizedLandmark>,
+}
+
+impl ImageFacialLandmarks {
+    /// Complete landmark model and preprocessing compatibility digest.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
+    /// Full-image normalized points in the model-defined topology order.
     #[must_use]
     pub fn points(&self) -> &[NormalizedLandmark] {
         &self.points
@@ -587,6 +643,9 @@ impl OnnxSession {
     /// Returns [`InferenceError`] for malformed source buffers, unsupported color conversion,
     /// excessive dimensions, or non-finite preprocessing results.
     pub fn preprocess(&self, image: ImageView<'_>) -> Result<InputTensor, InferenceError> {
+        if self.manifest.face_alignment.is_some() {
+            return Err(InferenceError::FaceAlignmentRequired);
+        }
         preprocess_image(&self.manifest.input, image)
     }
 
@@ -601,7 +660,31 @@ impl OnnxSession {
         image: ImageView<'_>,
         should_cancel: impl FnMut() -> bool,
     ) -> Result<InputTensor, InferenceError> {
+        if self.manifest.face_alignment.is_some() {
+            return Err(InferenceError::FaceAlignmentRequired);
+        }
         preprocess_image_cancellable(&self.manifest.input, image, should_cancel)
+    }
+
+    /// Align a face from full-image landmarks directly into the model's zeroizing float tensor.
+    ///
+    /// No intermediate aligned byte image is created. The exact five landmark indices, destination
+    /// reference geometry, landmark model compatibility digest, resize sampling, and normalization
+    /// are covered by the embedding manifest compatibility digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for a missing/mismatched alignment contract, incompatible
+    /// landmarks, degenerate geometry, source bounds, cancellation, or invalid arithmetic.
+    pub fn preprocess_aligned(
+        &self,
+        image: ImageView<'_>,
+        landmarks: &ImageFacialLandmarks,
+        should_cancel: impl FnMut() -> bool,
+    ) -> Result<InputTensor, InferenceError> {
+        let alignment =
+            self.manifest.face_alignment.as_ref().ok_or(InferenceError::FaceAlignmentRequired)?;
+        preprocess_aligned_image(&self.manifest.input, alignment, image, landmarks, should_cancel)
     }
 
     /// Execute one already validated tensor and copy all exact float32 outputs into zeroizing
@@ -938,6 +1021,41 @@ fn preprocess_image_cancellable(
     image: ImageView<'_>,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<InputTensor, InferenceError> {
+    let channels = validate_preprocess_inputs(contract, image)?;
+    check_cancelled(&mut should_cancel)?;
+
+    let dimensions = contract.dimensions();
+    let element_count = tensor_element_count(&dimensions)?;
+    let mut values = Zeroizing::new(vec![0.0_f32; element_count]);
+    let target_width = contract.width;
+    let target_height = contract.height;
+    match contract.resize_filter {
+        ResizeFilter::BilinearHalfPixel => {}
+    }
+    for target_y in 0..target_height {
+        check_cancelled(&mut should_cancel)?;
+        let (y0, y1, wy) = interpolation_axis(target_y, target_height, image.height);
+        for target_x in 0..target_width {
+            let (x0, x1, wx) = interpolation_axis(target_x, target_width, image.width);
+            for channel in 0..channels {
+                let top_left = source_channel(image, x0, y0, channel, contract.color_space)?;
+                let top_right = source_channel(image, x1, y0, channel, contract.color_space)?;
+                let bottom_left = source_channel(image, x0, y1, channel, contract.color_space)?;
+                let bottom_right = source_channel(image, x1, y1, channel, contract.color_space)?;
+                let top = top_left.mul_add(1.0 - wx, top_right * wx);
+                let bottom = bottom_left.mul_add(1.0 - wx, bottom_right * wx);
+                let pixel = top.mul_add(1.0 - wy, bottom * wy);
+                write_tensor_value(contract, &mut values, target_x, target_y, channel, pixel)?;
+            }
+        }
+    }
+    Ok(InputTensor { dimensions, values })
+}
+
+fn validate_preprocess_inputs(
+    contract: &InputContract,
+    image: ImageView<'_>,
+) -> Result<usize, InferenceError> {
     let channels = usize::from(contract.channels);
     if contract.width == 0
         || contract.height == 0
@@ -973,59 +1091,235 @@ fn preprocess_image_cancellable(
     {
         return Err(InferenceError::SourceImageInvalid);
     }
+    Ok(channels)
+}
 
-    check_cancelled(&mut should_cancel)?;
-
-    let dimensions = contract.dimensions();
-    let element_count = tensor_element_count(&dimensions)?;
-    let mut values = Zeroizing::new(vec![0.0_f32; element_count]);
+fn write_tensor_value(
+    contract: &InputContract,
+    values: &mut [f32],
+    target_x: u32,
+    target_y: u32,
+    channel: usize,
+    pixel: f32,
+) -> Result<(), InferenceError> {
+    let normalized =
+        pixel.mul_add(contract.normalization.scale[channel], contract.normalization.bias[channel]);
+    if !normalized.is_finite() {
+        return Err(InferenceError::InputTensorInvalid);
+    }
     let target_width = contract.width;
     let target_height = contract.height;
-    match contract.resize_filter {
-        ResizeFilter::BilinearHalfPixel => {}
+    let channels = usize::from(contract.channels);
+    let target_index = match contract.layout {
+        TensorLayout::Nchw => channel
+            .checked_mul(
+                usize::try_from(target_width * target_height)
+                    .map_err(|_| InferenceError::InputTensorInvalid)?,
+            )
+            .and_then(|base| {
+                base.checked_add(usize::try_from(target_y * target_width + target_x).ok()?)
+            }),
+        TensorLayout::Nhwc => usize::try_from(target_y * target_width + target_x)
+            .ok()
+            .and_then(|pixel_index| pixel_index.checked_mul(channels))
+            .and_then(|base| base.checked_add(channel)),
     }
-    for target_y in 0..target_height {
+    .ok_or(InferenceError::InputTensorInvalid)?;
+    values[target_index] = normalized;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SimilarityTransform {
+    cosine_scale: f64,
+    sine_scale: f64,
+    translation_x: f64,
+    translation_y: f64,
+}
+
+impl SimilarityTransform {
+    fn fit(
+        source: [(f64, f64); FACE_ALIGNMENT_LANDMARKS],
+        destination: [(f64, f64); FACE_ALIGNMENT_LANDMARKS],
+        maximum_residual: f64,
+    ) -> Result<Self, InferenceError> {
+        let count = 5.0_f64;
+        let source_center =
+            source.iter().fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
+        let destination_center =
+            destination.iter().fold((0.0, 0.0), |sum, point| (sum.0 + point.0, sum.1 + point.1));
+        let source_center = (source_center.0 / count, source_center.1 / count);
+        let destination_center = (destination_center.0 / count, destination_center.1 / count);
+        let (numerator_cosine, numerator_sine, denominator) = source
+            .iter()
+            .zip(destination.iter())
+            .fold((0.0, 0.0, 0.0), |sum, (source, destination)| {
+                let source_x = source.0 - source_center.0;
+                let source_y = source.1 - source_center.1;
+                let destination_x = destination.0 - destination_center.0;
+                let destination_y = destination.1 - destination_center.1;
+                (
+                    sum.0 + source_x * destination_x + source_y * destination_y,
+                    sum.1 + source_x * destination_y - source_y * destination_x,
+                    sum.2 + source_x * source_x + source_y * source_y,
+                )
+            });
+        if !denominator.is_finite() || denominator <= 1.0e-12 {
+            return Err(InferenceError::FaceAlignmentInvalid);
+        }
+        let cosine_scale = numerator_cosine / denominator;
+        let sine_scale = numerator_sine / denominator;
+        let determinant = cosine_scale.mul_add(cosine_scale, sine_scale * sine_scale);
+        if !determinant.is_finite() || determinant <= 1.0e-12 {
+            return Err(InferenceError::FaceAlignmentInvalid);
+        }
+        let translation_x = sine_scale
+            .mul_add(source_center.1, cosine_scale.mul_add(-source_center.0, destination_center.0));
+        let translation_y = cosine_scale
+            .mul_add(-source_center.1, sine_scale.mul_add(-source_center.0, destination_center.1));
+        let transform = Self { cosine_scale, sine_scale, translation_x, translation_y };
+        let squared_error = source.iter().zip(destination.iter()).try_fold(
+            0.0_f64,
+            |sum, (source, destination)| {
+                let mapped = transform.forward(*source);
+                let error_x = mapped.0 - destination.0;
+                let error_y = mapped.1 - destination.1;
+                let next = error_y.mul_add(error_y, error_x.mul_add(error_x, sum));
+                next.is_finite().then_some(next)
+            },
+        );
+        let residual = squared_error
+            .map(|value| (value / count).sqrt())
+            .filter(|value| value.is_finite())
+            .ok_or(InferenceError::FaceAlignmentInvalid)?;
+        if residual > maximum_residual {
+            return Err(InferenceError::FaceAlignmentResidualExceeded);
+        }
+        Ok(transform)
+    }
+
+    fn forward(self, source: (f64, f64)) -> (f64, f64) {
+        (
+            self.cosine_scale
+                .mul_add(source.0, (-self.sine_scale).mul_add(source.1, self.translation_x)),
+            self.sine_scale
+                .mul_add(source.0, self.cosine_scale.mul_add(source.1, self.translation_y)),
+        )
+    }
+
+    fn inverse(self, destination: (f64, f64)) -> Result<(f64, f64), InferenceError> {
+        let x = destination.0 - self.translation_x;
+        let y = destination.1 - self.translation_y;
+        let determinant =
+            self.cosine_scale.mul_add(self.cosine_scale, self.sine_scale * self.sine_scale);
+        let source = (
+            self.cosine_scale.mul_add(x, self.sine_scale * y) / determinant,
+            (-self.sine_scale).mul_add(x, self.cosine_scale * y) / determinant,
+        );
+        if source.0.is_finite() && source.1.is_finite() {
+            Ok(source)
+        } else {
+            Err(InferenceError::FaceAlignmentInvalid)
+        }
+    }
+}
+
+fn preprocess_aligned_image(
+    contract: &InputContract,
+    alignment: &FaceAlignmentContract,
+    image: ImageView<'_>,
+    landmarks: &ImageFacialLandmarks,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<InputTensor, InferenceError> {
+    let channels = validate_preprocess_inputs(contract, image)?;
+    if landmarks.compatibility_sha256 != alignment.landmarks_compatibility_sha256 {
+        return Err(InferenceError::FaceAlignmentIncompatible);
+    }
+    let mut source = [(0.0_f64, 0.0_f64); FACE_ALIGNMENT_LANDMARKS];
+    for (slot, index) in source.iter_mut().zip(alignment.landmark_indices) {
+        let point =
+            landmarks.points.get(usize::from(index)).ok_or(InferenceError::FaceAlignmentInvalid)?;
+        *slot = (f64::from(point.x), f64::from(point.y));
+    }
+    let destination =
+        alignment.reference_points.map(|point| (f64::from(point.x), f64::from(point.y)));
+    let transform = SimilarityTransform::fit(
+        source,
+        destination,
+        f64::from(alignment.maximum_normalized_residual),
+    )?;
+    check_cancelled(&mut should_cancel)?;
+    let dimensions = contract.dimensions();
+    let mut values = Zeroizing::new(vec![0.0_f32; tensor_element_count(&dimensions)?]);
+    for target_y in 0..contract.height {
         check_cancelled(&mut should_cancel)?;
-        let (y0, y1, wy) = interpolation_axis(target_y, target_height, image.height);
-        for target_x in 0..target_width {
-            let (x0, x1, wx) = interpolation_axis(target_x, target_width, image.width);
+        for target_x in 0..contract.width {
+            let destination = (
+                (f64::from(target_x) + 0.5) / f64::from(contract.width),
+                (f64::from(target_y) + 0.5) / f64::from(contract.height),
+            );
+            let source = transform.inverse(destination)?;
+            if !(0.0..=1.0).contains(&source.0) || !(0.0..=1.0).contains(&source.1) {
+                return Err(InferenceError::FaceAlignmentOutsideImage);
+            }
             for channel in 0..channels {
-                let top_left = source_channel(image, x0, y0, channel, contract.color_space)?;
-                let top_right = source_channel(image, x1, y0, channel, contract.color_space)?;
-                let bottom_left = source_channel(image, x0, y1, channel, contract.color_space)?;
-                let bottom_right = source_channel(image, x1, y1, channel, contract.color_space)?;
-                let top = top_left.mul_add(1.0 - wx, top_right * wx);
-                let bottom = bottom_left.mul_add(1.0 - wx, bottom_right * wx);
-                let pixel = top.mul_add(1.0 - wy, bottom * wy);
-                let normalized = pixel.mul_add(
-                    contract.normalization.scale[channel],
-                    contract.normalization.bias[channel],
-                );
-                if !normalized.is_finite() {
-                    return Err(InferenceError::InputTensorInvalid);
-                }
-                let target_index = match contract.layout {
-                    TensorLayout::Nchw => channel
-                        .checked_mul(
-                            usize::try_from(target_width * target_height)
-                                .map_err(|_| InferenceError::InputTensorInvalid)?,
-                        )
-                        .and_then(|base| {
-                            base.checked_add(
-                                usize::try_from(target_y * target_width + target_x).ok()?,
-                            )
-                        }),
-                    TensorLayout::Nhwc => usize::try_from(target_y * target_width + target_x)
-                        .ok()
-                        .and_then(|pixel_index| pixel_index.checked_mul(channels))
-                        .and_then(|base| base.checked_add(channel)),
-                }
-                .ok_or(InferenceError::InputTensorInvalid)?;
-                values[target_index] = normalized;
+                let pixel = sample_normalized_channel(
+                    image,
+                    source.0,
+                    source.1,
+                    channel,
+                    contract.color_space,
+                )?;
+                write_tensor_value(contract, &mut values, target_x, target_y, channel, pixel)?;
             }
         }
     }
     Ok(InputTensor { dimensions, values })
+}
+
+fn sample_normalized_channel(
+    image: ImageView<'_>,
+    normalized_x: f64,
+    normalized_y: f64,
+    channel: usize,
+    target_color: ColorSpace,
+) -> Result<f32, InferenceError> {
+    let source_x = normalized_x.mul_add(f64::from(image.width), -0.5);
+    let source_y = normalized_y.mul_add(f64::from(image.height), -0.5);
+    let (x0, x1, weight_x) = floating_interpolation_axis(source_x, image.width)?;
+    let (y0, y1, weight_y) = floating_interpolation_axis(source_y, image.height)?;
+    let top_left = source_channel(image, x0, y0, channel, target_color)?;
+    let top_right = source_channel(image, x1, y0, channel, target_color)?;
+    let bottom_left = source_channel(image, x0, y1, channel, target_color)?;
+    let bottom_right = source_channel(image, x1, y1, channel, target_color)?;
+    let top = top_left.mul_add(1.0 - weight_x, top_right * weight_x);
+    let bottom = bottom_left.mul_add(1.0 - weight_x, bottom_right * weight_x);
+    Ok(top.mul_add(1.0 - weight_y, bottom * weight_y))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the coordinate is finite and clamped to a source extent no larger than 4096"
+)]
+fn floating_interpolation_axis(
+    coordinate: f64,
+    extent: u32,
+) -> Result<(u32, u32, f32), InferenceError> {
+    if !coordinate.is_finite() || extent == 0 {
+        return Err(InferenceError::FaceAlignmentInvalid);
+    }
+    let maximum = f64::from(extent - 1);
+    let coordinate = coordinate.clamp(0.0, maximum);
+    let lower = coordinate.floor();
+    let lower = u32::try_from(lower as u64).map_err(|_| InferenceError::FaceAlignmentInvalid)?;
+    let upper = (lower + 1).min(extent - 1);
+    let weight = (coordinate - f64::from(lower)) as f32;
+    if weight.is_finite() {
+        Ok((lower, upper, weight))
+    } else {
+        Err(InferenceError::FaceAlignmentInvalid)
+    }
 }
 
 fn check_cancelled(should_cancel: &mut impl FnMut() -> bool) -> Result<(), InferenceError> {
@@ -1359,6 +1653,21 @@ pub enum InferenceError {
     /// Landmark points violate their fixed normalized single-face contract.
     #[error("face landmark output is invalid")]
     FaceLandmarkOutputInvalid,
+    /// This model requires its manifest-bound landmark alignment path.
+    #[error("model input requires landmark-bound face alignment")]
+    FaceAlignmentRequired,
+    /// Landmark evidence came from a different model/preprocessing compatibility contract.
+    #[error("face landmarks are incompatible with the alignment contract")]
+    FaceAlignmentIncompatible,
+    /// Landmark geometry or similarity-transform arithmetic is degenerate or invalid.
+    #[error("face alignment geometry is invalid")]
+    FaceAlignmentInvalid,
+    /// The fitted landmarks disagree with the reviewed similarity geometry beyond calibration.
+    #[error("face alignment residual exceeds its calibrated maximum")]
+    FaceAlignmentResidualExceeded,
+    /// The aligned output would sample beyond the source image.
+    #[error("aligned face extends outside the source image")]
+    FaceAlignmentOutsideImage,
     /// Face embedding is empty, excessive, degenerate, or numerically invalid.
     #[error("face embedding output is invalid")]
     EmbeddingInvalid,
@@ -1428,12 +1737,29 @@ mod tests {
             license_spdx: "Apache-2.0".to_owned(),
             sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             input: input_contract(1, 1, TensorLayout::Nchw, ColorSpace::Rgb),
+            face_alignment: (role == ModelRole::FaceEmbedding).then(test_alignment),
             outputs: vec![OutputContract {
                 name: "output".to_owned(),
                 dimensions,
                 element_type: ManifestElementType::Float32,
                 semantic,
             }],
+        }
+    }
+
+    fn test_alignment() -> FaceAlignmentContract {
+        FaceAlignmentContract {
+            landmarks_compatibility_sha256:
+                "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef".to_owned(),
+            landmark_indices: [0, 1, 2, 3, 4],
+            reference_points: [
+                faceauth_model::NormalizedPoint { x: 0.25, y: 0.25 },
+                faceauth_model::NormalizedPoint { x: 0.75, y: 0.25 },
+                faceauth_model::NormalizedPoint { x: 0.50, y: 0.50 },
+                faceauth_model::NormalizedPoint { x: 0.30, y: 0.75 },
+                faceauth_model::NormalizedPoint { x: 0.70, y: 0.75 },
+            ],
+            maximum_normalized_residual: 0.05,
         }
     }
 
@@ -1825,6 +2151,85 @@ mod tests {
         assert!(matches!(
             extract_face_landmark_output(&wrong_role, &compatibility, &[]),
             Err(InferenceError::ModelRoleMismatch)
+        ));
+    }
+
+    fn image_landmarks(digest: &str, points: &[(f32, f32)]) -> ImageFacialLandmarks {
+        ImageFacialLandmarks {
+            compatibility_sha256: digest.to_owned(),
+            points: points.iter().map(|(x, y)| NormalizedLandmark { x: *x, y: *y }).collect(),
+        }
+    }
+
+    #[test]
+    fn crop_landmarks_map_back_to_full_image_without_pixels() -> Result<(), InferenceError> {
+        let landmarks = FacialLandmarks {
+            compatibility_sha256: "ef".repeat(32),
+            points: vec![
+                NormalizedLandmark { x: 0.0, y: 0.0 },
+                NormalizedLandmark { x: 1.0, y: 1.0 },
+            ],
+        };
+        let region = NormalizedFaceBox { left: 0.2, top: 0.3, right: 0.8, bottom: 0.9 };
+        let mapped = landmarks.map_to_image(&region)?;
+        assert!((mapped.points()[0].x() - 0.2).abs() < f32::EPSILON);
+        assert!((mapped.points()[0].y() - 0.3).abs() < f32::EPSILON);
+        assert!((mapped.points()[1].x() - 0.8).abs() < f32::EPSILON);
+        assert!((mapped.points()[1].y() - 0.9).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_landmark_alignment_matches_full_frame_preprocessing() -> Result<(), InferenceError>
+    {
+        let contract = input_contract(4, 4, TensorLayout::Nhwc, ColorSpace::Rgb);
+        let alignment = test_alignment();
+        let points = alignment.reference_points.map(|point| (point.x, point.y));
+        let landmarks = image_landmarks(&alignment.landmarks_compatibility_sha256, &points);
+        let bytes = (0_u8..48).collect::<Vec<_>>();
+        let image = ImageView { width: 4, height: 4, format: ImageFormat::Rgb8, bytes: &bytes };
+        let regular = preprocess_image(&contract, image)?;
+        let aligned = preprocess_aligned_image(&contract, &alignment, image, &landmarks, || false)?;
+        assert_eq!(regular.dimensions(), aligned.dimensions());
+        assert_eq!(regular.values(), aligned.values());
+        Ok(())
+    }
+
+    #[test]
+    fn alignment_rejects_wrong_contract_degenerate_geometry_residual_and_cancellation() {
+        let contract = input_contract(4, 4, TensorLayout::Nhwc, ColorSpace::Rgb);
+        let alignment = test_alignment();
+        let image = ImageView { width: 4, height: 4, format: ImageFormat::Rgb8, bytes: &[127; 48] };
+        let points = alignment.reference_points.map(|point| (point.x, point.y));
+        let incompatible = image_landmarks(&"aa".repeat(32), &points);
+        assert!(matches!(
+            preprocess_aligned_image(&contract, &alignment, image, &incompatible, || false),
+            Err(InferenceError::FaceAlignmentIncompatible)
+        ));
+
+        let degenerate = image_landmarks(
+            &alignment.landmarks_compatibility_sha256,
+            &[(0.5, 0.5); FACE_ALIGNMENT_LANDMARKS],
+        );
+        assert!(matches!(
+            preprocess_aligned_image(&contract, &alignment, image, &degenerate, || false),
+            Err(InferenceError::FaceAlignmentInvalid)
+        ));
+
+        let mut strict = alignment.clone();
+        strict.maximum_normalized_residual = 0.001;
+        let mut distorted_points = points;
+        distorted_points[4] = (0.95, 0.95);
+        let distorted = image_landmarks(&strict.landmarks_compatibility_sha256, &distorted_points);
+        assert!(matches!(
+            preprocess_aligned_image(&contract, &strict, image, &distorted, || false),
+            Err(InferenceError::FaceAlignmentResidualExceeded)
+        ));
+
+        let valid = image_landmarks(&alignment.landmarks_compatibility_sha256, &points);
+        assert!(matches!(
+            preprocess_aligned_image(&contract, &alignment, image, &valid, || true),
+            Err(InferenceError::Cancelled)
         ));
     }
 

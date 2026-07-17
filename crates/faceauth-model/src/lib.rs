@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 5;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 6;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -42,6 +42,9 @@ pub const MIN_FACE_LANDMARKS: u32 = 5;
 
 /// Maximum fixed landmarks admitted from one face crop.
 pub const MAX_FACE_LANDMARKS: u32 = 512;
+
+/// Exact number of landmarks admitted by the initial similarity-alignment contract.
+pub const FACE_ALIGNMENT_LANDMARKS: usize = 5;
 
 /// Role a model serves in the biometric pipeline.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,6 +100,65 @@ pub enum TensorElementType {
 pub enum ResizeFilter {
     /// Bilinear interpolation with half-pixel center coordinates and clamped edges.
     BilinearHalfPixel,
+}
+
+/// One normalized destination point in an aligned model input.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedPoint {
+    /// Horizontal coordinate in `0..=1`.
+    pub x: f32,
+    /// Vertical coordinate in `0..=1`.
+    pub y: f32,
+}
+
+/// Exact five-point similarity-alignment contract for an embedding input.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaceAlignmentContract {
+    /// Complete compatibility digest of the landmark model that supplies the source points.
+    pub landmarks_compatibility_sha256: String,
+    /// Five unique indices in the landmark model's fixed topology.
+    pub landmark_indices: [u16; FACE_ALIGNMENT_LANDMARKS],
+    /// Corresponding normalized points in the embedding model's fixed input image.
+    pub reference_points: [NormalizedPoint; FACE_ALIGNMENT_LANDMARKS],
+    /// Maximum root-mean-square normalized landmark residual admitted after fitting.
+    pub maximum_normalized_residual: f32,
+}
+
+impl FaceAlignmentContract {
+    fn validate(&self) -> Result<(), ModelError> {
+        if !valid_sha256(&self.landmarks_compatibility_sha256) {
+            return Err(ModelError::InvalidAlignmentContract);
+        }
+        let mut sorted = self.landmark_indices;
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1])
+            || sorted.iter().any(|index| u32::from(*index) >= MAX_FACE_LANDMARKS)
+            || self.reference_points.iter().any(|point| {
+                !point.x.is_finite()
+                    || !point.y.is_finite()
+                    || !(0.0..=1.0).contains(&point.x)
+                    || !(0.0..=1.0).contains(&point.y)
+            })
+            || !self.maximum_normalized_residual.is_finite()
+            || !(0.001..=0.25).contains(&self.maximum_normalized_residual)
+        {
+            return Err(ModelError::InvalidAlignmentContract);
+        }
+        let center_x = self.reference_points.iter().map(|point| point.x).sum::<f32>() / 5.0;
+        let center_y = self.reference_points.iter().map(|point| point.y).sum::<f32>() / 5.0;
+        let variance = self.reference_points.iter().try_fold(0.0_f32, |sum, point| {
+            let x = point.x - center_x;
+            let y = point.y - center_y;
+            let next = x.mul_add(x, y.mul_add(y, sum));
+            next.is_finite().then_some(next)
+        });
+        if variance.is_none_or(|value| value <= 1.0e-6) {
+            return Err(ModelError::InvalidAlignmentContract);
+        }
+        Ok(())
+    }
 }
 
 /// Per-channel affine conversion from an 8-bit pixel to a model tensor value.
@@ -198,6 +260,8 @@ pub struct ModelManifest {
     pub sha256: String,
     /// Static input tensor contract.
     pub input: InputContract,
+    /// Required landmark-bound geometry preprocessing for roles that consume an aligned face.
+    pub face_alignment: Option<FaceAlignmentContract>,
     /// Exact bounded output tensors expected from the graph.
     pub outputs: Vec<OutputContract>,
 }
@@ -225,10 +289,7 @@ impl ModelManifest {
         if spdx::Expression::parse(&self.license_spdx).is_err() {
             return Err(ModelError::InvalidLicenseExpression);
         }
-        if self.sha256.len() != 64
-            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || self.sha256.bytes().any(|byte| byte.is_ascii_uppercase())
-        {
+        if !valid_sha256(&self.sha256) {
             return Err(ModelError::InvalidSha256);
         }
         validate_tensor_name(&self.input.name)?;
@@ -248,6 +309,14 @@ impl ModelManifest {
                 expected: expected_channels,
                 actual: self.input.channels,
             });
+        }
+        match (&self.role, &self.face_alignment) {
+            (ModelRole::FaceEmbedding, Some(alignment)) => alignment.validate()?,
+            (ModelRole::FaceEmbedding, None) => {
+                return Err(ModelError::InvalidAlignmentContract);
+            }
+            (_, None) => {}
+            (_, Some(_)) => return Err(ModelError::InvalidAlignmentContract),
         }
         let channel_count = usize::from(self.input.channels);
         if self.input.normalization.scale.len() != channel_count
@@ -335,6 +404,12 @@ impl ModelManifest {
     }
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !value.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
 /// Invalid model manifest or artifact.
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -375,6 +450,9 @@ pub enum ModelError {
     /// Normalization vectors must exactly match the channel count and contain finite values.
     #[error("model input normalization is invalid")]
     InvalidNormalization,
+    /// Face alignment is absent, attached to the wrong role, malformed, or degenerate.
+    #[error("model face-alignment contract is invalid")]
+    InvalidAlignmentContract,
     /// Tensor name is empty, excessive, or contains unsupported bytes.
     #[error("model tensor name is invalid")]
     InvalidTensorName,
@@ -598,6 +676,7 @@ mod tests {
                     bias: vec![0.0; 3],
                 },
             },
+            face_alignment: None,
             outputs: vec![
                 OutputContract {
                     name: "boxes".to_owned(),
@@ -704,6 +783,19 @@ mod tests {
     fn role_requires_matching_output_semantics() {
         let mut embedding = manifest();
         embedding.role = ModelRole::FaceEmbedding;
+        embedding.face_alignment = Some(FaceAlignmentContract {
+            landmarks_compatibility_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            landmark_indices: [0, 1, 2, 3, 4],
+            reference_points: [
+                NormalizedPoint { x: 0.3, y: 0.35 },
+                NormalizedPoint { x: 0.7, y: 0.35 },
+                NormalizedPoint { x: 0.5, y: 0.52 },
+                NormalizedPoint { x: 0.36, y: 0.72 },
+                NormalizedPoint { x: 0.64, y: 0.72 },
+            ],
+            maximum_normalized_residual: 0.05,
+        });
         assert!(matches!(embedding.validate(), Err(ModelError::OutputSemanticMismatch)));
         embedding.outputs = vec![OutputContract {
             name: "embedding".to_owned(),
@@ -723,6 +815,48 @@ mod tests {
             semantic: OutputSemantic::LiveProbability,
         }];
         assert!(passive.validate().is_ok());
+    }
+
+    #[test]
+    fn embedding_alignment_is_required_unique_model_bound_and_non_degenerate() {
+        let mut embedding = manifest();
+        embedding.role = ModelRole::FaceEmbedding;
+        embedding.outputs = vec![OutputContract {
+            name: "embedding".to_owned(),
+            dimensions: vec![1, 128],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::Embedding,
+        }];
+        assert!(matches!(embedding.validate(), Err(ModelError::InvalidAlignmentContract)));
+
+        let valid = FaceAlignmentContract {
+            landmarks_compatibility_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            landmark_indices: [0, 1, 2, 3, 4],
+            reference_points: [
+                NormalizedPoint { x: 0.3, y: 0.35 },
+                NormalizedPoint { x: 0.7, y: 0.35 },
+                NormalizedPoint { x: 0.5, y: 0.52 },
+                NormalizedPoint { x: 0.36, y: 0.72 },
+                NormalizedPoint { x: 0.64, y: 0.72 },
+            ],
+            maximum_normalized_residual: 0.05,
+        };
+        embedding.face_alignment = Some(valid.clone());
+        assert!(embedding.validate().is_ok());
+
+        let mut duplicate = valid.clone();
+        duplicate.landmark_indices[4] = 3;
+        embedding.face_alignment = Some(duplicate);
+        assert!(matches!(embedding.validate(), Err(ModelError::InvalidAlignmentContract)));
+        let mut degenerate = valid.clone();
+        degenerate.reference_points.fill(NormalizedPoint { x: 0.5, y: 0.5 });
+        embedding.face_alignment = Some(degenerate);
+        assert!(matches!(embedding.validate(), Err(ModelError::InvalidAlignmentContract)));
+        let mut unbound = valid;
+        unbound.landmarks_compatibility_sha256 = "bad".into();
+        embedding.face_alignment = Some(unbound);
+        assert!(matches!(embedding.validate(), Err(ModelError::InvalidAlignmentContract)));
     }
 
     #[test]
@@ -779,6 +913,33 @@ mod tests {
         let mut changed_output = original;
         changed_output.outputs[0].name = "different".to_owned();
         assert_ne!(changed_output.compatibility_sha256()?, original_digest);
+
+        let mut embedding = manifest();
+        embedding.role = ModelRole::FaceEmbedding;
+        embedding.outputs = vec![OutputContract {
+            name: "embedding".to_owned(),
+            dimensions: vec![1, 128],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::Embedding,
+        }];
+        embedding.face_alignment = Some(FaceAlignmentContract {
+            landmarks_compatibility_sha256:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            landmark_indices: [0, 1, 2, 3, 4],
+            reference_points: [
+                NormalizedPoint { x: 0.3, y: 0.35 },
+                NormalizedPoint { x: 0.7, y: 0.35 },
+                NormalizedPoint { x: 0.5, y: 0.52 },
+                NormalizedPoint { x: 0.36, y: 0.72 },
+                NormalizedPoint { x: 0.64, y: 0.72 },
+            ],
+            maximum_normalized_residual: 0.05,
+        });
+        let embedding_digest = embedding.compatibility_sha256()?;
+        if let Some(alignment) = embedding.face_alignment.as_mut() {
+            alignment.reference_points[0].x += 0.01;
+        }
+        assert_ne!(embedding.compatibility_sha256()?, embedding_digest);
         Ok(())
     }
 }

@@ -12,7 +12,8 @@ use std::{
 use faceauth_capture::{CaptureError, FrameSource, PairedFrames, PairingPolicy};
 use faceauth_core::CapturePair;
 use faceauth_inference::{
-    FaceEmbedding, ImageView, InferenceError, InputTensor, OnnxSession, PassiveLivenessScore,
+    FaceEmbedding, ImageFacialLandmarks, ImageView, InferenceError, InputTensor, OnnxSession,
+    PassiveLivenessScore,
 };
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
@@ -109,6 +110,25 @@ impl AuthenticationJob {
         image: ImageView<'_>,
     ) -> Result<InputTensor, InferenceError> {
         session.preprocess_cancellable(image, || self.is_cancelled())
+    }
+
+    /// Align a full-frame face into an embedding tensor while mapping exact job cancellation.
+    ///
+    /// The session manifest binds the landmark model digest, five topology indices, reference
+    /// geometry, residual ceiling, sampling, normalization, and tensor shape. No intermediate raw
+    /// aligned image crosses this boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for cancellation, incompatible or malformed landmarks, invalid
+    /// geometry, source bounds, or tensor construction failure.
+    pub fn preprocess_aligned(
+        &self,
+        session: &OnnxSession,
+        image: ImageView<'_>,
+        landmarks: &ImageFacialLandmarks,
+    ) -> Result<InputTensor, InferenceError> {
+        session.preprocess_aligned(image, landmarks, || self.is_cancelled())
     }
 
     /// Assess one borrowed face region without retaining image pixels, while mapping exact job

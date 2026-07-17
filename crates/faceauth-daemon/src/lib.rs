@@ -31,7 +31,8 @@ use faceauth_core::{
 };
 use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
 use faceauth_inference::{
-    FaceEmbedding, ImageView, InferenceError, InputTensor, OnnxSession, PassiveLivenessScore,
+    FaceEmbedding, ImageFacialLandmarks, ImageView, InferenceError, InputTensor, OnnxSession,
+    PassiveLivenessScore,
 };
 use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
@@ -356,6 +357,21 @@ impl AuthenticationWorker {
         image: ImageView<'_>,
     ) -> Result<InputTensor, InferenceError> {
         session.preprocess_cancellable(image, || self.cancellation.is_cancelled())
+    }
+
+    /// Align a full-frame face directly into a zeroizing model tensor with transaction
+    /// cancellation and the session's manifest-bound geometry contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded alignment/preprocessing error, including [`InferenceError::Cancelled`].
+    pub fn preprocess_aligned(
+        &self,
+        session: &OnnxSession,
+        image: ImageView<'_>,
+        landmarks: &ImageFacialLandmarks,
+    ) -> Result<InputTensor, InferenceError> {
+        session.preprocess_aligned(image, landmarks, || self.cancellation.is_cancelled())
     }
 
     /// Process one fresh active-liveness observation while mapping the transaction signal.
