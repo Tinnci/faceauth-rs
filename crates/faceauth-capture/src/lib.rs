@@ -7,7 +7,7 @@ use std::{
 };
 
 use faceauth_core::{CaptureModality, CapturePair};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use v4l::{
     Device, Format, FourCC,
@@ -19,7 +19,7 @@ use v4l::{
 use zeroize::Zeroizing;
 
 /// Pixel encoding accepted by the capture boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PixelFormat {
     /// One byte of grayscale intensity per pixel.
@@ -41,7 +41,8 @@ impl PixelFormat {
 }
 
 /// Exact capture requirements for one camera stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureSpec {
     /// Required frame width.
     pub width: u32,
@@ -158,7 +159,8 @@ impl PairedFrames {
 }
 
 /// Bounded frame-pairing policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PairingPolicy {
     /// Maximum timestamp difference accepted as one observation.
     pub max_skew_micros: u64,

@@ -10,6 +10,8 @@ use std::{
 
 use faceauth_authz::{AuthorizationPolicy, AuthorizationRule, CallerRelation};
 use faceauth_camera::{CameraPairSelector, CameraSelector};
+use faceauth_capture::{CaptureSpec, PairingPolicy};
+use faceauth_core::CaptureModality;
 use faceauth_core::{AuthPolicy, LivenessLevel};
 use faceauth_enrollment::EnrollmentConfig;
 use faceauth_inference::{RuntimeConfig, verify_model_installation, verify_runtime_installation};
@@ -30,7 +32,7 @@ use thiserror::Error;
 use crate::{DetectionPolicy, supervision::SupervisorConfig};
 
 /// Current daemon production-configuration schema.
-pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 3;
+pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 4;
 /// Current machine-readable readiness-report schema.
 pub const READINESS_REPORT_SCHEMA_VERSION: u16 = 1;
 
@@ -52,8 +54,8 @@ const REQUIRED_MODEL_ROLES: [ModelRole; 6] = [
 pub struct ProductionConfig {
     /// Exact configuration schema understood by this build.
     pub schema_version: u16,
-    /// Stable selectors for one IR and one visible-light capture node.
-    pub cameras: CameraPairSelector,
+    /// Stable selectors and exact bounded capture/pairing requirements.
+    pub cameras: ProductionCameraConfig,
     /// Trusted dynamic ONNX Runtime policy.
     pub runtime: RuntimePolicyConfig,
     /// Complete role-bound model installation set.
@@ -70,6 +72,37 @@ pub struct ProductionConfig {
     pub supervision: SupervisionPolicyConfig,
     /// Root-owned authentication socket and password-recovery invariants.
     pub authentication_boundary: AuthenticationBoundaryConfig,
+}
+
+/// Exact production camera selection, negotiation, and pairing policy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionCameraConfig {
+    /// Infrared camera selector and required stream format.
+    pub infrared: CameraStreamConfig,
+    /// Visible-light camera selector and required stream format.
+    pub visible: CameraStreamConfig,
+    /// Maximum temporal skew and replacement budget for one observation.
+    pub pairing: PairingPolicy,
+}
+
+impl ProductionCameraConfig {
+    fn selectors(&self) -> CameraPairSelector {
+        CameraPairSelector {
+            infrared: self.infrared.selector.clone(),
+            visible: self.visible.selector.clone(),
+        }
+    }
+}
+
+/// One stable camera selector and exact V4L2 negotiation contract.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraStreamConfig {
+    /// Stable udev identity and physical location selector.
+    pub selector: CameraSelector,
+    /// Required dimensions, encoding, frame rate, buffers, warmup, and timeout.
+    pub capture: CaptureSpec,
 }
 
 /// Serializable ONNX Runtime resource bounds.
@@ -431,11 +464,20 @@ impl ProductionConfig {
                 self.schema_version, PRODUCTION_CONFIG_SCHEMA_VERSION
             ));
         }
-        validate_camera_selector(&self.cameras.infrared, "infrared")?;
-        validate_camera_selector(&self.cameras.visible, "visible")?;
-        if self.cameras.infrared == self.cameras.visible {
+        validate_camera_selector(&self.cameras.infrared.selector, "infrared")?;
+        validate_camera_selector(&self.cameras.visible.selector, "visible")?;
+        if self.cameras.infrared.selector == self.cameras.visible.selector {
             return invalid("infrared and visible camera selectors must differ");
         }
+        self.cameras.infrared.capture.validate(CaptureModality::Infrared).map_err(|error| {
+            ProductionConfigError::Invalid(format!("invalid IR capture: {error}"))
+        })?;
+        self.cameras.visible.capture.validate(CaptureModality::Visible).map_err(|error| {
+            ProductionConfigError::Invalid(format!("invalid visible capture: {error}"))
+        })?;
+        self.cameras.pairing.validate().map_err(|error| {
+            ProductionConfigError::Invalid(format!("invalid camera pairing: {error}"))
+        })?;
         if !self.runtime.library_path.is_absolute() {
             return invalid("runtime library path must be absolute");
         }
@@ -688,7 +730,8 @@ fn validate_evidence_config(evidence: &ReviewedEvidence) -> Result<(), Productio
 
 fn inspect_cameras(config: &ProductionConfig) -> Result<String, String> {
     let devices = faceauth_camera::discover().map_err(|error| error.to_string())?;
-    faceauth_camera::resolve_pair(&devices, &config.cameras).map_err(|error| error.to_string())?;
+    faceauth_camera::resolve_pair(&devices, &config.cameras.selectors())
+        .map_err(|error| error.to_string())?;
     Ok("configured IR and visible selectors resolve uniquely to distinct capture nodes".to_owned())
 }
 
@@ -1057,9 +1100,34 @@ mod tests {
             .collect();
         Ok(ProductionConfig {
             schema_version: PRODUCTION_CONFIG_SCHEMA_VERSION,
-            cameras: CameraPairSelector {
-                infrared: selector("b769", "pci-ir"),
-                visible: selector("b768", "pci-rgb"),
+            cameras: ProductionCameraConfig {
+                infrared: CameraStreamConfig {
+                    selector: selector("b769", "pci-ir"),
+                    capture: CaptureSpec {
+                        width: 640,
+                        height: 480,
+                        pixel_format: faceauth_capture::PixelFormat::Gray8,
+                        frames_per_second: 30,
+                        buffer_count: 4,
+                        warmup_frames: 3,
+                        frame_timeout_millis: 250,
+                        max_frame_bytes: 640 * 480,
+                    },
+                },
+                visible: CameraStreamConfig {
+                    selector: selector("b768", "pci-rgb"),
+                    capture: CaptureSpec {
+                        width: 640,
+                        height: 480,
+                        pixel_format: faceauth_capture::PixelFormat::Yuyv,
+                        frames_per_second: 30,
+                        buffer_count: 4,
+                        warmup_frames: 3,
+                        frame_timeout_millis: 250,
+                        max_frame_bytes: 640 * 480 * 2,
+                    },
+                },
+                pairing: PairingPolicy { max_skew_micros: 100_000, max_replacements: 4 },
             },
             runtime: RuntimePolicyConfig {
                 library_path: PathBuf::from("/usr/lib/libonnxruntime.so"),

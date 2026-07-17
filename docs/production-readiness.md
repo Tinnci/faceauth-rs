@@ -1,10 +1,13 @@
 # Production configuration and readiness
 
-`faceauth-daemon` uses strict production-configuration schema 3 for production composition. The
+`faceauth-daemon` uses strict production-configuration schema 4 for production composition. The
 machine-readable readiness report remains schema 1. The configuration schema
 rejects unknown fields, unsupported versions, relative security-sensitive paths, incomplete model
 roles, unbounded resources, passive-only liveness, missing visible capture, and disabled password
-fallback. It also bounds supervisor polling, service count, and graceful shutdown time. The starting
+fallback. It also bounds supervisor polling, service count, and graceful shutdown time. Schema 4
+binds each camera selector to an exact V4L2 width, height, pixel format, frame rate, buffer
+count, warmup count, per-frame timeout, maximum byte length, and IR/RGB pairing budget. Negotiation
+drift or an invalid modality/format combination prevents production construction. The starting
 point is
 [`faceauth.json.example`](../contrib/config/faceauth.json.example); every placeholder digest,
 executable fingerprint, path, selector, threshold, and review artifact must be replaced with
