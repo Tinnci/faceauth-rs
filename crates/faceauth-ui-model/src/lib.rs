@@ -1,7 +1,7 @@
 //! Desktop-independent, privacy-preserving experience state for KCM, OSD, and lock-screen clients.
 
 use faceauth_management::{ManagementProgress, ManagementResult, ManagementUpdate, OperationId};
-use faceauth_protocol::{DecisionCode, ProgressCode, TransactionId};
+use faceauth_protocol::{DecisionCode, ProgressCode, RejectionCode, TransactionId};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -13,6 +13,11 @@ pub enum ExperienceFlow {
     Authentication {
         /// Exact daemon transaction.
         transaction_id: TransactionId,
+    },
+    /// Authentication request rejected before biometric processing began.
+    AuthenticationRejection {
+        /// Transaction recovered from the request, if decoding reached that field.
+        transaction_id: Option<TransactionId>,
     },
     /// Manager1 enrollment or template replacement operation.
     Enrollment {
@@ -253,6 +258,28 @@ impl ExperienceModel {
         Ok(())
     }
 
+    /// Record a request rejected before biometric processing began.
+    ///
+    /// Rejections never enter a busy state and always preserve the password path. The public
+    /// reason is deliberately collapsed to an unavailable outcome so authorization and enrollment
+    /// state are not amplified by lock-screen UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExperienceError::Busy`] until the previous flow is reset.
+    pub fn authentication_rejected(
+        &mut self,
+        transaction_id: Option<TransactionId>,
+        _reason: RejectionCode,
+    ) -> Result<(), ExperienceError> {
+        if self.state != ExperienceState::Idle {
+            return Err(ExperienceError::Busy);
+        }
+        let flow = ExperienceFlow::AuthenticationRejection { transaction_id };
+        self.state = ExperienceState::Terminal { flow, outcome: ExperienceOutcome::Unavailable };
+        Ok(())
+    }
+
     /// Apply one Manager1 progress or terminal update.
     ///
     /// # Errors
@@ -317,8 +344,11 @@ impl ExperienceModel {
                 title_key: outcome.title_key(),
                 icon_name: outcome.icon_name(),
                 busy: false,
-                show_password_fallback: matches!(flow, ExperienceFlow::Authentication { .. })
-                    && !matches!(outcome, ExperienceOutcome::Succeeded),
+                show_password_fallback: matches!(
+                    flow,
+                    ExperienceFlow::Authentication { .. }
+                        | ExperienceFlow::AuthenticationRejection { .. }
+                ) && !matches!(outcome, ExperienceOutcome::Succeeded),
             },
         }
     }
@@ -364,10 +394,10 @@ const fn authentication_outcome(decision: DecisionCode) -> ExperienceOutcome {
         DecisionCode::Accepted => ExperienceOutcome::Succeeded,
         DecisionCode::Cancelled => ExperienceOutcome::Cancelled,
         DecisionCode::TimedOut => ExperienceOutcome::TimedOut,
-        DecisionCode::InternalError => ExperienceOutcome::Unavailable,
-        DecisionCode::InfraredMissing
-        | DecisionCode::VisibleMissing
-        | DecisionCode::InsufficientQuality
+        DecisionCode::InternalError
+        | DecisionCode::InfraredMissing
+        | DecisionCode::VisibleMissing => ExperienceOutcome::Unavailable,
+        DecisionCode::InsufficientQuality
         | DecisionCode::PassiveLivenessFailed
         | DecisionCode::ActiveChallengeFailed
         | DecisionCode::FaceMismatch => ExperienceOutcome::TryAgain,
@@ -491,8 +521,6 @@ mod tests {
     fn biometric_failure_details_collapse_to_one_safe_experience()
     -> Result<(), Box<dyn std::error::Error>> {
         for decision in [
-            DecisionCode::InfraredMissing,
-            DecisionCode::VisibleMissing,
             DecisionCode::InsufficientQuality,
             DecisionCode::PassiveLivenessFailed,
             DecisionCode::ActiveChallengeFailed,
@@ -509,6 +537,52 @@ mod tests {
             assert_eq!(model.presentation().token, "try-again");
             assert!(model.presentation().show_password_fallback);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_camera_is_unavailable_and_never_prompts_biometric_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for decision in [DecisionCode::InfraredMissing, DecisionCode::VisibleMissing] {
+            let transaction_id = TransactionId::generate();
+            let mut model = ExperienceModel::default();
+            model.begin_authentication(transaction_id)?;
+            model.authentication_completed(transaction_id, decision)?;
+            assert!(matches!(
+                model.state(),
+                ExperienceState::Terminal { outcome: ExperienceOutcome::Unavailable, .. }
+            ));
+            assert_eq!(model.presentation().token, "unavailable");
+            assert!(model.presentation().show_password_fallback);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_preflight_rejection_is_terminal_and_preserves_password_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for reason in [
+            RejectionCode::UnauthorizedPeer,
+            RejectionCode::ServiceNotAllowed,
+            RejectionCode::NotEnrolled,
+            RejectionCode::CameraUnavailable,
+            RejectionCode::Busy,
+            RejectionCode::ServiceUnavailable,
+        ] {
+            let mut model = ExperienceModel::default();
+            model.authentication_rejected(Some(TransactionId::generate()), reason)?;
+            assert!(matches!(
+                model.state(),
+                ExperienceState::Terminal { outcome: ExperienceOutcome::Unavailable, .. }
+            ));
+            let presentation = model.presentation();
+            assert_eq!(presentation.token, "unavailable");
+            assert!(!presentation.busy);
+            assert!(presentation.show_password_fallback);
+        }
+        let mut undecodable = ExperienceModel::default();
+        undecodable.authentication_rejected(None, RejectionCode::ServiceUnavailable)?;
+        assert!(undecodable.presentation().show_password_fallback);
         Ok(())
     }
 
