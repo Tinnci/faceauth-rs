@@ -26,7 +26,10 @@ use faceauth_quality::{
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
 use thiserror::Error;
 
-use crate::{AuthenticationObservation, AuthenticationWorker, ShutdownToken};
+use crate::{
+    AuthenticationObservation, AuthenticationWorker, BiometricResourceArbiter,
+    BiometricResourceError, BiometricResourceLease, BiometricResourceOwner, ShutdownToken,
+};
 
 const REQUEST_QUEUE_CAPACITY: usize = 1;
 const MAX_PROGRESS_UPDATES: usize = 32;
@@ -350,6 +353,7 @@ pub enum AuthenticationEngineUpdate {
 struct EngineRequest {
     job: AuthenticationJob,
     updates: mpsc::SyncSender<AuthenticationEngineUpdate>,
+    _resource_lease: BiometricResourceLease,
 }
 
 /// Cloneable submission half for the single-capacity engine worker.
@@ -357,6 +361,7 @@ struct EngineRequest {
 pub struct AuthenticationEngineClient {
     requests: mpsc::SyncSender<EngineRequest>,
     active: Arc<AtomicBool>,
+    resources: BiometricResourceArbiter,
 }
 
 impl AuthenticationEngineClient {
@@ -370,12 +375,25 @@ impl AuthenticationEngineClient {
         &self,
         job: AuthenticationJob,
     ) -> Result<AuthenticationEngineHandle, AuthenticationEngineSubmitError> {
+        let resource_lease = self
+            .resources
+            .try_acquire(BiometricResourceOwner::Authentication(job.transaction_id))
+            .map_err(|error| match error {
+                BiometricResourceError::Busy { .. } => AuthenticationEngineSubmitError::Busy,
+                BiometricResourceError::Unavailable => {
+                    AuthenticationEngineSubmitError::ResourceUnavailable
+                }
+            })?;
         if self.active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(AuthenticationEngineSubmitError::Busy);
         }
         let transaction_id = job.transaction_id;
         let (updates, receiver) = mpsc::sync_channel(UPDATE_QUEUE_CAPACITY);
-        if self.requests.try_send(EngineRequest { job, updates }).is_err() {
+        if self
+            .requests
+            .try_send(EngineRequest { job, updates, _resource_lease: resource_lease })
+            .is_err()
+        {
             self.active.store(false, Ordering::Release);
             return Err(AuthenticationEngineSubmitError::WorkerStopped);
         }
@@ -432,10 +450,19 @@ where
     /// Create a single-capacity engine client and its supervised worker half.
     #[must_use]
     pub fn new(engine: E) -> (AuthenticationEngineClient, Self) {
+        Self::with_arbiter(engine, BiometricResourceArbiter::default())
+    }
+
+    /// Create an engine service using the daemon-wide arbiter shared with enrollment.
+    #[must_use]
+    pub fn with_arbiter(
+        engine: E,
+        resources: BiometricResourceArbiter,
+    ) -> (AuthenticationEngineClient, Self) {
         let (requests, receiver) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
         let active = Arc::new(AtomicBool::new(false));
         (
-            AuthenticationEngineClient { requests, active: Arc::clone(&active) },
+            AuthenticationEngineClient { requests, active: Arc::clone(&active), resources },
             Self { engine, requests: receiver, active },
         )
     }
@@ -515,6 +542,9 @@ pub enum AuthenticationEngineSubmitError {
     /// The supervised engine service is no longer available.
     #[error("authentication engine worker has stopped")]
     WorkerStopped,
+    /// Shared camera/model ownership state could not be trusted.
+    #[error("biometric resources are unavailable")]
+    ResourceUnavailable,
 }
 
 /// Fatal worker lifecycle failure.
@@ -535,6 +565,7 @@ mod tests {
     use faceauth_authz::{AuthorizationGrant, ExecutableFingerprint};
     use faceauth_core::CapturePair;
     use faceauth_inference::{FaceEmbedding, PassiveLivenessScore};
+    use faceauth_management::OperationId;
     use faceauth_model::ModelRole;
     use faceauth_protocol::{AuthenticationPurpose, ServiceName};
     use faceauth_session::SessionConfig;
@@ -616,6 +647,20 @@ mod tests {
             shutdown_grace: Duration::from_secs(1),
             max_services: 2,
         })
+    }
+
+    #[test]
+    fn enrollment_lease_blocks_authentication_before_worker_submission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resources = BiometricResourceArbiter::default();
+        let operation = OperationId::parse("123e4567-e89b-12d3-a456-426614174000")?;
+        let enrollment = resources.try_acquire(BiometricResourceOwner::Enrollment(operation))?;
+        let (client, _service) =
+            AuthenticationEngineService::with_arbiter(SuccessfulEngine, resources);
+        let (_sessions, _connection, job) = active_job()?;
+        assert!(matches!(client.submit(job), Err(AuthenticationEngineSubmitError::Busy)));
+        drop(enrollment);
+        Ok(())
     }
 
     #[test]
