@@ -2,6 +2,7 @@
 
 mod engine;
 mod production;
+mod resource;
 mod supervision;
 
 pub use engine::{
@@ -14,6 +15,10 @@ pub use production::{
     PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,
     READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind, ReadinessReport,
     inspect_production_readiness, load_production_config, readiness_from_config_path,
+};
+pub use resource::{
+    BiometricResourceArbiter, BiometricResourceError, BiometricResourceLease,
+    BiometricResourceOwner,
 };
 pub use supervision::{
     ServiceSupervisor, ShutdownFuture, ShutdownToken, SupervisorConfig, SupervisorError,

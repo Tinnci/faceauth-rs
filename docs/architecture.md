@@ -133,6 +133,11 @@ evidence: paired timestamps, quality, a normalized embedding, role-bound PAD pro
 challenge state, and completion time. Every result is checked against the exact transaction that
 created the job before encrypted template comparison. Raw frames, landmark arrays, tensors,
 templates, and keys have no representation in this channel.
+Authentication and enrollment share one daemon-wide, non-queueing biometric resource arbiter.
+Each scoped lease is bound to the exact authentication transaction or management operation and
+owns the dual cameras plus mutable model sessions as one pipeline. A competing operation receives
+a closed busy result immediately; dropping the lease releases capacity on cancellation,
+disconnect, error, or unwind, so expiring authorizations never wait in an internal work queue.
 The authentication evidence orchestrator then requires a valid paired IR/visible
 timestamp, explicitly calibrated IR and visible PAD scores bound to exact model
 compatibility digests, a completed randomized challenge, a finite quality value,
