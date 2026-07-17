@@ -1,6 +1,6 @@
 # Desktop-independent management contract
 
-`faceauth-management` defines the version-1 contract that the `faceauth-management-dbus` adapter,
+`faceauth-management` defines the version-2 contract that the `faceauth-management-dbus` adapter,
 future KDE System Settings module, and enrollment OSD consume. The core crate owns the
 security-relevant operation lifecycle; the D-Bus crate remains a thin translation layer.
 
@@ -9,7 +9,7 @@ Stable identifiers:
 - bus/interface: `org.faceauth.Manager1`;
 - object path: `/org/faceauth/Manager1`;
 - Polkit action: `org.faceauth.enroll`;
-- schema version: `1`.
+- schema version: `2`.
 
 The matching introspection input is
 [`org.faceauth.Manager1.xml`](../contrib/dbus/org.faceauth.Manager1.xml). It is a packaging input and
@@ -106,8 +106,10 @@ operation has an unpredictable UUID, an authorized numeric UID, and a fixed 5–
 deadline. Progress, cancellation, and completion require the exact UID and operation ID. Wrong
 bindings do not consume or alter the active operation.
 
-Public progress is limited to `preparing`, `position-face`, `hold-still`, `active-challenge`, and
-`processing`. Terminal results are `completed`, `cancelled`, `timed-out`, or `failed`. Neither the
+Public progress is limited to `preparing`, `position-face`, `hold-still`, `active-challenge`,
+`blink`, `turn-left`, `turn-right`, `return-to-center`, and `processing`. The generic
+`active-challenge` remains a compatibility fallback; version-2 clients prefer the exact action cue.
+Terminal results are `completed`, `cancelled`, `timed-out`, or `failed`. Neither the
 Rust types nor the D-Bus XML contain raw frames, landmarks, image quality, match scores, PAD scores,
 embeddings, or templates. Localized UI strings are selected by the client from these stable codes.
 
@@ -117,9 +119,14 @@ the operation slot.
 
 ## KDE boundary
 
-The future KCM should display enrollment state, begin/cancel enrollment after Polkit authorization,
-and render safe progress. It must not load models, open cameras, access encrypted storage, or make
-authentication decisions. The future OSD should subscribe only while its operation ID is active and
-must ignore signals for all other operations.
+The KF6 KCM displays authenticated enrollment state, begins or cancels enrollment after Polkit
+authorization, and renders only safe progress codes. It does not load models, open cameras, access
+encrypted storage, or make authentication decisions. Its C++ adapter keeps the exact operation ID
+out of QML, rejects unknown codes, filters stale updates, and invalidates asynchronous replies after
+service restart or a newer request.
+
+The reusable OSD view is present, but its production KScreenLocker/Plasma host remains future work.
+That host must subscribe only while its exact authentication transaction is active and ignore all
+other updates. See [KDE experience](kde-ui.md).
 
 No Plasma, KScreenLocker, SDDM, or PAM configuration is modified by this milestone.

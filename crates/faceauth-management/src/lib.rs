@@ -17,7 +17,7 @@ pub const MANAGER_INTERFACE: &str = "org.faceauth.Manager1";
 /// Polkit action required before constructing an enrollment authorization.
 pub const ENROLLMENT_POLKIT_ACTION: &str = "org.faceauth.enroll";
 /// Current management contract schema.
-pub const MANAGEMENT_SCHEMA_VERSION: u16 = 1;
+pub const MANAGEMENT_SCHEMA_VERSION: u16 = 2;
 /// Dedicated authorization service name admitted for enrollment.
 pub const ENROLLMENT_SERVICE: &str = "faceauth-enroll";
 
@@ -92,6 +92,14 @@ pub enum ManagementProgress {
     HoldStill,
     /// Perform the randomized action shown separately by the client mapping.
     ActiveChallenge,
+    /// Close and reopen both eyes.
+    Blink,
+    /// Turn toward the user's left.
+    TurnLeft,
+    /// Turn toward the user's right.
+    TurnRight,
+    /// Return to a centered, eyes-open pose.
+    ReturnToCenter,
     /// Derived samples are being checked and encrypted.
     Processing,
 }

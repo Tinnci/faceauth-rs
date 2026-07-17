@@ -18,6 +18,10 @@ use faceauth_liveness::{
     ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
 };
 use faceauth_protocol::{ProgressCode, TransactionId};
+use faceauth_quality::{
+    FaceGeometry, ImageView as QualityImageView, QualityConfig, QualityError, QualityReport,
+    assess_cancellable,
+};
 use faceauth_session::{ConnectionToken, SessionError, SessionManager};
 use thiserror::Error;
 
@@ -105,6 +109,22 @@ impl AuthenticationJob {
         image: ImageView<'_>,
     ) -> Result<InputTensor, InferenceError> {
         session.preprocess_cancellable(image, || self.is_cancelled())
+    }
+
+    /// Assess one borrowed face region without retaining image pixels, while mapping exact job
+    /// cancellation into both bounded image scans.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualityError`] for cancellation, malformed geometry/image data, invalid
+    /// calibration, resource-limit violations, or non-finite computation.
+    pub fn assess_quality(
+        &self,
+        image: QualityImageView<'_>,
+        geometry: FaceGeometry,
+        config: QualityConfig,
+    ) -> Result<QualityReport, QualityError> {
+        assess_cancellable(image, geometry, config, || self.is_cancelled())
     }
 
     /// Process one active-liveness observation with session and daemon cancellation.

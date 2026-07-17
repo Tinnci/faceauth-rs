@@ -42,3 +42,15 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  kde:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: archlinux:base-devel
+    steps:
+      - name: Install Qt and KDE build dependencies
+        run: pacman -Syu --noconfirm cmake git ninja extra-cmake-modules qt6-declarative kcmutils ki18n kirigami
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: ./scripts/check-kde-ui.sh

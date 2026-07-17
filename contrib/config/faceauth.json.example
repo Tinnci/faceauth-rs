@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "cameras": {
     "infrared": {
       "vendor_id": "04f2",
@@ -96,6 +96,86 @@
         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     },
+    "quality": {
+      "detector_compatibility_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "landmarks_compatibility_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "policy": {
+        "max_image_pixels": 8294400,
+        "minimum_face_width_pixels": 32,
+        "minimum_face_height_pixels": 32,
+        "low_percentile": 5,
+        "high_percentile": 95,
+        "exposure": {
+          "reject_below": 24.0,
+          "ideal_min": 72.0,
+          "ideal_max": 184.0,
+          "reject_above": 240.0
+        },
+        "dark_clip_at_or_below": 8,
+        "bright_clip_at_or_above": 247,
+        "clipped_fraction": {
+          "ideal_at_or_below": 0.02,
+          "reject_at_or_above": 0.25
+        },
+        "dynamic_range": {
+          "reject_at_or_below": 12.0,
+          "ideal_at_or_above": 96.0
+        },
+        "sharpness": {
+          "reject_at_or_below": 0.002,
+          "ideal_at_or_above": 0.08
+        },
+        "face_fraction": {
+          "reject_below": 0.02,
+          "ideal_min": 0.12,
+          "ideal_max": 0.45,
+          "reject_above": 0.75
+        },
+        "horizontal_centering": {
+          "ideal_at_or_below": 0.05,
+          "reject_at_or_above": 0.35
+        },
+        "vertical_centering": {
+          "ideal_at_or_below": 0.08,
+          "reject_at_or_above": 0.4
+        },
+        "yaw": {
+          "ideal_at_or_below": 8.0,
+          "reject_at_or_above": 35.0
+        },
+        "pitch": {
+          "ideal_at_or_below": 8.0,
+          "reject_at_or_above": 30.0
+        },
+        "roll": {
+          "ideal_at_or_below": 8.0,
+          "reject_at_or_above": 30.0
+        },
+        "visibility": {
+          "reject_at_or_below": 0.45,
+          "ideal_at_or_above": 0.92
+        },
+        "landmark_confidence": {
+          "reject_at_or_below": 0.4,
+          "ideal_at_or_above": 0.9
+        },
+        "weights": {
+          "exposure": 1.0,
+          "dynamic_range": 1.0,
+          "sharpness": 1.5,
+          "face_scale": 1.0,
+          "centering": 0.75,
+          "pose": 1.25,
+          "occlusion": 1.5,
+          "landmark_confidence": 1.0
+        },
+        "weakest_component_headroom": 0.12
+      },
+      "evidence": {
+        "path": "/usr/share/doc/faceauth/reviews/quality-calibration.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
     "passive_pad": {
       "infrared_compatibility_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "minimum_infrared_probability": 0.8,
@@ -117,7 +197,10 @@
         "open_eye_threshold": 0.7,
         "closed_eye_threshold": 0.3,
         "neutral_yaw_degrees": 8.0,
-        "turn_yaw_degrees": 20.0
+        "turn_yaw_degrees": 20.0,
+        "action_consecutive_observations": 3,
+        "minimum_action_duration_micros": 100000,
+        "recovery_consecutive_observations": 3
       },
       "evidence": {
         "path": "/usr/share/doc/faceauth/reviews/active-liveness-calibration.json",

@@ -20,6 +20,7 @@ use faceauth_management::{
 };
 use faceauth_model::{ModelManifest, ModelRole};
 use faceauth_protocol::AuthenticationPurpose;
+use faceauth_quality::QualityConfig;
 use faceauth_session::SessionConfig;
 use faceauth_transport::TransportConfig;
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ use thiserror::Error;
 use crate::supervision::SupervisorConfig;
 
 /// Current daemon production-configuration schema.
-pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 1;
+pub const PRODUCTION_CONFIG_SCHEMA_VERSION: u16 = 2;
 /// Current machine-readable readiness-report schema.
 pub const READINESS_REPORT_SCHEMA_VERSION: u16 = 1;
 
@@ -105,7 +106,7 @@ impl RuntimePolicyConfig {
 pub struct ModelInstallation {
     /// Pipeline role this entry must provide.
     pub role: ModelRole,
-    /// Root-controlled schema-v4 manifest.
+    /// Root-controlled schema-v5 manifest.
     pub manifest_path: PathBuf,
     /// Root-controlled ONNX artifact.
     pub artifact_path: PathBuf,
@@ -129,12 +130,28 @@ pub struct ReviewedEvidence {
 pub struct CalibrationConfig {
     /// Recognition, quality, capture, and fallback policy.
     pub recognition: RecognitionCalibration,
+    /// Image/face quality policy bound to detector and landmark contracts.
+    pub quality: QualityCalibration,
     /// Exact multi-modal passive PAD thresholds.
     pub passive_pad: PassivePadCalibration,
     /// Randomized active-liveness bounds.
     pub active_liveness: ActiveLivenessCalibration,
     /// Multi-observation enrollment bounds.
     pub enrollment: EnrollmentCalibration,
+}
+
+/// Quality algorithm calibration bound to exact detector and landmark contracts.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityCalibration {
+    /// Full compatibility digest of the admitted face detector manifest.
+    pub detector_compatibility_sha256: String,
+    /// Full compatibility digest of the admitted landmark manifest.
+    pub landmarks_compatibility_sha256: String,
+    /// Resource-bounded image and geometry quality policy.
+    pub policy: QualityConfig,
+    /// Camera, lighting, pose, occlusion, and operating-threshold evaluation report.
+    pub evidence: ReviewedEvidence,
 }
 
 /// Recognition policy bound to one embedding model and measured operating point.
@@ -556,6 +573,15 @@ fn validate_calibration(config: &CalibrationConfig) -> Result<(), ProductionConf
         );
     }
     validate_evidence_config(&config.recognition.evidence)?;
+    if !valid_digest(&config.quality.detector_compatibility_sha256)
+        || !valid_digest(&config.quality.landmarks_compatibility_sha256)
+    {
+        return invalid("quality calibration model compatibility digests are invalid");
+    }
+    config.quality.policy.validate().map_err(|error| {
+        ProductionConfigError::Invalid(format!("invalid quality calibration: {error}"))
+    })?;
+    validate_evidence_config(&config.quality.evidence)?;
     let pad = &config.passive_pad;
     if !valid_digest(&pad.infrared_compatibility_sha256)
         || !valid_digest(&pad.visible_compatibility_sha256)
@@ -687,6 +713,8 @@ fn inspect_calibration(
     };
     let calibration = &config.calibration;
     if expected(ModelRole::FaceEmbedding)? != calibration.recognition.embedding_compatibility_sha256
+        || expected(ModelRole::FaceDetector)? != calibration.quality.detector_compatibility_sha256
+        || expected(ModelRole::FaceLandmarks)? != calibration.quality.landmarks_compatibility_sha256
         || expected(ModelRole::FaceLandmarks)?
             != calibration.active_liveness.landmarks_compatibility_sha256
         || expected(ModelRole::PassiveLivenessInfrared)?
@@ -700,6 +728,7 @@ fn inspect_calibration(
     }
     for evidence in [
         &calibration.recognition.evidence,
+        &calibration.quality.evidence,
         &calibration.passive_pad.evidence,
         &calibration.active_liveness.evidence,
         &calibration.enrollment.evidence,
@@ -937,6 +966,12 @@ mod tests {
                 },
                 evidence: evidence("recognition.json"),
             },
+            quality: QualityCalibration {
+                detector_compatibility_sha256: digest('1'),
+                landmarks_compatibility_sha256: digest('f'),
+                policy: QualityConfig::engineering_baseline(),
+                evidence: evidence("quality.json"),
+            },
             passive_pad: PassivePadCalibration {
                 infrared_compatibility_sha256: digest('c'),
                 minimum_infrared_probability: 0.8,
@@ -956,6 +991,9 @@ mod tests {
                     closed_eye_threshold: 0.3,
                     neutral_yaw_degrees: 8.0,
                     turn_yaw_degrees: 20.0,
+                    action_consecutive_observations: 3,
+                    minimum_action_duration_micros: 100_000,
+                    recovery_consecutive_observations: 3,
                 },
                 evidence: evidence("active.json"),
             },

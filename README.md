@@ -33,7 +33,8 @@ See [architecture](docs/architecture.md), [threat model](docs/threat-model.md),
 [template storage](docs/storage.md), [camera capture](docs/capture.md),
 [active liveness](docs/liveness.md), [enrollment](docs/enrollment.md), and
 [presence integration](docs/presence.md), [PAM boundary](docs/pam.md), and
-[management contract](docs/management.md), [deployment artifacts](docs/deployment.md), and
+[management contract](docs/management.md), [KDE experience](docs/kde-ui.md),
+[deployment artifacts](docs/deployment.md), and
 [production readiness](docs/production-readiness.md), and [research](docs/research.md).
 
 ## Development

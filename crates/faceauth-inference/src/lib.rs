@@ -10,7 +10,8 @@ use std::{
 };
 
 use faceauth_model::{
-    ColorSpace, InputContract, ModelManifest, ModelRole, OutputSemantic, ResizeFilter,
+    ColorSpace, InputContract, MAX_FACE_DETECTION_CANDIDATES, MAX_FACE_LANDMARKS,
+    MIN_FACE_LANDMARKS, ModelManifest, ModelRole, OutputSemantic, ResizeFilter,
     TensorElementType as ManifestElementType, TensorLayout,
 };
 use ort::{
@@ -18,7 +19,7 @@ use ort::{
     value::{TensorElementType, TensorRef, ValueType},
 };
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Default maximum admitted ONNX artifact size.
 pub const DEFAULT_MAX_MODEL_BYTES: u64 = 512 * 1024 * 1024;
@@ -165,6 +166,208 @@ pub struct OutputTensor {
     name: String,
     dimensions: Vec<u32>,
     values: Zeroizing<Vec<f32>>,
+}
+
+/// Face bounds in normalized image coordinates.
+///
+/// The coordinate order is fixed by the manifest contract as `left, top, right, bottom` and all
+/// values are in `0..=1`. The right and bottom edges must be strictly greater than their opposite
+/// edges for an admitted detection.
+#[derive(Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct NormalizedFaceBox {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl NormalizedFaceBox {
+    /// Normalized left edge.
+    #[must_use]
+    pub const fn left(&self) -> f32 {
+        self.left
+    }
+
+    /// Normalized top edge.
+    #[must_use]
+    pub const fn top(&self) -> f32 {
+        self.top
+    }
+
+    /// Normalized right edge.
+    #[must_use]
+    pub const fn right(&self) -> f32 {
+        self.right
+    }
+
+    /// Normalized bottom edge.
+    #[must_use]
+    pub const fn bottom(&self) -> f32 {
+        self.bottom
+    }
+}
+
+/// One confidence-filtered detector result.
+#[derive(Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct FaceDetection {
+    bounds: NormalizedFaceBox,
+    confidence: f32,
+}
+
+impl FaceDetection {
+    /// Validated normalized face bounds.
+    #[must_use]
+    pub const fn bounds(&self) -> &NormalizedFaceBox {
+        &self.bounds
+    }
+
+    /// Finite detector confidence in `0..=1`.
+    #[must_use]
+    pub const fn confidence(&self) -> f32 {
+        self.confidence
+    }
+}
+
+/// Bounded detector results tied to the complete model and preprocessing contract.
+///
+/// This type contains derived geometry only. It deliberately does not retain an input image or a
+/// raw output tensor and zeroizes the derived values when dropped.
+#[derive(PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct FaceDetections {
+    compatibility_sha256: String,
+    faces: Vec<FaceDetection>,
+}
+
+impl FaceDetections {
+    /// Complete model and preprocessing compatibility digest.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
+    /// Confidence-filtered faces in stable detector-candidate order.
+    #[must_use]
+    pub fn faces(&self) -> &[FaceDetection] {
+        &self.faces
+    }
+
+    /// Apply explicit confidence-ordered non-maximum suppression to decoded detector boxes.
+    ///
+    /// This stage is intentionally separate from output extraction: its `IoU` threshold and output
+    /// ceiling are calibration inputs that must be reviewed with the exact detector contract. The
+    /// ceiling fails closed instead of truncating distinct faces, because truncation could hide a
+    /// second person from the single-face policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::InvalidDetectionPostprocessConfig`] for an invalid `IoU` threshold
+    /// or face ceiling, or [`InferenceError::FaceDetectionLimitExceeded`] when more distinct faces
+    /// survive suppression than the configured ceiling.
+    pub fn suppress_overlaps(
+        &self,
+        maximum_iou: f32,
+        maximum_faces: usize,
+    ) -> Result<Self, InferenceError> {
+        if !maximum_iou.is_finite()
+            || !(0.0..=1.0).contains(&maximum_iou)
+            || !(1..=64).contains(&maximum_faces)
+        {
+            return Err(InferenceError::InvalidDetectionPostprocessConfig);
+        }
+        let mut candidates = (0..self.faces.len()).collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            self.faces[*right]
+                .confidence
+                .total_cmp(&self.faces[*left].confidence)
+                .then_with(|| left.cmp(right))
+        });
+        let mut faces: Vec<FaceDetection> = Vec::with_capacity(self.faces.len().min(maximum_faces));
+        for index in candidates {
+            let candidate = &self.faces[index];
+            if faces.iter().any(|retained| {
+                intersection_over_union(&candidate.bounds, &retained.bounds) > maximum_iou
+            }) {
+                continue;
+            }
+            if faces.len() == maximum_faces {
+                return Err(InferenceError::FaceDetectionLimitExceeded {
+                    count: faces.len() + 1,
+                    maximum: maximum_faces,
+                });
+            }
+            faces.push(candidate.clone());
+        }
+        Ok(Self { compatibility_sha256: self.compatibility_sha256.clone(), faces })
+    }
+
+    /// Require exactly one admitted face before alignment or biometric inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::NoFaceDetected`] for no admitted face or
+    /// [`InferenceError::MultipleFacesDetected`] when more than one face is present.
+    pub fn require_single_face(&self) -> Result<&FaceDetection, InferenceError> {
+        match self.faces.as_slice() {
+            [face] => Ok(face),
+            [] => Err(InferenceError::NoFaceDetected),
+            faces => Err(InferenceError::MultipleFacesDetected { count: faces.len() }),
+        }
+    }
+}
+
+fn intersection_over_union(left: &NormalizedFaceBox, right: &NormalizedFaceBox) -> f32 {
+    let intersection_width = (left.right.min(right.right) - left.left.max(right.left)).max(0.0);
+    let intersection_height = (left.bottom.min(right.bottom) - left.top.max(right.top)).max(0.0);
+    let intersection = intersection_width * intersection_height;
+    let left_area = (left.right - left.left) * (left.bottom - left.top);
+    let right_area = (right.right - right.left) * (right.bottom - right.top);
+    let union = left_area + right_area - intersection;
+    if union > 0.0 { intersection / union } else { 0.0 }
+}
+
+/// One normalized facial landmark point in a single face crop.
+#[derive(Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct NormalizedLandmark {
+    x: f32,
+    y: f32,
+}
+
+impl NormalizedLandmark {
+    /// Normalized horizontal coordinate in `0..=1`.
+    #[must_use]
+    pub const fn x(&self) -> f32 {
+        self.x
+    }
+
+    /// Normalized vertical coordinate in `0..=1`.
+    #[must_use]
+    pub const fn y(&self) -> f32 {
+        self.y
+    }
+}
+
+/// Fixed-topology landmarks for one face crop, bound to a reviewed model contract.
+///
+/// Point ordering is model-specific and therefore covered by the compatibility digest. Callers
+/// must only apply geometry calibrated for that exact digest.
+#[derive(PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct FacialLandmarks {
+    compatibility_sha256: String,
+    points: Vec<NormalizedLandmark>,
+}
+
+impl FacialLandmarks {
+    /// Complete model and preprocessing compatibility digest.
+    #[must_use]
+    pub fn compatibility_sha256(&self) -> &str {
+        &self.compatibility_sha256
+    }
+
+    /// Validated points in the exact model-defined topology order.
+    #[must_use]
+    pub fn points(&self) -> &[NormalizedLandmark] {
+        &self.points
+    }
 }
 
 /// L2-normalized face embedding bound to one complete model compatibility contract.
@@ -465,6 +668,42 @@ impl OnnxSession {
         Ok(copied)
     }
 
+    /// Convert fixed detector box and score outputs into bounded normalized detections.
+    ///
+    /// The threshold is an explicitly calibrated property of the exact compatibility contract.
+    /// Padded candidates below the threshold are not retained, but every raw coordinate and score
+    /// must still be finite and normalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] when the loaded role, threshold, output identity, shape,
+    /// coordinates, scores, or admitted box geometry is invalid.
+    pub fn extract_face_detections(
+        &self,
+        outputs: &[OutputTensor],
+        minimum_confidence: f32,
+    ) -> Result<FaceDetections, InferenceError> {
+        extract_face_detection_outputs(
+            &self.manifest,
+            &self.compatibility_sha256,
+            outputs,
+            minimum_confidence,
+        )
+    }
+
+    /// Convert a fixed single-face landmark output into normalized, contract-bound points.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] when the loaded role, output identity, shape, point count, or
+    /// normalized coordinates are invalid.
+    pub fn extract_face_landmarks(
+        &self,
+        outputs: &[OutputTensor],
+    ) -> Result<FacialLandmarks, InferenceError> {
+        extract_face_landmark_output(&self.manifest, &self.compatibility_sha256, outputs)
+    }
+
     /// Convert the semantic embedding output into a normalized, compatibility-bound template.
     ///
     /// # Errors
@@ -490,6 +729,116 @@ impl OnnxSession {
     ) -> Result<PassiveLivenessScore, InferenceError> {
         extract_passive_liveness_output(&self.manifest, &self.compatibility_sha256, outputs)
     }
+}
+
+fn extract_face_detection_outputs(
+    manifest: &ModelManifest,
+    compatibility_sha256: &str,
+    outputs: &[OutputTensor],
+    minimum_confidence: f32,
+) -> Result<FaceDetections, InferenceError> {
+    if manifest.role != ModelRole::FaceDetector {
+        return Err(InferenceError::ModelRoleMismatch);
+    }
+    if !minimum_confidence.is_finite() || !(0.0..=1.0).contains(&minimum_confidence) {
+        return Err(InferenceError::InvalidDetectionThreshold);
+    }
+    if !valid_compatibility_sha256(compatibility_sha256) || outputs.len() != 2 {
+        return Err(InferenceError::FaceDetectionOutputInvalid);
+    }
+    let boxes_contract = semantic_output(manifest, OutputSemantic::FaceDetectionBoxes)
+        .map_err(|_| InferenceError::FaceDetectionOutputInvalid)?;
+    let scores_contract = semantic_output(manifest, OutputSemantic::FaceDetectionScores)
+        .map_err(|_| InferenceError::FaceDetectionOutputInvalid)?;
+    let [1, candidate_count, 4] = boxes_contract.dimensions.as_slice() else {
+        return Err(InferenceError::FaceDetectionOutputInvalid);
+    };
+    let [1, score_count] = scores_contract.dimensions.as_slice() else {
+        return Err(InferenceError::FaceDetectionOutputInvalid);
+    };
+    if candidate_count != score_count {
+        return Err(InferenceError::FaceDetectionOutputInvalid);
+    }
+    if !(1..=MAX_FACE_DETECTION_CANDIDATES).contains(candidate_count) {
+        return Err(InferenceError::FaceDetectionOutputInvalid);
+    }
+    let boxes = exact_output(outputs, &boxes_contract.name, &boxes_contract.dimensions)
+        .map_err(|_| InferenceError::FaceDetectionOutputInvalid)?;
+    let scores = exact_output(outputs, &scores_contract.name, &scores_contract.dimensions)
+        .map_err(|_| InferenceError::FaceDetectionOutputInvalid)?;
+    let count = usize::try_from(*candidate_count)
+        .map_err(|_| InferenceError::FaceDetectionOutputInvalid)?;
+    if boxes.values.len() != count.saturating_mul(4) || scores.values.len() != count {
+        return Err(InferenceError::FaceDetectionOutputInvalid);
+    }
+
+    let mut faces = Vec::with_capacity(count);
+    for (coordinates, confidence) in boxes.values.chunks_exact(4).zip(scores.values.iter()) {
+        if !confidence.is_finite() || !(0.0..=1.0).contains(confidence) {
+            return Err(InferenceError::FaceDetectionOutputInvalid);
+        }
+        let [left, top, right, bottom] = coordinates else {
+            return Err(InferenceError::FaceDetectionOutputInvalid);
+        };
+        if coordinates.iter().any(|value| !value.is_finite() || !(0.0..=1.0).contains(value)) {
+            return Err(InferenceError::FaceDetectionOutputInvalid);
+        }
+        if *confidence >= minimum_confidence {
+            if left >= right || top >= bottom {
+                return Err(InferenceError::FaceDetectionOutputInvalid);
+            }
+            faces.push(FaceDetection {
+                bounds: NormalizedFaceBox {
+                    left: *left,
+                    top: *top,
+                    right: *right,
+                    bottom: *bottom,
+                },
+                confidence: *confidence,
+            });
+        }
+    }
+    Ok(FaceDetections { compatibility_sha256: compatibility_sha256.to_owned(), faces })
+}
+
+fn extract_face_landmark_output(
+    manifest: &ModelManifest,
+    compatibility_sha256: &str,
+    outputs: &[OutputTensor],
+) -> Result<FacialLandmarks, InferenceError> {
+    if manifest.role != ModelRole::FaceLandmarks {
+        return Err(InferenceError::ModelRoleMismatch);
+    }
+    if !valid_compatibility_sha256(compatibility_sha256) || outputs.len() != 1 {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    let contract = semantic_output(manifest, OutputSemantic::FaceLandmarks)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let [1, landmark_count, 2] = contract.dimensions.as_slice() else {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    };
+    if !(MIN_FACE_LANDMARKS..=MAX_FACE_LANDMARKS).contains(landmark_count) {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    let output = exact_output(outputs, &contract.name, &contract.dimensions)
+        .map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    let count =
+        usize::try_from(*landmark_count).map_err(|_| InferenceError::FaceLandmarkOutputInvalid)?;
+    if output.values.len() != count.saturating_mul(2) {
+        return Err(InferenceError::FaceLandmarkOutputInvalid);
+    }
+    let mut points = Vec::with_capacity(count);
+    for coordinates in output.values.chunks_exact(2) {
+        let [x, y] = coordinates else {
+            return Err(InferenceError::FaceLandmarkOutputInvalid);
+        };
+        if !x.is_finite() || !y.is_finite() || !(0.0..=1.0).contains(x) || !(0.0..=1.0).contains(y)
+        {
+            return Err(InferenceError::FaceLandmarkOutputInvalid);
+        }
+        points.push(NormalizedLandmark { x: *x, y: *y });
+    }
+    Ok(FacialLandmarks { compatibility_sha256: compatibility_sha256.to_owned(), points })
 }
 
 fn extract_embedding_output(
@@ -519,6 +868,12 @@ fn extract_embedding_output(
         return Err(InferenceError::EmbeddingInvalid);
     }
     Ok(FaceEmbedding { compatibility_sha256: compatibility_sha256.to_owned(), values })
+}
+
+fn valid_compatibility_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !value.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
 fn extract_passive_liveness_output(
@@ -975,6 +1330,35 @@ pub enum InferenceError {
     /// A role-specific adapter was requested from a different model role.
     #[error("model role does not match the requested biometric adapter")]
     ModelRoleMismatch,
+    /// Detector boxes or scores violate their fixed normalized single-batch contract.
+    #[error("face detector output is invalid")]
+    FaceDetectionOutputInvalid,
+    /// The detector confidence threshold is non-finite or outside 0..=1.
+    #[error("face detector confidence threshold must be finite and in 0..=1")]
+    InvalidDetectionThreshold,
+    /// Detector overlap suppression configuration is non-finite or outside hard bounds.
+    #[error("face detector postprocessing configuration is invalid")]
+    InvalidDetectionPostprocessConfig,
+    /// More distinct faces survived overlap suppression than the configured safe ceiling.
+    #[error("face detector produced {count} distinct faces; maximum is {maximum}")]
+    FaceDetectionLimitExceeded {
+        /// Minimum number of distinct faces observed before failing closed.
+        count: usize,
+        /// Configured maximum retained faces.
+        maximum: usize,
+    },
+    /// No face met the calibrated detector confidence threshold.
+    #[error("no face detected")]
+    NoFaceDetected,
+    /// More than one face met the calibrated detector confidence threshold.
+    #[error("multiple faces detected: {count}")]
+    MultipleFacesDetected {
+        /// Number of admitted faces.
+        count: usize,
+    },
+    /// Landmark points violate their fixed normalized single-face contract.
+    #[error("face landmark output is invalid")]
+    FaceLandmarkOutputInvalid,
     /// Face embedding is empty, excessive, degenerate, or numerically invalid.
     #[error("face embedding output is invalid")]
     EmbeddingInvalid,
@@ -1051,6 +1435,34 @@ mod tests {
                 semantic,
             }],
         }
+    }
+
+    fn detector_manifest(candidate_count: u32) -> ModelManifest {
+        let mut manifest = model_manifest(
+            ModelRole::FaceDetector,
+            OutputSemantic::FaceDetectionBoxes,
+            vec![1, candidate_count, 4],
+        );
+        manifest.outputs[0].name = "boxes".to_owned();
+        manifest.outputs.push(OutputContract {
+            name: "scores".to_owned(),
+            dimensions: vec![1, candidate_count],
+            element_type: ManifestElementType::Float32,
+            semantic: OutputSemantic::FaceDetectionScores,
+        });
+        manifest
+    }
+
+    fn landmark_manifest(landmark_count: u32) -> ModelManifest {
+        model_manifest(
+            ModelRole::FaceLandmarks,
+            OutputSemantic::FaceLandmarks,
+            vec![1, landmark_count, 2],
+        )
+    }
+
+    fn output(name: &str, dimensions: Vec<u32>, values: Vec<f32>) -> OutputTensor {
+        OutputTensor { name: name.to_owned(), dimensions, values: Zeroizing::new(values) }
     }
 
     #[test]
@@ -1234,6 +1646,186 @@ mod tests {
             Err(InferenceError::SourceImageInvalid)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn detector_adapter_filters_and_returns_normalized_strong_types() -> Result<(), InferenceError>
+    {
+        let compatibility = "ab".repeat(32);
+        let manifest = detector_manifest(3);
+        let outputs = vec![
+            output(
+                "boxes",
+                vec![1, 3, 4],
+                vec![0.1, 0.2, 0.8, 0.9, 0.0, 0.0, 0.0, 0.0, 0.4, 0.3, 0.7, 0.8],
+            ),
+            output("scores", vec![1, 3], vec![0.95, 0.0, 0.2]),
+        ];
+        let detections = extract_face_detection_outputs(&manifest, &compatibility, &outputs, 0.8)?;
+        assert_eq!(detections.compatibility_sha256(), compatibility);
+        assert_eq!(detections.faces().len(), 1);
+        let face = detections.require_single_face()?;
+        assert!((face.confidence() - 0.95).abs() < f32::EPSILON);
+        assert!((face.bounds().left() - 0.1).abs() < f32::EPSILON);
+        assert!((face.bounds().top() - 0.2).abs() < f32::EPSILON);
+        assert!((face.bounds().right() - 0.8).abs() < f32::EPSILON);
+        assert!((face.bounds().bottom() - 0.9).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn detector_adapter_rejects_unsafe_values_and_geometry() {
+        let compatibility = "ab".repeat(32);
+        let manifest = detector_manifest(1);
+        let scores = output("scores", vec![1, 1], vec![0.9]);
+        for boxes in [
+            vec![f32::NAN, 0.1, 0.8, 0.9],
+            vec![-0.1, 0.1, 0.8, 0.9],
+            vec![0.8, 0.1, 0.2, 0.9],
+            vec![0.1, 0.9, 0.8, 0.2],
+        ] {
+            let outputs = vec![
+                output("boxes", vec![1, 1, 4], boxes),
+                output("scores", scores.dimensions.clone(), scores.values.to_vec()),
+            ];
+            assert!(matches!(
+                extract_face_detection_outputs(&manifest, &compatibility, &outputs, 0.8),
+                Err(InferenceError::FaceDetectionOutputInvalid)
+            ));
+        }
+
+        let invalid_score = vec![
+            output("boxes", vec![1, 1, 4], vec![0.1, 0.1, 0.8, 0.9]),
+            output("scores", vec![1, 1], vec![1.1]),
+        ];
+        assert!(matches!(
+            extract_face_detection_outputs(&manifest, &compatibility, &invalid_score, 0.8),
+            Err(InferenceError::FaceDetectionOutputInvalid)
+        ));
+    }
+
+    #[test]
+    fn detector_adapter_checks_threshold_shape_and_single_face_policy() -> Result<(), InferenceError>
+    {
+        let compatibility = "cd".repeat(32);
+        let manifest = detector_manifest(2);
+        let outputs = vec![
+            output("boxes", vec![1, 2, 4], vec![0.1, 0.1, 0.4, 0.5, 0.5, 0.2, 0.9, 0.8]),
+            output("scores", vec![1, 2], vec![0.9, 0.85]),
+        ];
+        assert!(matches!(
+            extract_face_detection_outputs(&manifest, &compatibility, &outputs, f32::NAN),
+            Err(InferenceError::InvalidDetectionThreshold)
+        ));
+        assert!(matches!(
+            extract_face_detection_outputs(&manifest, &compatibility, &outputs, 1.1),
+            Err(InferenceError::InvalidDetectionThreshold)
+        ));
+
+        let multiple = extract_face_detection_outputs(&manifest, &compatibility, &outputs, 0.8)?;
+        assert!(matches!(
+            multiple.require_single_face(),
+            Err(InferenceError::MultipleFacesDetected { count: 2 })
+        ));
+        let none = extract_face_detection_outputs(&manifest, &compatibility, &outputs, 1.0)?;
+        assert!(matches!(none.require_single_face(), Err(InferenceError::NoFaceDetected)));
+
+        let malformed = vec![
+            output("boxes", vec![1, 1, 4], vec![0.1, 0.1, 0.4, 0.5]),
+            output("scores", vec![1, 2], vec![0.9, 0.85]),
+        ];
+        assert!(matches!(
+            extract_face_detection_outputs(&manifest, &compatibility, &malformed, 0.8),
+            Err(InferenceError::FaceDetectionOutputInvalid)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn detector_overlap_suppression_is_explicit_stable_and_never_truncates_distinct_faces()
+    -> Result<(), InferenceError> {
+        let compatibility = "cd".repeat(32);
+        let manifest = detector_manifest(3);
+        let outputs = vec![
+            output(
+                "boxes",
+                vec![1, 3, 4],
+                vec![0.10, 0.10, 0.50, 0.60, 0.12, 0.12, 0.49, 0.59, 0.60, 0.20, 0.90, 0.70],
+            ),
+            output("scores", vec![1, 3], vec![0.95, 0.90, 0.85]),
+        ];
+        let decoded = extract_face_detection_outputs(&manifest, &compatibility, &outputs, 0.8)?;
+        let suppressed = decoded.suppress_overlaps(0.5, 4)?;
+        assert_eq!(suppressed.faces().len(), 2);
+        assert!((suppressed.faces()[0].confidence() - 0.95).abs() < f32::EPSILON);
+        assert!((suppressed.faces()[1].confidence() - 0.85).abs() < f32::EPSILON);
+        assert!(matches!(
+            suppressed.require_single_face(),
+            Err(InferenceError::MultipleFacesDetected { count: 2 })
+        ));
+        assert!(matches!(
+            decoded.suppress_overlaps(0.5, 1),
+            Err(InferenceError::FaceDetectionLimitExceeded { count: 2, maximum: 1 })
+        ));
+        assert!(matches!(
+            decoded.suppress_overlaps(f32::NAN, 4),
+            Err(InferenceError::InvalidDetectionPostprocessConfig)
+        ));
+        assert!(matches!(
+            decoded.suppress_overlaps(0.5, 0),
+            Err(InferenceError::InvalidDetectionPostprocessConfig)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn landmark_adapter_returns_fixed_normalized_topology() -> Result<(), InferenceError> {
+        let compatibility = "ef".repeat(32);
+        let manifest = landmark_manifest(5);
+        let outputs = vec![output(
+            "output",
+            vec![1, 5, 2],
+            vec![0.2, 0.3, 0.8, 0.3, 0.5, 0.5, 0.3, 0.8, 0.7, 0.8],
+        )];
+        let landmarks = extract_face_landmark_output(&manifest, &compatibility, &outputs)?;
+        assert_eq!(landmarks.compatibility_sha256(), compatibility);
+        assert_eq!(landmarks.points().len(), 5);
+        assert!((landmarks.points()[2].x() - 0.5).abs() < f32::EPSILON);
+        assert!((landmarks.points()[2].y() - 0.5).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn landmark_adapter_rejects_range_shape_count_and_role_mismatches() {
+        let compatibility = "ef".repeat(32);
+        let manifest = landmark_manifest(5);
+        for invalid_coordinate in [f32::NAN, -0.1, 1.1] {
+            let mut values = vec![0.5; 10];
+            values[3] = invalid_coordinate;
+            let outputs = vec![output("output", vec![1, 5, 2], values)];
+            assert!(matches!(
+                extract_face_landmark_output(&manifest, &compatibility, &outputs),
+                Err(InferenceError::FaceLandmarkOutputInvalid)
+            ));
+        }
+
+        let wrong_shape = vec![output("output", vec![5, 2], vec![0.5; 10])];
+        assert!(matches!(
+            extract_face_landmark_output(&manifest, &compatibility, &wrong_shape),
+            Err(InferenceError::FaceLandmarkOutputInvalid)
+        ));
+        let too_few = landmark_manifest(4);
+        let output = vec![output("output", vec![1, 4, 2], vec![0.5; 8])];
+        assert!(matches!(
+            extract_face_landmark_output(&too_few, &compatibility, &output),
+            Err(InferenceError::FaceLandmarkOutputInvalid)
+        ));
+        let wrong_role =
+            model_manifest(ModelRole::FaceEmbedding, OutputSemantic::Embedding, vec![1, 32]);
+        assert!(matches!(
+            extract_face_landmark_output(&wrong_role, &compatibility, &[]),
+            Err(InferenceError::ModelRoleMismatch)
+        ));
     }
 
     #[test]

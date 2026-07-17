@@ -13,11 +13,13 @@ members = [
     "crates/faceauth-management-dbus",
     "crates/faceauth-model",
     "crates/faceauth-presence",
+    "crates/faceauth-quality",
     "crates/pam-faceauth",
     "crates/faceauth-protocol",
     "crates/faceauth-session",
     "crates/faceauth-storage",
     "crates/faceauth-transport",
+    "crates/faceauth-ui-model",
 ]
 resolver = "3"
 

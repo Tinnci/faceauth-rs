@@ -1,6 +1,7 @@
 # Production configuration and readiness
 
-`faceauth-daemon` uses one strict, versioned configuration for production composition. The schema
+`faceauth-daemon` uses strict production-configuration schema 2 for production composition. The
+machine-readable readiness report remains schema 1. The configuration schema
 rejects unknown fields, unsupported versions, relative security-sensitive paths, incomplete model
 roles, unbounded resources, passive-only liveness, missing visible capture, and disabled password
 fallback. It also bounds supervisor polling, service count, and graceful shutdown time. The starting
@@ -27,7 +28,8 @@ The report has stable schema version `1` and ten independent gates:
 2. unique exact IR/RGB hardware resolution;
 3. trusted ONNX Runtime installation;
 4. the complete six-role reviewed and hash-verified model suite;
-5. model-bound recognition, passive PAD, active-liveness, and enrollment calibration evidence;
+5. model-bound recognition, quality, passive PAD, active-liveness, and enrollment calibration
+   evidence;
 6. TPM-bound storage and restart/recovery evidence;
 7. executable-bound screen-unlock, login, and Polkit authorization review;
 8. stable Manager1 and PolicyKit lifecycle review;

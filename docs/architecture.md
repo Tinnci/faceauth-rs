@@ -25,23 +25,25 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
    retains only zeroizing embeddings and emits one encrypted-storage record.
 9. `faceauth-presence`: optional versioned thinkpad-hpd D-Bus hints and a generic
    capture-activity lease registry; never part of identity evidence.
-10. `faceauth-model`: bounded schema-v4 provenance, digest, preprocessing, semantic
+10. `faceauth-model`: bounded schema-v5 provenance, digest, preprocessing, semantic
    output roles, and exact tensor-contract admission.
 11. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
    whose graph I/O must exactly match an admitted manifest.
-12. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
+12. `faceauth-quality`: bounded, cancellable exposure, range, sharpness, geometry, pose,
+   visibility, and landmark-confidence assessment over borrowed face-region pixels.
+13. `faceauth-daemon`: camera ownership, inference, liveness, encrypted templates,
    audit events, and authentication transactions.
-13. `faceauth-management`: desktop-independent enrollment authorization and operation lifecycle.
-14. `faceauth-management-dbus`: thin asynchronous zbus Manager1 adapter with real system-bus
+14. `faceauth-management`: desktop-independent enrollment authorization and operation lifecycle.
+15. `faceauth-management-dbus`: thin asynchronous zbus Manager1 adapter with real system-bus
    sender-UID and PolicyKit clients plus injected template-state and root-grant boundaries; it has
    no permissive default backend. Operations are bound to unique senders and a bus owner-change
    watcher cancels abandoned enrollment work. Authenticated template-state reads use one bounded
    storage worker rather than blocking the D-Bus executor. Its service runner subscribes before
    exposure and obtains the well-known name without queuing or replacement.
-15. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
+16. `pam_faceauth`: future minimal PAM bridge. It will be tested against a
    dedicated PAM service before any system login stack is touched.
-16. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
-17. KDE KCM and lock-screen status UI: optional clients over stable APIs.
+17. `faceauth-cli`: enrollment, removal, diagnostics, dry-run, and recovery.
+18. KDE KCM and lock-screen status UI: optional clients over stable APIs.
 
 The authentication transport contract is described in [ipc.md](ipc.md). Caller
 numeric peer identity comes from Unix peer credentials, not serialized request
@@ -71,7 +73,7 @@ The runtime is selected by an explicit trusted local path and is never downloade
 by the service. Production artifacts and their containing directories must be
 root-owned and immutable to non-root users. Sessions are CPU-bound and sequential
 with fixed thread, model-size, tensor-rank, and tensor-element ceilings. The graph
-must expose exactly the input and outputs declared by its schema-v4 manifest.
+must expose exactly the input and outputs declared by its schema-v5 manifest.
 The manifest also fixes bilinear half-pixel resizing, channel order, and per-channel
 affine normalization. Tightly packed Gray8/RGB8/BGR8/YUYV sources are converted
 into zeroizing float buffers; copied outputs are shape-checked, finite-only, and
@@ -84,6 +86,17 @@ L2-normalized, and compared only when their complete manifest compatibility dige
 and dimension match. Passive-PAD adapters accept only a semantic scalar live
 probability; model-specific calibrated thresholds remain outside the generic
 runtime and have no production defaults.
+
+`faceauth-quality` converts one borrowed, tightly packed Gray8 or RGB8 view plus an admitted
+normalized face/pose summary into derived quality evidence. It scans only the rasterized face
+region and retains no image: a fixed 256-bin luma histogram provides mean exposure, clipping, and percentile
+dynamic range, while a bounded second pass computes four-neighbor Laplacian variance. Face scale,
+centering, yaw/pitch/roll, estimated unoccluded fraction, and landmark confidence are independently
+calibrated. A weighted harmonic mean is capped near the weakest component so one strong signal
+cannot conceal a severe quality failure. Dimensions, exact byte length, face bounds, finite values,
+per-deployment and absolute pixel ceilings, minimum face pixels, and cancellation are checked before
+or during bounded work. Shipped thresholds are engineering starting points and still require
+camera/model/population calibration before production admission.
 
 The daemon is the bridge between inference and encrypted storage: enrollment can
 construct a template only from a normalized `FaceEmbedding`, and authentication

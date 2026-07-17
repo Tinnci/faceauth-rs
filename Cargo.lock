@@ -675,6 +675,7 @@ dependencies = [
  "faceauth-model",
  "faceauth-presence",
  "faceauth-protocol",
+ "faceauth-quality",
  "faceauth-session",
  "faceauth-storage",
  "faceauth-transport",
@@ -776,6 +777,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "faceauth-quality"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "faceauth-session"
 version = "0.1.0"
 dependencies = [
@@ -809,6 +818,16 @@ dependencies = [
  "nix 0.31.3",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "faceauth-ui-model"
+version = "0.1.0"
+dependencies = [
+ "faceauth-management",
+ "faceauth-protocol",
+ "serde",
  "thiserror",
 ]
 

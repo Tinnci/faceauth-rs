@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 4;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 5;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -33,6 +33,15 @@ pub const MAX_TENSOR_ELEMENTS: u64 = 64 * 1024 * 1024;
 
 /// Maximum aggregate elements across all declared output tensors.
 pub const MAX_TOTAL_OUTPUT_ELEMENTS: u64 = 64 * 1024 * 1024;
+
+/// Maximum fixed detector candidates admitted by a reviewed graph.
+pub const MAX_FACE_DETECTION_CANDIDATES: u32 = 4096;
+
+/// Minimum landmarks required by the geometric alignment boundary.
+pub const MIN_FACE_LANDMARKS: u32 = 5;
+
+/// Maximum fixed landmarks admitted from one face crop.
+pub const MAX_FACE_LANDMARKS: u32 = 512;
 
 /// Role a model serves in the biometric pipeline.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -155,6 +164,12 @@ pub struct OutputContract {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputSemantic {
+    /// Normalized detector boxes in `[1, candidates, 4]` `x_min, y_min, x_max, y_max` order.
+    FaceDetectionBoxes,
+    /// Detector confidence scores in `[1, candidates]`, paired by candidate index with boxes.
+    FaceDetectionScores,
+    /// Normalized landmark points in `[1, landmarks, 2]` `x, y` order for one face crop.
+    FaceLandmarks,
     /// Face embedding vector used only by the embedding adapter.
     Embedding,
     /// Scalar probability that the observation is live, in the inclusive range 0..=1.
@@ -437,18 +452,19 @@ fn validate_output_semantics(
     role: ModelRole,
     outputs: &[OutputContract],
 ) -> Result<(), ModelError> {
-    let embedding_outputs =
-        outputs.iter().filter(|output| output.semantic == OutputSemantic::Embedding).count();
-    let live_outputs =
-        outputs.iter().filter(|output| output.semantic == OutputSemantic::LiveProbability).count();
     match role {
-        ModelRole::FaceEmbedding if embedding_outputs == 1 && live_outputs == 0 => {}
+        ModelRole::FaceDetector => validate_face_detector_outputs(outputs)?,
+        ModelRole::FaceLandmarks => validate_face_landmark_outputs(outputs)?,
+        ModelRole::FaceEmbedding
+            if semantic_count(outputs, OutputSemantic::Embedding) == 1
+                && semantic_count(outputs, OutputSemantic::LiveProbability) == 0
+                && detector_and_landmark_semantics_absent(outputs) => {}
         ModelRole::PassiveLivenessInfrared
         | ModelRole::PassiveLivenessVisible
         | ModelRole::PassiveLivenessFusion
-            if live_outputs == 1 && embedding_outputs == 0 => {}
-        ModelRole::FaceDetector | ModelRole::FaceLandmarks
-            if embedding_outputs == 0 && live_outputs == 0 => {}
+            if semantic_count(outputs, OutputSemantic::LiveProbability) == 1
+                && semantic_count(outputs, OutputSemantic::Embedding) == 0
+                && detector_and_landmark_semantics_absent(outputs) => {}
         _ => return Err(ModelError::OutputSemanticMismatch),
     }
     for output in outputs {
@@ -466,10 +482,71 @@ fn validate_output_semantics(
                     return Err(ModelError::OutputSemanticMismatch);
                 }
             }
-            OutputSemantic::Auxiliary => {}
+            OutputSemantic::FaceDetectionBoxes
+            | OutputSemantic::FaceDetectionScores
+            | OutputSemantic::FaceLandmarks
+            | OutputSemantic::Auxiliary => {}
         }
     }
     Ok(())
+}
+
+fn validate_face_detector_outputs(outputs: &[OutputContract]) -> Result<(), ModelError> {
+    if outputs.len() != 2 {
+        return Err(ModelError::OutputSemanticMismatch);
+    }
+    let boxes = unique_semantic_output(outputs, OutputSemantic::FaceDetectionBoxes)?;
+    let scores = unique_semantic_output(outputs, OutputSemantic::FaceDetectionScores)?;
+    let [1, candidate_count, 4] = boxes.dimensions.as_slice() else {
+        return Err(ModelError::OutputSemanticMismatch);
+    };
+    let [1, score_count] = scores.dimensions.as_slice() else {
+        return Err(ModelError::OutputSemanticMismatch);
+    };
+    if candidate_count != score_count
+        || !(1..=MAX_FACE_DETECTION_CANDIDATES).contains(candidate_count)
+    {
+        return Err(ModelError::OutputSemanticMismatch);
+    }
+    Ok(())
+}
+
+fn validate_face_landmark_outputs(outputs: &[OutputContract]) -> Result<(), ModelError> {
+    if outputs.len() != 1 {
+        return Err(ModelError::OutputSemanticMismatch);
+    }
+    let landmarks = unique_semantic_output(outputs, OutputSemantic::FaceLandmarks)?;
+    let [1, landmark_count, 2] = landmarks.dimensions.as_slice() else {
+        return Err(ModelError::OutputSemanticMismatch);
+    };
+    if !(MIN_FACE_LANDMARKS..=MAX_FACE_LANDMARKS).contains(landmark_count) {
+        return Err(ModelError::OutputSemanticMismatch);
+    }
+    Ok(())
+}
+
+fn unique_semantic_output(
+    outputs: &[OutputContract],
+    semantic: OutputSemantic,
+) -> Result<&OutputContract, ModelError> {
+    let mut matching = outputs.iter().filter(|output| output.semantic == semantic);
+    let output = matching.next().ok_or(ModelError::OutputSemanticMismatch)?;
+    if matching.next().is_some() { Err(ModelError::OutputSemanticMismatch) } else { Ok(output) }
+}
+
+fn semantic_count(outputs: &[OutputContract], semantic: OutputSemantic) -> usize {
+    outputs.iter().filter(|output| output.semantic == semantic).count()
+}
+
+fn detector_and_landmark_semantics_absent(outputs: &[OutputContract]) -> bool {
+    outputs.iter().all(|output| {
+        !matches!(
+            output.semantic,
+            OutputSemantic::FaceDetectionBoxes
+                | OutputSemantic::FaceDetectionScores
+                | OutputSemantic::FaceLandmarks
+        )
+    })
 }
 
 fn dimension_product(dimensions: &[u32]) -> Result<u64, ModelError> {
@@ -521,12 +598,20 @@ mod tests {
                     bias: vec![0.0; 3],
                 },
             },
-            outputs: vec![OutputContract {
-                name: "boxes".to_owned(),
-                dimensions: vec![1, 100, 4],
-                element_type: TensorElementType::Float32,
-                semantic: OutputSemantic::Auxiliary,
-            }],
+            outputs: vec![
+                OutputContract {
+                    name: "boxes".to_owned(),
+                    dimensions: vec![1, 100, 4],
+                    element_type: TensorElementType::Float32,
+                    semantic: OutputSemantic::FaceDetectionBoxes,
+                },
+                OutputContract {
+                    name: "scores".to_owned(),
+                    dimensions: vec![1, 100],
+                    element_type: TensorElementType::Float32,
+                    semantic: OutputSemantic::FaceDetectionScores,
+                },
+            ],
         }
     }
 
@@ -620,15 +705,66 @@ mod tests {
         let mut embedding = manifest();
         embedding.role = ModelRole::FaceEmbedding;
         assert!(matches!(embedding.validate(), Err(ModelError::OutputSemanticMismatch)));
-        embedding.outputs[0].semantic = OutputSemantic::Embedding;
+        embedding.outputs = vec![OutputContract {
+            name: "embedding".to_owned(),
+            dimensions: vec![1, 128],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::Embedding,
+        }];
         embedding.outputs[0].dimensions = vec![1, 128];
         assert!(embedding.validate().is_ok());
 
         let mut passive = manifest();
         passive.role = ModelRole::PassiveLivenessInfrared;
-        passive.outputs[0].semantic = OutputSemantic::LiveProbability;
-        passive.outputs[0].dimensions = vec![1];
+        passive.outputs = vec![OutputContract {
+            name: "live".to_owned(),
+            dimensions: vec![1],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::LiveProbability,
+        }];
         assert!(passive.validate().is_ok());
+    }
+
+    #[test]
+    fn detector_requires_exact_paired_single_batch_outputs() {
+        let mut detector = manifest();
+        assert!(detector.validate().is_ok());
+
+        detector.outputs[1].dimensions = vec![1, 99];
+        assert!(matches!(detector.validate(), Err(ModelError::OutputSemanticMismatch)));
+
+        detector = manifest();
+        detector.outputs[0].dimensions = vec![2, 100, 4];
+        assert!(matches!(detector.validate(), Err(ModelError::OutputSemanticMismatch)));
+
+        detector = manifest();
+        detector.outputs[1].semantic = OutputSemantic::Auxiliary;
+        assert!(matches!(detector.validate(), Err(ModelError::OutputSemanticMismatch)));
+
+        detector = manifest();
+        detector.outputs[0].dimensions = vec![1, MAX_FACE_DETECTION_CANDIDATES + 1, 4];
+        detector.outputs[1].dimensions = vec![1, MAX_FACE_DETECTION_CANDIDATES + 1];
+        assert!(matches!(detector.validate(), Err(ModelError::OutputSemanticMismatch)));
+    }
+
+    #[test]
+    fn landmark_role_requires_one_bounded_xy_tensor() {
+        let mut landmarks = manifest();
+        landmarks.role = ModelRole::FaceLandmarks;
+        landmarks.outputs = vec![OutputContract {
+            name: "landmarks".to_owned(),
+            dimensions: vec![1, 5, 2],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::FaceLandmarks,
+        }];
+        assert!(landmarks.validate().is_ok());
+
+        landmarks.outputs[0].dimensions = vec![1, 4, 2];
+        assert!(matches!(landmarks.validate(), Err(ModelError::OutputSemanticMismatch)));
+        landmarks.outputs[0].dimensions = vec![1, 5, 3];
+        assert!(matches!(landmarks.validate(), Err(ModelError::OutputSemanticMismatch)));
+        landmarks.outputs[0].dimensions = vec![5, 2];
+        assert!(matches!(landmarks.validate(), Err(ModelError::OutputSemanticMismatch)));
     }
 
     #[test]

@@ -53,6 +53,12 @@ pub struct ChallengeConfig {
     pub neutral_yaw_degrees: f32,
     /// Minimum absolute yaw in degrees required for a turn.
     pub turn_yaw_degrees: f32,
+    /// Consecutive qualifying observations required before accepting the requested action.
+    pub action_consecutive_observations: u8,
+    /// Minimum monotonic time the qualifying action must remain continuously observed.
+    pub minimum_action_duration_micros: u64,
+    /// Consecutive neutral observations required before accepting recovery.
+    pub recovery_consecutive_observations: u8,
 }
 
 impl ChallengeConfig {
@@ -76,6 +82,14 @@ impl ChallengeConfig {
         if self.max_pair_skew_micros == 0
             || !(1_000_000..=30_000_000).contains(&self.duration_micros)
             || !(3..=300).contains(&self.max_observations)
+            || !(2..=15).contains(&self.action_consecutive_observations)
+            || !(2..=15).contains(&self.recovery_consecutive_observations)
+            || !(20_000..=2_000_000).contains(&self.minimum_action_duration_micros)
+            || self.minimum_action_duration_micros >= self.duration_micros
+            || u16::from(self.action_consecutive_observations)
+                + u16::from(self.recovery_consecutive_observations)
+                + 1
+                > self.max_observations
             || !scores_valid
             || !yaw_valid
         {
@@ -161,6 +175,9 @@ pub struct ChallengeSession {
     last_timestamp_micros: Option<u64>,
     last_sequences: Option<(u32, u32)>,
     phase: Phase,
+    action_streak: u8,
+    action_streak_started_at_micros: Option<u64>,
+    recovery_streak: u8,
 }
 
 impl ChallengeSession {
@@ -194,6 +211,9 @@ impl ChallengeSession {
             last_timestamp_micros: None,
             last_sequences: None,
             phase: Phase::Baseline,
+            action_streak: 0,
+            action_streak_started_at_micros: None,
+            recovery_streak: 0,
         })
     }
 
@@ -268,11 +288,38 @@ impl ChallengeSession {
             && observation.yaw_degrees.abs() <= self.config.neutral_yaw_degrees;
         match self.phase {
             Phase::Baseline if neutral => self.phase = Phase::Action,
-            Phase::Action if self.action_observed(observation) => self.phase = Phase::Recovery,
-            Phase::Recovery if neutral => self.phase = Phase::Passed,
-            Phase::Baseline | Phase::Action | Phase::Recovery | Phase::Passed => {}
+            Phase::Action => self.observe_action(observation, timestamp),
+            Phase::Recovery => self.observe_recovery(neutral),
+            Phase::Baseline | Phase::Passed => {}
         }
         Ok(self.progress())
+    }
+
+    fn observe_action(&mut self, observation: ChallengeObservation, timestamp: u64) {
+        if !self.action_observed(observation) {
+            self.action_streak = 0;
+            self.action_streak_started_at_micros = None;
+            return;
+        }
+        let started = *self.action_streak_started_at_micros.get_or_insert(timestamp);
+        self.action_streak = self.action_streak.saturating_add(1);
+        if self.action_streak >= self.config.action_consecutive_observations
+            && timestamp.saturating_sub(started) >= self.config.minimum_action_duration_micros
+        {
+            self.phase = Phase::Recovery;
+            self.recovery_streak = 0;
+        }
+    }
+
+    const fn observe_recovery(&mut self, neutral: bool) {
+        if !neutral {
+            self.recovery_streak = 0;
+            return;
+        }
+        self.recovery_streak = self.recovery_streak.saturating_add(1);
+        if self.recovery_streak >= self.config.recovery_consecutive_observations {
+            self.phase = Phase::Passed;
+        }
     }
 
     fn action_observed(&self, observation: ChallengeObservation) -> bool {
@@ -347,6 +394,9 @@ mod tests {
             closed_eye_threshold: 0.25,
             neutral_yaw_degrees: 10.0,
             turn_yaw_degrees: 20.0,
+            action_consecutive_observations: 2,
+            minimum_action_duration_micros: 50_000,
+            recovery_consecutive_observations: 2,
         }
     }
 
@@ -375,10 +425,18 @@ mod tests {
         );
         assert_eq!(
             session.observe(observation(1_200_000, 2, 0.1, 0.0))?,
+            ChallengeProgress::ActionRequired(ChallengeAction::Blink)
+        );
+        assert_eq!(
+            session.observe(observation(1_300_000, 3, 0.1, 0.0))?,
             ChallengeProgress::RecoveryRequired
         );
         assert_eq!(
-            session.observe(observation(1_300_000, 3, 0.8, 0.0))?,
+            session.observe(observation(1_400_000, 4, 0.8, 0.0))?,
+            ChallengeProgress::RecoveryRequired
+        );
+        assert_eq!(
+            session.observe(observation(1_500_000, 5, 0.8, 0.0))?,
             ChallengeProgress::Passed
         );
         Ok(())
@@ -413,7 +471,14 @@ mod tests {
             Err(ChallengeError::Cancelled)
         ));
         assert_eq!(session.progress(), ChallengeProgress::ActionRequired(ChallengeAction::Blink));
-        assert_eq!(session.observe(blink)?, ChallengeProgress::RecoveryRequired);
+        assert_eq!(
+            session.observe(blink)?,
+            ChallengeProgress::ActionRequired(ChallengeAction::Blink)
+        );
+        assert_eq!(
+            session.observe(observation(1_300_000, 3, 0.1, 0.0))?,
+            ChallengeProgress::RecoveryRequired
+        );
         Ok(())
     }
 
@@ -429,7 +494,53 @@ mod tests {
         );
         assert_eq!(
             session.observe(observation(1_300_000, 3, 0.8, -30.0))?,
+            ChallengeProgress::ActionRequired(ChallengeAction::TurnLeft)
+        );
+        assert_eq!(
+            session.observe(observation(1_400_000, 4, 0.8, -30.0))?,
             ChallengeProgress::RecoveryRequired
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn right_turn_requires_a_continuous_timed_streak() -> Result<(), ChallengeError> {
+        let mut session =
+            ChallengeSession::with_action(config(), 1_000_000, ChallengeAction::TurnRight)?;
+        let _ = session.observe(observation(1_100_000, 1, 0.8, 0.0))?;
+        assert_eq!(
+            session.observe(observation(1_200_000, 2, 0.8, 30.0))?,
+            ChallengeProgress::ActionRequired(ChallengeAction::TurnRight)
+        );
+        assert_eq!(
+            session.observe(observation(1_210_000, 3, 0.8, 30.0))?,
+            ChallengeProgress::ActionRequired(ChallengeAction::TurnRight)
+        );
+        assert_eq!(
+            session.observe(observation(1_260_000, 4, 0.8, 30.0))?,
+            ChallengeProgress::RecoveryRequired
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn jitter_resets_action_and_recovery_streaks() -> Result<(), ChallengeError> {
+        let mut session =
+            ChallengeSession::with_action(config(), 1_000_000, ChallengeAction::Blink)?;
+        let _ = session.observe(observation(1_100_000, 1, 0.8, 0.0))?;
+        let _ = session.observe(observation(1_200_000, 2, 0.1, 0.0))?;
+        let _ = session.observe(observation(1_300_000, 3, 0.5, 0.0))?;
+        let _ = session.observe(observation(1_400_000, 4, 0.1, 0.0))?;
+        assert_eq!(
+            session.observe(observation(1_500_000, 5, 0.1, 0.0))?,
+            ChallengeProgress::RecoveryRequired
+        );
+        let _ = session.observe(observation(1_600_000, 6, 0.8, 0.0))?;
+        let _ = session.observe(observation(1_700_000, 7, 0.8, 15.0))?;
+        let _ = session.observe(observation(1_800_000, 8, 0.8, 0.0))?;
+        assert_eq!(
+            session.observe(observation(1_900_000, 9, 0.8, 0.0))?,
+            ChallengeProgress::Passed
         );
         Ok(())
     }
@@ -471,7 +582,7 @@ mod tests {
 
     #[test]
     fn deadline_and_observation_budget_are_bounded() -> Result<(), ChallengeError> {
-        let config = ChallengeConfig { max_observations: 3, ..config() };
+        let config = ChallengeConfig { max_observations: 5, ..config() };
         let mut expired = ChallengeSession::with_action(config, 1_000_000, ChallengeAction::Blink)?;
         assert!(matches!(
             expired.observe(observation(11_000_001, 1, 0.8, 0.0)),
@@ -483,8 +594,10 @@ mod tests {
         let _ = budgeted.observe(observation(1_100_000, 1, 0.4, 0.0))?;
         let _ = budgeted.observe(observation(1_200_000, 2, 0.4, 0.0))?;
         let _ = budgeted.observe(observation(1_300_000, 3, 0.4, 0.0))?;
+        let _ = budgeted.observe(observation(1_400_000, 4, 0.4, 0.0))?;
+        let _ = budgeted.observe(observation(1_500_000, 5, 0.4, 0.0))?;
         assert!(matches!(
-            budgeted.observe(observation(1_400_000, 4, 0.4, 0.0)),
+            budgeted.observe(observation(1_600_000, 6, 0.4, 0.0)),
             Err(ChallengeError::ObservationBudgetExhausted)
         ));
         Ok(())
@@ -510,5 +623,16 @@ mod tests {
                 .is_err()
         );
         assert!(ChallengeConfig { max_observations: 301, ..config() }.validate().is_err());
+        assert!(
+            ChallengeConfig { action_consecutive_observations: 1, ..config() }.validate().is_err()
+        );
+        assert!(
+            ChallengeConfig { minimum_action_duration_micros: 0, ..config() }.validate().is_err()
+        );
+        assert!(
+            ChallengeConfig { recovery_consecutive_observations: 16, ..config() }
+                .validate()
+                .is_err()
+        );
     }
 }

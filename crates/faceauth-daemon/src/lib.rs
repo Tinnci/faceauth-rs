@@ -1140,6 +1140,9 @@ mod tests {
                 closed_eye_threshold: 0.25,
                 neutral_yaw_degrees: 10.0,
                 turn_yaw_degrees: 20.0,
+                action_consecutive_observations: 2,
+                minimum_action_duration_micros: 50_000,
+                recovery_consecutive_observations: 2,
             },
             1_000_000,
         )?;

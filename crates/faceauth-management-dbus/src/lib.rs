@@ -983,6 +983,10 @@ const fn progress_name(progress: ManagementProgress) -> &'static str {
         ManagementProgress::PositionFace => "position-face",
         ManagementProgress::HoldStill => "hold-still",
         ManagementProgress::ActiveChallenge => "active-challenge",
+        ManagementProgress::Blink => "blink",
+        ManagementProgress::TurnLeft => "turn-left",
+        ManagementProgress::TurnRight => "turn-right",
+        ManagementProgress::ReturnToCenter => "return-to-center",
         ManagementProgress::Processing => "processing",
     }
 }
@@ -1400,6 +1404,10 @@ mod tests {
         assert_eq!(progress_name(ManagementProgress::PositionFace), "position-face");
         assert_eq!(progress_name(ManagementProgress::HoldStill), "hold-still");
         assert_eq!(progress_name(ManagementProgress::ActiveChallenge), "active-challenge");
+        assert_eq!(progress_name(ManagementProgress::Blink), "blink");
+        assert_eq!(progress_name(ManagementProgress::TurnLeft), "turn-left");
+        assert_eq!(progress_name(ManagementProgress::TurnRight), "turn-right");
+        assert_eq!(progress_name(ManagementProgress::ReturnToCenter), "return-to-center");
         assert_eq!(progress_name(ManagementProgress::Processing), "processing");
         assert_eq!(result_name(ManagementResult::Completed), "completed");
         assert_eq!(result_name(ManagementResult::Cancelled), "cancelled");

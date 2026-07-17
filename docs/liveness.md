@@ -10,7 +10,9 @@ to a landmark model or desktop client:
 - unbiased operating-system random selection among blink, turn-left, and
   turn-right actions;
 - a centered, eyes-open baseline before the action prompt;
-- observation of the requested action followed by centered recovery;
+- observation of the requested action for a calibrated minimum duration and
+  consecutive-frame count, followed by a separately calibrated consecutive
+  centered recovery;
 - strictly increasing monotonic timestamps that do not predate challenge issue;
 - fresh sequence numbers from both IR and visible cameras;
 - exact one-face and dual-camera pairing requirements;
@@ -28,6 +30,15 @@ The crate deliberately has no default thresholds. Eye-openness and yaw bounds
 must be calibrated for the admitted landmark model, preprocessing contract, and
 target camera hardware, then versioned with that model configuration. Changing a
 model or preprocessing path invalidates those bounds.
+
+Action and recovery streak lengths are explicitly bounded to 2 through 15
+fresh observations. Action dwell time is bounded to 20 ms through 2 s and must
+remain below the total challenge deadline. A non-qualifying measurement resets
+the applicable streak (and the action dwell timer), so a single noisy landmark
+or alternating threshold jitter cannot advance the transaction. The observation
+budget must cover at least baseline plus both configured streaks. These values
+also have no production defaults and belong to the reviewed hardware/model
+calibration evidence.
 
 Desktop clients and the future lock-screen OSD receive only progress prompts:
 waiting for neutral baseline, perform the selected action, or return to neutral.
