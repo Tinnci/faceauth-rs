@@ -20,10 +20,11 @@ pub use enrollment_engine::{
     EnrollmentJob, EnrollmentTemplateSink,
 };
 pub use production::{
-    PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionConfig, ProductionConfigError,
-    READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind, ReadinessReport,
-    build_production_authentication_engine, inspect_production_readiness, load_production_config,
-    readiness_from_config_path,
+    PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionAuthenticationBoundary, ProductionConfig,
+    ProductionConfigError, READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind,
+    ReadinessReport, build_production_authentication_boundary,
+    build_production_authentication_engine, build_production_template_store,
+    inspect_production_readiness, load_production_config, readiness_from_config_path,
 };
 pub use resource::{
     BiometricResourceArbiter, BiometricResourceError, BiometricResourceLease,

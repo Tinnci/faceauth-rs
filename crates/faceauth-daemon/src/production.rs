@@ -26,7 +26,8 @@ use faceauth_model::{ModelManifest, ModelRole};
 use faceauth_protocol::AuthenticationPurpose;
 use faceauth_quality::QualityConfig;
 use faceauth_session::SessionConfig;
-use faceauth_transport::TransportConfig;
+use faceauth_storage::{EncryptedTemplateStore, TpmKeyProvider};
+use faceauth_transport::{SecureListener, TransportConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -636,6 +637,69 @@ pub fn build_production_authentication_engine(
             ))
         }
     })
+}
+
+/// Construct and self-test the TPM-backed encrypted template store.
+///
+/// # Errors
+///
+/// Returns [`ProductionConfigError`] when storage evidence, TPM access, the sealed blob, or the
+/// template directory fails production policy. Diagnostic file keys are always rejected.
+pub fn build_production_template_store(
+    config: &ProductionConfig,
+) -> Result<EncryptedTemplateStore<TpmKeyProvider>, ProductionConfigError> {
+    config.validate()?;
+    inspect_storage(config).map_err(ProductionConfigError::Invalid)?;
+    let StorageKeyConfig::Tpm { sealed_key_blob } = &config.storage.key else {
+        return invalid("production template storage requires a TPM key");
+    };
+    let provider = TpmKeyProvider::new(sealed_key_blob);
+    provider.self_test().map_err(|error| {
+        ProductionConfigError::Invalid(format!("TPM key self-test failed: {error}"))
+    })?;
+    Ok(EncryptedTemplateStore::new(&config.storage.template_directory, provider))
+}
+
+/// Bound listener plus exact authorization, framing, and session policies for production.
+pub struct ProductionAuthenticationBoundary {
+    /// Root-owned Unix listener that never replaces an existing path.
+    pub listener: SecureListener,
+    /// Connected-peer framing and I/O limits.
+    pub transport: TransportConfig,
+    /// Exact executable-bound caller authorization policy.
+    pub authorization: AuthorizationPolicy,
+    /// Single-slot transaction deadline manager.
+    pub sessions: SessionConfig,
+}
+
+/// Bind the root-owned authentication socket and construct its exact boundary policies.
+///
+/// # Errors
+///
+/// Returns [`ProductionConfigError`] when policy evidence, authorization, socket ownership/mode,
+/// transport limits, or session limits are invalid. Existing socket paths are never removed.
+pub fn build_production_authentication_boundary(
+    config: &ProductionConfig,
+) -> Result<ProductionAuthenticationBoundary, ProductionConfigError> {
+    config.validate()?;
+    inspect_authorization(config).map_err(ProductionConfigError::Invalid)?;
+    inspect_authentication_boundary(config).map_err(ProductionConfigError::Invalid)?;
+    let boundary = &config.authentication_boundary;
+    let listener = SecureListener::bind_root_owned(&boundary.socket_path, boundary.socket_mode)
+        .map_err(|error| {
+            ProductionConfigError::Invalid(format!("authentication socket bind failed: {error}"))
+        })?;
+    let transport = TransportConfig {
+        max_message_bytes: boundary.max_message_bytes,
+        io_timeout: Duration::from_millis(boundary.io_timeout_millis),
+    };
+    let sessions =
+        SessionConfig { transaction_duration_micros: boundary.transaction_duration_micros };
+    let authorization =
+        AuthorizationPolicy::new(config.authorization.rules.clone()).map_err(|error| {
+            ProductionConfigError::Invalid(format!("authorization assembly failed: {error}"))
+        })?;
+    Ok(ProductionAuthenticationBoundary { listener, transport, authorization, sessions })
 }
 
 #[allow(clippy::too_many_arguments)]

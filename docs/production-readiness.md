@@ -57,3 +57,7 @@ The explicit production authentication builder is separate: it first revalidates
 calibration evidence, then resolves and negotiates both configured V4L2 streams, loads all six
 role-bound ONNX sessions, verifies their complete compatibility digests, and only then returns the
 single-worker engine.
+Separate explicit builders self-test the TPM-unsealed machine key before returning an encrypted
+template store, and bind the authentication socket without unlinking any existing path before
+returning its exact authorization, framing, and transaction policies. Diagnostic file keys cannot
+enter this production construction path.
