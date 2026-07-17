@@ -24,20 +24,25 @@ One explicitly calibrated configuration fixes:
 - a 5–120 second monotonic transaction duration;
 - 3–16 required/maximum derived samples;
 - the minimum image-quality score;
-- the minimum mapped cosine similarity between every sample pair.
+- the minimum mapped cosine similarity between every sample pair;
+- a minimum monotonic interval between retained samples;
+- a minimum model-derived yaw span across the accepted set.
 
-Each accepted observation must be fresh and strictly newer than the prior one,
+Each accepted observation must be fresh, sufficiently separated from the prior one,
 inside the original deadline, from the same complete model compatibility digest
 and embedding dimension, and have passed both passive and randomized active
 liveness. Low-quality observations may be discarded and retried. A stale or
 duplicated observation, liveness failure, model switch, dimension switch, sample
-overflow, invalid arithmetic, or inconsistent identity permanently fails that
+overflow, invalid pose, invalid arithmetic, or inconsistent identity permanently fails that
 transaction.
 
 ## Template production
 
-Completion requires the configured minimum sample count before the fixed deadline.
-The state machine averages only the accepted normalized embeddings, rejects a
+Completion requires both the configured minimum sample count and calibrated left-to-right pose
+coverage before the fixed deadline. This prevents a burst of nearly identical frontal frames from
+masquerading as a robust enrollment. The state machine computes a quality-weighted centroid from
+only the accepted normalized embeddings, so marginal but admissible frames exert less influence
+than clear observations. It rejects a
 non-finite or degenerate aggregate, normalizes the aggregate again, and emits a
 template-format-v2 record. The record contains only numeric UID, complete model
 compatibility digest, and the derived embedding. All temporary sample and

@@ -1004,6 +1004,8 @@ mod tests {
                     maximum_samples: 8,
                     minimum_quality: 0.7,
                     minimum_sample_similarity: 0.75,
+                    minimum_sample_interval_micros: 250_000,
+                    minimum_yaw_span_degrees: 15.0,
                 },
                 evidence: evidence("enrollment.json"),
             },

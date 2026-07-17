@@ -23,6 +23,10 @@ pub struct EnrollmentConfig {
     pub minimum_quality: f32,
     /// Minimum mapped cosine similarity between every accepted sample pair.
     pub minimum_sample_similarity: f32,
+    /// Minimum monotonic spacing between accepted samples to reject near-duplicate frames.
+    pub minimum_sample_interval_micros: u64,
+    /// Minimum yaw range covered by the accepted sample set before template creation.
+    pub minimum_yaw_span_degrees: f32,
 }
 
 impl EnrollmentConfig {
@@ -39,6 +43,9 @@ impl EnrollmentConfig {
             || self.maximum_samples > MAX_ENROLLMENT_SAMPLES
             || !valid_unit_score(self.minimum_quality)
             || !valid_unit_score(self.minimum_sample_similarity)
+            || !(50_000..=5_000_000).contains(&self.minimum_sample_interval_micros)
+            || !self.minimum_yaw_span_degrees.is_finite()
+            || !(5.0..=60.0).contains(&self.minimum_yaw_span_degrees)
         {
             return Err(EnrollmentError::InvalidConfig);
         }
@@ -59,6 +66,8 @@ pub struct EnrollmentObservation<'a> {
     pub active_liveness_passed: bool,
     /// Fresh paired-frame timestamp from the daemon monotonic clock.
     pub timestamp_micros: u64,
+    /// Model-derived yaw in degrees used only to require multi-pose enrollment coverage.
+    pub yaw_degrees: f32,
 }
 
 /// One capacity-bounded enrollment transaction.
@@ -71,6 +80,8 @@ pub struct EnrollmentSession {
     compatibility_sha256: Option<String>,
     dimension: Option<usize>,
     samples: Vec<Zeroizing<Vec<f32>>>,
+    sample_qualities: Vec<f32>,
+    sample_yaws: Vec<f32>,
     terminal_failure: bool,
 }
 
@@ -98,6 +109,8 @@ impl EnrollmentSession {
             compatibility_sha256: None,
             dimension: None,
             samples: Vec::with_capacity(usize::from(config.maximum_samples)),
+            sample_qualities: Vec::with_capacity(usize::from(config.maximum_samples)),
+            sample_yaws: Vec::with_capacity(usize::from(config.maximum_samples)),
             terminal_failure: false,
         })
     }
@@ -154,6 +167,8 @@ impl EnrollmentSession {
             }
         }
         self.samples.push(Zeroizing::new(observation.embedding.values().to_vec()));
+        self.sample_qualities.push(observation.quality);
+        self.sample_yaws.push(observation.yaw_degrees);
         self.last_timestamp_micros = Some(observation.timestamp_micros);
         Ok(())
     }
@@ -177,18 +192,31 @@ impl EnrollmentSession {
                 required: self.config.minimum_samples,
             });
         }
+        let minimum_yaw = self.sample_yaws.iter().copied().reduce(f32::min);
+        let maximum_yaw = self.sample_yaws.iter().copied().reduce(f32::max);
+        if minimum_yaw.zip(maximum_yaw).is_none_or(|(minimum, maximum)| {
+            maximum - minimum < self.config.minimum_yaw_span_degrees
+        }) {
+            return Err(EnrollmentError::InsufficientPoseCoverage);
+        }
         let dimension = self.dimension.ok_or(EnrollmentError::InsufficientSamples {
             actual: 0,
             required: self.config.minimum_samples,
         })?;
         let mut aggregate = Zeroizing::new(vec![0.0_f32; dimension]);
-        for sample in &self.samples {
+        let mut total_weight = 0.0_f32;
+        for (sample, quality) in self.samples.iter().zip(self.sample_qualities.iter()) {
+            let weight = *quality;
+            total_weight += weight;
             for (sum, value) in aggregate.iter_mut().zip(sample.iter()) {
-                *sum += value;
+                *sum = value.mul_add(weight, *sum);
                 if !sum.is_finite() {
                     return Err(EnrollmentError::AggregateInvalid);
                 }
             }
+        }
+        if !total_weight.is_finite() || total_weight <= f32::EPSILON {
+            return Err(EnrollmentError::AggregateInvalid);
         }
         normalize(&mut aggregate)?;
         let record = TemplateRecord {
@@ -212,6 +240,9 @@ impl EnrollmentSession {
             || self
                 .last_timestamp_micros
                 .is_some_and(|previous| observation.timestamp_micros <= previous)
+            || self.last_timestamp_micros.is_some_and(|previous| {
+                observation.timestamp_micros - previous < self.config.minimum_sample_interval_micros
+            })
         {
             return Err(EnrollmentError::StaleObservation);
         }
@@ -219,6 +250,11 @@ impl EnrollmentSession {
             || observation.quality < self.config.minimum_quality
         {
             return Err(EnrollmentError::InsufficientQuality);
+        }
+        if !observation.yaw_degrees.is_finite()
+            || !(-90.0..=90.0).contains(&observation.yaw_degrees)
+        {
+            return Err(EnrollmentError::InvalidPose);
         }
         if !observation.passive_liveness_passed || !observation.active_liveness_passed {
             return Err(EnrollmentError::LivenessRequired);
@@ -282,6 +318,9 @@ pub enum EnrollmentError {
     /// Quality score is invalid or below the configured threshold.
     #[error("enrollment observation quality is insufficient")]
     InsufficientQuality,
+    /// Model-derived pose is non-finite or outside the admitted physical range.
+    #[error("enrollment observation pose is invalid")]
+    InvalidPose,
     /// Both passive and randomized active liveness must pass.
     #[error("enrollment requires passive and active liveness")]
     LivenessRequired,
@@ -308,6 +347,9 @@ pub enum EnrollmentError {
         /// Required samples.
         required: u8,
     },
+    /// Accepted samples do not cover the configured yaw range.
+    #[error("enrollment samples do not cover the required pose range")]
+    InsufficientPoseCoverage,
     /// Sample aggregation produced a non-finite or degenerate vector.
     #[error("enrollment aggregate is invalid")]
     AggregateInvalid,
@@ -339,6 +381,8 @@ mod tests {
             maximum_samples: 5,
             minimum_quality: 0.7,
             minimum_sample_similarity: 0.9,
+            minimum_sample_interval_micros: 250_000,
+            minimum_yaw_span_degrees: 15.0,
         }
     }
 
@@ -362,6 +406,11 @@ mod tests {
             passive_liveness_passed: true,
             active_liveness_passed: true,
             timestamp_micros,
+            yaw_degrees: match timestamp_micros {
+                2_000_000 => -10.0,
+                4_000_000 => 10.0,
+                _ => 0.0,
+            },
         }
     }
 
@@ -446,6 +495,48 @@ mod tests {
 
         let expired = EnrollmentSession::start(config(), 1000, 1_000_000)?;
         assert!(matches!(expired.finish(31_000_000), Err(EnrollmentError::DeadlineElapsed)));
+        Ok(())
+    }
+
+    #[test]
+    fn near_duplicate_frames_and_insufficient_pose_coverage_fail_closed()
+    -> Result<(), EnrollmentError> {
+        let face = embedding(0xaa, 1.0, 0.0)?;
+        let mut duplicate = EnrollmentSession::start(config(), 1000, 1_000_000)?;
+        duplicate.observe(observation(&face, 2_000_000))?;
+        assert!(matches!(
+            duplicate.observe(observation(&face, 2_100_000)),
+            Err(EnrollmentError::StaleObservation)
+        ));
+
+        let mut flat = EnrollmentSession::start(config(), 1000, 1_000_000)?;
+        for timestamp in [2_000_000, 3_000_000, 4_000_000] {
+            let mut sample = observation(&face, timestamp);
+            sample.yaw_degrees = 0.0;
+            flat.observe(sample)?;
+        }
+        assert!(matches!(flat.finish(5_000_000), Err(EnrollmentError::InsufficientPoseCoverage)));
+        Ok(())
+    }
+
+    #[test]
+    fn quality_weighted_centroid_limits_lower_quality_sample_drift() -> Result<(), EnrollmentError>
+    {
+        let frontal = embedding(0xaa, 1.0, 0.0)?;
+        let offset = embedding(0xaa, 0.98, 0.2)?;
+        let mut session = EnrollmentSession::start(config(), 1000, 1_000_000)?;
+        let mut first = observation(&frontal, 2_000_000);
+        first.quality = 1.0;
+        session.observe(first)?;
+        let mut second = observation(&offset, 3_000_000);
+        second.quality = 0.7;
+        session.observe(second)?;
+        let mut third = observation(&offset, 4_000_000);
+        third.quality = 0.7;
+        session.observe(third)?;
+        let record = session.finish(5_000_000)?;
+        assert!(record.embedding[0] > 0.99);
+        assert!(record.embedding[1] < 0.13);
         Ok(())
     }
 }

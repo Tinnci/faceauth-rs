@@ -797,6 +797,8 @@ mod tests {
             maximum_samples: 5,
             minimum_quality: 0.7,
             minimum_sample_similarity: 0.9,
+            minimum_sample_interval_micros: 250_000,
+            minimum_yaw_span_degrees: 15.0,
         }
     }
 
