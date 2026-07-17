@@ -732,6 +732,45 @@ impl OnnxSession {
         preprocess_image(&self.manifest.input, image)
     }
 
+    /// Convert an image for an exact named graph input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] when the name is undeclared or the source violates that input's
+    /// reviewed preprocessing contract.
+    pub fn preprocess_named(
+        &self,
+        name: &str,
+        image: ImageView<'_>,
+    ) -> Result<InputTensor, InferenceError> {
+        if self.manifest.role != ModelRole::PassiveLivenessFusion {
+            return Err(InferenceError::ModelRoleMismatch);
+        }
+        let contract =
+            manifest_input(&self.manifest, name).ok_or(InferenceError::InputTensorInvalid)?;
+        preprocess_image(contract, image)
+    }
+
+    /// Convert an image for an exact named fusion input while observing cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::Cancelled`] when requested, or the same errors as
+    /// [`Self::preprocess_named`].
+    pub fn preprocess_named_cancellable(
+        &self,
+        name: &str,
+        image: ImageView<'_>,
+        should_cancel: impl FnMut() -> bool,
+    ) -> Result<InputTensor, InferenceError> {
+        if self.manifest.role != ModelRole::PassiveLivenessFusion {
+            return Err(InferenceError::ModelRoleMismatch);
+        }
+        let contract =
+            manifest_input(&self.manifest, name).ok_or(InferenceError::InputTensorInvalid)?;
+        preprocess_image_cancellable(contract, image, should_cancel)
+    }
+
     /// Convert an image while checking cancellation before allocation and before each output row.
     ///
     /// # Errors
@@ -820,13 +859,29 @@ impl OnnxSession {
     /// Returns [`InferenceError`] when the input differs from the loaded manifest, ONNX Runtime
     /// fails, or an output is malformed or non-finite.
     pub fn run(&mut self, input: &InputTensor) -> Result<Vec<OutputTensor>, InferenceError> {
-        if input.dimensions != self.manifest.input.dimensions()
-            || input.values.iter().any(|value| !value.is_finite())
-        {
-            return Err(InferenceError::InputTensorInvalid);
-        }
-        let shape = input.dimensions.map(i64::from);
-        let tensor = TensorRef::from_array_view((shape, input.values.as_slice()))?;
+        let input_name = self.manifest.input.name.clone();
+        self.run_named(&[(input_name.as_str(), input)])
+    }
+
+    /// Execute tensors bound to their exact manifest input names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError`] for missing, unexpected, duplicate, malformed, or non-finite
+    /// inputs, ONNX Runtime failures, watchdog expiry, or malformed outputs.
+    pub fn run_named(
+        &mut self,
+        inputs: &[(&str, &InputTensor)],
+    ) -> Result<Vec<OutputTensor>, InferenceError> {
+        let ordered = validate_named_inputs(&self.manifest, inputs)?;
+        let tensors = ordered
+            .into_iter()
+            .map(|(contract, input)| {
+                let shape = input.dimensions.map(i64::from);
+                let tensor = TensorRef::from_array_view((shape, input.values.as_slice()))?;
+                Ok((contract.name.as_str(), tensor))
+            })
+            .collect::<Result<Vec<_>, InferenceError>>()?;
         let run_options = Arc::new(RunOptions::new()?);
         let watchdog_options = Arc::clone(&run_options);
         let deadline = Duration::from_millis(u64::from(self.max_run_millis));
@@ -842,7 +897,7 @@ impl OnnxSession {
                     }
                 }
             })?;
-        let run_result = self.session.run_with_options(ort::inputs![tensor], &run_options);
+        let run_result = self.session.run_with_options(tensors, &run_options);
         let _completion_result = completion_sender.send(());
         let watchdog_expired = watchdog.join().map_err(|_| InferenceError::WatchdogPanicked)?;
         if watchdog_expired || started.elapsed() >= deadline {
@@ -1774,22 +1829,61 @@ fn verify_trusted_file(path: &Path, max_bytes: Option<u64>) -> Result<(), Infere
     Ok(())
 }
 
+fn manifest_input<'a>(manifest: &'a ModelManifest, name: &str) -> Option<&'a InputContract> {
+    std::iter::once(&manifest.input)
+        .chain(&manifest.additional_inputs)
+        .find(|contract| contract.name == name)
+}
+
+fn validate_named_inputs<'a, 'b>(
+    manifest: &'a ModelManifest,
+    inputs: &'b [(&str, &InputTensor)],
+) -> Result<Vec<(&'a InputContract, &'b InputTensor)>, InferenceError> {
+    let expected_count = 1 + manifest.additional_inputs.len();
+    if inputs.len() != expected_count {
+        return Err(InferenceError::InputTensorInvalid);
+    }
+    let mut ordered = Vec::with_capacity(expected_count);
+    for contract in std::iter::once(&manifest.input).chain(&manifest.additional_inputs) {
+        let mut matches = inputs.iter().filter(|(name, _)| *name == contract.name);
+        let (_, input) = matches.next().ok_or(InferenceError::InputTensorInvalid)?;
+        if matches.next().is_some()
+            || input.dimensions != contract.dimensions()
+            || input.values.iter().any(|value| !value.is_finite())
+        {
+            return Err(InferenceError::InputTensorInvalid);
+        }
+        ordered.push((contract, *input));
+    }
+    Ok(ordered)
+}
+
 fn validate_session_contract(
     manifest: &ModelManifest,
     session: &Session,
 ) -> Result<(), InferenceError> {
-    if session.inputs().len() != 1 || session.outputs().len() != manifest.outputs.len() {
+    let expected_inputs =
+        std::iter::once(&manifest.input).chain(&manifest.additional_inputs).collect::<Vec<_>>();
+    if session.inputs().len() != expected_inputs.len()
+        || session.outputs().len() != manifest.outputs.len()
+    {
         return Err(InferenceError::GraphContractMismatch);
     }
-    let input = &session.inputs()[0];
-    let expected_input = manifest.input.dimensions().map(i64::from).to_vec();
-    validate_outlet(
-        input.name(),
-        input.dtype(),
-        &manifest.input.name,
-        &expected_input,
-        manifest.input.element_type,
-    )?;
+    for expected in expected_inputs {
+        let input = session
+            .inputs()
+            .iter()
+            .find(|input| input.name() == expected.name)
+            .ok_or(InferenceError::GraphContractMismatch)?;
+        let dimensions = expected.dimensions().map(i64::from).to_vec();
+        validate_outlet(
+            input.name(),
+            input.dtype(),
+            &expected.name,
+            &dimensions,
+            expected.element_type,
+        )?;
+    }
     for (actual, expected) in session.outputs().iter().zip(&manifest.outputs) {
         let expected_dimensions =
             expected.dimensions.iter().copied().map(i64::from).collect::<Vec<_>>();
@@ -2036,7 +2130,7 @@ mod tests {
         semantic: OutputSemantic,
         dimensions: Vec<u32>,
     ) -> ModelManifest {
-        ModelManifest {
+        let mut manifest = ModelManifest {
             schema_version: MODEL_MANIFEST_SCHEMA_VERSION,
             name: "test-model".to_owned(),
             version: "1".to_owned(),
@@ -2045,6 +2139,7 @@ mod tests {
             license_spdx: "Apache-2.0".to_owned(),
             sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             input: input_contract(1, 1, TensorLayout::Nchw, ColorSpace::Rgb),
+            additional_inputs: Vec::new(),
             face_crop: (role == ModelRole::FaceLandmarks).then_some(FaceCropContract {
                 scale: 1.0,
                 center_offset_x: 0.0,
@@ -2065,7 +2160,75 @@ mod tests {
                 element_type: ManifestElementType::Float32,
                 semantic,
             }],
+        };
+        if role == ModelRole::PassiveLivenessFusion {
+            let mut visible = manifest.input.clone();
+            manifest.input.name = "infrared".to_owned();
+            visible.name = "visible".to_owned();
+            manifest.additional_inputs.push(visible);
         }
+        manifest
+    }
+
+    fn input_tensor(contract: &InputContract, value: f32) -> Result<InputTensor, InferenceError> {
+        let dimensions = contract.dimensions();
+        Ok(InputTensor {
+            dimensions,
+            values: Zeroizing::new(vec![value; tensor_element_count(&dimensions)?]),
+        })
+    }
+
+    #[test]
+    fn named_inputs_require_exact_names_shapes_and_finite_values() -> Result<(), InferenceError> {
+        let manifest = model_manifest(
+            ModelRole::PassiveLivenessFusion,
+            OutputSemantic::LiveProbability,
+            vec![1],
+        );
+        let infrared = input_tensor(&manifest.input, 0.25)?;
+        let visible = input_tensor(&manifest.additional_inputs[0], 0.75)?;
+
+        let reversed = [("visible", &visible), ("infrared", &infrared)];
+        let ordered = validate_named_inputs(&manifest, &reversed)?;
+        assert_eq!(ordered[0].0.name, "infrared");
+        assert_eq!(ordered[1].0.name, "visible");
+
+        for invalid in [
+            vec![("infrared", &infrared)],
+            vec![("infrared", &infrared), ("infrared", &visible)],
+            vec![("infrared", &infrared), ("unexpected", &visible)],
+        ] {
+            assert!(matches!(
+                validate_named_inputs(&manifest, &invalid),
+                Err(InferenceError::InputTensorInvalid)
+            ));
+        }
+
+        let wrong_shape =
+            InputTensor { dimensions: [1, 3, 2, 1], values: Zeroizing::new(vec![0.0; 6]) };
+        assert!(matches!(
+            validate_named_inputs(&manifest, &[("infrared", &wrong_shape), ("visible", &visible)]),
+            Err(InferenceError::InputTensorInvalid)
+        ));
+
+        let non_finite = input_tensor(&manifest.input, f32::NAN)?;
+        assert!(matches!(
+            validate_named_inputs(&manifest, &[("infrared", &non_finite), ("visible", &visible)]),
+            Err(InferenceError::InputTensorInvalid)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn single_input_validation_remains_supported() -> Result<(), InferenceError> {
+        let manifest = model_manifest(
+            ModelRole::PassiveLivenessInfrared,
+            OutputSemantic::LiveProbability,
+            vec![1],
+        );
+        let tensor = input_tensor(&manifest.input, 0.5)?;
+        assert!(validate_named_inputs(&manifest, &[("input", &tensor)]).is_ok());
+        Ok(())
     }
 
     fn test_alignment() -> FaceAlignmentContract {

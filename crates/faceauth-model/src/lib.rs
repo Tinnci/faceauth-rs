@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Current model-manifest schema version.
-pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 8;
+pub const MODEL_MANIFEST_SCHEMA_VERSION: u16 = 9;
 
 /// Maximum artifact name or version length.
 pub const MAX_ARTIFACT_LABEL_LENGTH: usize = 128;
@@ -327,6 +327,8 @@ pub struct ModelManifest {
     pub sha256: String,
     /// Static input tensor contract.
     pub input: InputContract,
+    /// Additional exact named inputs; admitted only for reviewed multi-modal fusion graphs.
+    pub additional_inputs: Vec<InputContract>,
     /// Required detector-region derivation for landmark model inputs.
     pub face_crop: Option<FaceCropContract>,
     /// Required calibrated measurement semantics for landmark roles.
@@ -363,23 +365,25 @@ impl ModelManifest {
         if !valid_sha256(&self.sha256) {
             return Err(ModelError::InvalidSha256);
         }
-        validate_tensor_name(&self.input.name)?;
-        if self.input.width == 0
-            || self.input.height == 0
-            || self.input.width > MAX_INPUT_DIMENSION
-            || self.input.height > MAX_INPUT_DIMENSION
-        {
-            return Err(ModelError::InvalidInputDimensions);
+        if self.role == ModelRole::PassiveLivenessFusion {
+            if self.additional_inputs.len() != 1 {
+                return Err(ModelError::InvalidInputCount {
+                    actual: 1 + self.additional_inputs.len(),
+                });
+            }
+            if self.input.name != "infrared" || self.additional_inputs[0].name != "visible" {
+                return Err(ModelError::InvalidFusionInputNames);
+            }
+        } else if !self.additional_inputs.is_empty() {
+            return Err(ModelError::InvalidInputCount { actual: 1 + self.additional_inputs.len() });
         }
-        let expected_channels = match self.input.color_space {
-            ColorSpace::Grayscale => 1,
-            ColorSpace::Rgb | ColorSpace::Bgr => 3,
-        };
-        if self.input.channels != expected_channels {
-            return Err(ModelError::InvalidChannelCount {
-                expected: expected_channels,
-                actual: self.input.channels,
-            });
+        let mut input_names = Vec::with_capacity(1 + self.additional_inputs.len());
+        for input in std::iter::once(&self.input).chain(&self.additional_inputs) {
+            validate_input_contract(input)?;
+            if input_names.contains(&input.name) {
+                return Err(ModelError::DuplicateInputName { name: input.name.clone() });
+            }
+            input_names.push(input.name.clone());
         }
         match (&self.role, &self.face_alignment) {
             (ModelRole::FaceEmbedding, Some(alignment)) => alignment.validate()?,
@@ -403,20 +407,6 @@ impl ModelManifest {
             }
             (_, None) => {}
         }
-        let channel_count = usize::from(self.input.channels);
-        if self.input.normalization.scale.len() != channel_count
-            || self.input.normalization.bias.len() != channel_count
-            || self
-                .input
-                .normalization
-                .scale
-                .iter()
-                .any(|value| !value.is_finite() || *value == 0.0)
-            || self.input.normalization.bias.iter().any(|value| !value.is_finite())
-        {
-            return Err(ModelError::InvalidNormalization);
-        }
-        validate_dimensions(&self.input.dimensions())?;
         if self.outputs.is_empty() || self.outputs.len() > MAX_OUTPUT_TENSORS {
             return Err(ModelError::InvalidOutputCount { actual: self.outputs.len() });
         }
@@ -524,6 +514,12 @@ pub enum ModelError {
     /// Width and height must be fixed and inside hard bounds.
     #[error("model input dimensions are invalid or excessive")]
     InvalidInputDimensions,
+    /// Only fusion graphs may declare exactly two total named inputs.
+    #[error("model has invalid declared input count {actual}")]
+    InvalidInputCount {
+        /// Total declared input count.
+        actual: usize,
+    },
     /// Channel count does not match the declared color space.
     #[error("model input has {actual} channels; declared color space requires {expected}")]
     InvalidChannelCount {
@@ -547,6 +543,15 @@ pub enum ModelError {
     /// Tensor name is empty, excessive, or contains unsupported bytes.
     #[error("model tensor name is invalid")]
     InvalidTensorName,
+    /// Input names must be unique.
+    #[error("duplicate model input tensor name {name}")]
+    DuplicateInputName {
+        /// Repeated input name.
+        name: String,
+    },
+    /// Fusion inputs have fixed modality identities to prevent accidental swapping.
+    #[error("fusion model inputs must be named infrared and visible")]
+    InvalidFusionInputNames,
     /// Output tensor count must be bounded and non-zero.
     #[error("model has invalid declared output count {actual}")]
     InvalidOutputCount {
@@ -604,6 +609,36 @@ fn validate_tensor_name(value: &str) -> Result<(), ModelError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_input_contract(input: &InputContract) -> Result<(), ModelError> {
+    validate_tensor_name(&input.name)?;
+    if input.width == 0
+        || input.height == 0
+        || input.width > MAX_INPUT_DIMENSION
+        || input.height > MAX_INPUT_DIMENSION
+    {
+        return Err(ModelError::InvalidInputDimensions);
+    }
+    let expected_channels = match input.color_space {
+        ColorSpace::Grayscale => 1,
+        ColorSpace::Rgb | ColorSpace::Bgr => 3,
+    };
+    if input.channels != expected_channels {
+        return Err(ModelError::InvalidChannelCount {
+            expected: expected_channels,
+            actual: input.channels,
+        });
+    }
+    let channel_count = usize::from(input.channels);
+    if input.normalization.scale.len() != channel_count
+        || input.normalization.bias.len() != channel_count
+        || input.normalization.scale.iter().any(|value| !value.is_finite() || *value == 0.0)
+        || input.normalization.bias.iter().any(|value| !value.is_finite())
+    {
+        return Err(ModelError::InvalidNormalization);
+    }
+    validate_dimensions(&input.dimensions())
 }
 
 fn validate_dimensions(dimensions: &[u32]) -> Result<(), ModelError> {
@@ -782,6 +817,7 @@ mod tests {
                     bias: vec![0.0; 3],
                 },
             },
+            additional_inputs: Vec::new(),
             face_crop: None,
             landmark_measurement: None,
             face_alignment: None,
@@ -899,6 +935,60 @@ mod tests {
         let mut invalid_name = manifest();
         invalid_name.input.name = "bad name".to_owned();
         assert!(matches!(invalid_name.validate(), Err(ModelError::InvalidTensorName)));
+    }
+
+    #[test]
+    fn fusion_requires_exactly_two_unique_named_inputs() -> Result<(), ModelError> {
+        let mut fusion = manifest();
+        fusion.role = ModelRole::PassiveLivenessFusion;
+        fusion.outputs = vec![OutputContract {
+            name: "live".to_owned(),
+            dimensions: vec![1],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::LiveProbability,
+        }];
+        assert!(matches!(fusion.validate(), Err(ModelError::InvalidInputCount { actual: 1 })));
+
+        fusion.input.name = "infrared".to_owned();
+        let mut visible = fusion.input.clone();
+        visible.name = "visible".to_owned();
+        fusion.additional_inputs.push(visible);
+        fusion.validate()?;
+
+        fusion.additional_inputs[0].name = "infrared".to_owned();
+        assert!(matches!(fusion.validate(), Err(ModelError::InvalidFusionInputNames)));
+
+        fusion.input.name = "visible".to_owned();
+        fusion.additional_inputs[0].name = "infrared".to_owned();
+        assert!(matches!(fusion.validate(), Err(ModelError::InvalidFusionInputNames)));
+        Ok(())
+    }
+
+    #[test]
+    fn non_fusion_roles_reject_additional_inputs() {
+        let mut detector = manifest();
+        detector.additional_inputs.push(detector.input.clone());
+        assert!(matches!(detector.validate(), Err(ModelError::InvalidInputCount { actual: 2 })));
+    }
+
+    #[test]
+    fn additional_input_changes_compatibility_digest() -> Result<(), ModelError> {
+        let mut original = manifest();
+        original.role = ModelRole::PassiveLivenessFusion;
+        original.outputs = vec![OutputContract {
+            name: "live".to_owned(),
+            dimensions: vec![1],
+            element_type: TensorElementType::Float32,
+            semantic: OutputSemantic::LiveProbability,
+        }];
+        original.input.name = "infrared".to_owned();
+        let mut visible = original.input.clone();
+        visible.name = "visible".to_owned();
+        original.additional_inputs.push(visible);
+        let mut changed = original.clone();
+        changed.additional_inputs[0].normalization.bias[0] = 0.25;
+        assert_ne!(original.compatibility_sha256()?, changed.compatibility_sha256()?);
+        Ok(())
     }
 
     #[test]

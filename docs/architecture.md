@@ -25,7 +25,7 @@ frames, camera ambiguity, model failure, or missing liveness evidence.
    retains only zeroizing embeddings and emits one encrypted-storage record.
 9. `faceauth-presence`: optional versioned thinkpad-hpd D-Bus hints and a generic
    capture-activity lease registry; never part of identity evidence.
-10. `faceauth-model`: bounded schema-v8 provenance, digest, preprocessing, semantic
+10. `faceauth-model`: bounded schema-v9 provenance, digest, preprocessing, semantic
    output roles, and exact tensor-contract admission.
 11. `faceauth-inference`: dynamically loaded, resource-bounded ONNX Runtime sessions
    whose graph I/O must exactly match an admitted manifest.
@@ -73,7 +73,10 @@ The runtime is selected by an explicit trusted local path and is never downloade
 by the service. Production artifacts and their containing directories must be
 root-owned and immutable to non-root users. Sessions are CPU-bound and sequential
 with fixed thread, model-size, tensor-rank, and tensor-element ceilings. The graph
-must expose exactly the input and outputs declared by its schema-v8 manifest.
+must expose exactly the named inputs and outputs declared by its schema-v9 manifest. Ordinary roles
+have one input; the passive IR/RGB fusion role has exactly two. Fusion tensors are bound by exact
+modality name and must come from the same paired observation, so missing, duplicate, unexpected, or
+swapped inputs fail closed.
 The manifest also fixes bilinear half-pixel resizing, channel order, and per-channel
 affine normalization. Tightly packed Gray8/RGB8/BGR8/YUYV sources are converted
 into zeroizing float buffers; copied outputs are shape-checked, finite-only, and
@@ -87,14 +90,14 @@ and dimension match. Passive-PAD adapters accept only a semantic scalar live
 probability; model-specific calibrated thresholds remain outside the generic
 runtime and have no production defaults.
 
-Embedding preprocessing cannot resize a full camera frame directly. Its schema-v8 manifest binds
+Embedding preprocessing cannot resize a full camera frame directly. Its schema-v9 manifest binds
 an exact landmark model, five topology indices, normalized reference geometry, and a maximum
 similarity-fit residual. The inference boundary maps crop-relative landmarks back to the full image,
 fits one finite non-reflecting similarity transform, and inverse-samples directly into the
 zeroizing model tensor with per-row cancellation. No aligned raw-image buffer is returned or
 persisted.
 
-Landmark preprocessing derives its region from a schema-v8 crop contract: a calibrated square
+Landmark preprocessing derives its region from a schema-v9 crop contract: a calibrated square
 scale and center offset are applied to the admitted detector box, and regions crossing an image
 edge fail rather than receiving implicit padding. The resulting strong region type is bound to the
 landmark compatibility digest, carried with the decoded landmarks, and is the only geometry used

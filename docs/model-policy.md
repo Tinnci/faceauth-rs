@@ -1,15 +1,17 @@
 # Model acceptance policy
 
 No model weights are bundled or downloaded merely because they are technically
-compatible with ONNX Runtime. Every artifact must have a schema-v8 reviewed
+compatible with ONNX Runtime. Every artifact must have a schema-v9 reviewed
 manifest with an HTTPS provenance URL, valid SPDX license expression, exact
 SHA-256 digest, pipeline role, and exact static input and output contracts.
 
-The initial runtime admits exactly one fixed-shape float32 input and a bounded,
-non-empty list of fixed-shape float32 outputs. Tensor names, ranks, dimensions,
+The runtime admits exactly one fixed-shape float32 input for ordinary roles. A passive-liveness
+fusion graph must instead declare exactly two unique named inputs: `infrared` and `visible` in the
+reviewed installation manifest. All roles have a bounded, non-empty list of fixed-shape float32
+outputs. Tensor names, ranks, dimensions,
 and element counts are bounded. Dynamic dimensions, unexpected graph inputs or
 outputs, duplicate outputs, and name/type/shape mismatches fail closed.
-Schema v8 binds the resize filter, finite per-channel affine normalization
+Schema v9 binds every input's resize filter, finite per-channel affine normalization
 (`pixel * scale + bias`), and security-relevant output semantics to the model and
 its calibration record. Detector roles require exact normalized `[1,N,4]` box and `[1,N]`
 confidence outputs; landmark roles require exact normalized `[1,L,2]` points. Embedding roles
@@ -17,6 +19,11 @@ require exactly one bounded embedding output; passive-PAD roles require exactly 
 live-probability output. Detector confidence filtering is explicit and calibrated. A detector graph
 must either include its reviewed decode/NMS stage or be followed by a separately reviewed,
 contract-bound postprocessor before the single-face policy is applied.
+
+Fusion execution binds tensors by exact name rather than argument order. Both tensors must derive
+from the same admitted IR/RGB paired observation; missing, duplicate, unexpected, swapped-modality,
+malformed, or non-finite inputs fail closed. Each input has its own manifest-bound color and
+normalization contract, and changing either invalidates the compatibility digest and calibration.
 
 Embedding manifests must also contain an exact five-point similarity-alignment contract. It binds
 the complete landmark-model compatibility digest, five unique topology indices, normalized target
