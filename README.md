@@ -24,7 +24,8 @@ identity or liveness evidence.
 - A privileged daemon owns cameras, inference, liveness, and encrypted templates.
 - A small PAM module exchanges nonce-bound messages with the daemon.
 - Enrollment requires existing authorization through Polkit or PAM.
-- KDE System Settings is a thin client over desktop-independent service APIs.
+- KDE System Settings provides a thin `Security & Privacy → Face Authentication` client over
+  desktop-independent service APIs.
 - Raw enrollment frames are ephemeral and are not retained by default.
 - Face authentication never removes the password path.
 

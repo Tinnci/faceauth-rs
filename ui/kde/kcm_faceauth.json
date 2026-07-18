@@ -5,10 +5,13 @@
     "Description": "Enroll and manage secure IR face authentication",
     "Icon": "preferences-desktop-user-password",
     "Category": "Security",
+    "FormFactors": [
+      "desktop"
+    ],
     "License": "MIT OR Apache-2.0",
     "Version": "0.1.0"
   },
-  "X-KDE-System-Settings-Parent-Category": "security",
+  "X-KDE-System-Settings-Parent-Category": "security-privacy",
   "X-KDE-Keywords": "face,authentication,biometrics,login,lock screen,IR",
   "X-KDE-Weight": 40
 }

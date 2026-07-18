@@ -19,6 +19,12 @@ constexpr auto managerPath = "/org/faceauth/Manager1";
 constexpr auto managerInterface = "org.faceauth.Manager1";
 constexpr quint16 supportedSchemaVersion = 2;
 
+QString uniqueBusConnectionName()
+{
+    return QStringLiteral("faceauth-kcm-")
+        + QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
 bool isCanonicalOperationId(const QString &value)
 {
     const auto id = QUuid::fromString(value);
@@ -68,19 +74,20 @@ K_PLUGIN_CLASS_WITH_JSON(FaceAuthKcm, "kcm_faceauth.json")
 
 FaceAuthKcm::FaceAuthKcm(QObject *parent, const KPluginMetaData &metaData)
     : KQuickConfigModule(parent, metaData)
-    , m_manager(new QDBusInterface(QString::fromLatin1(managerService),
-                                   QString::fromLatin1(managerPath),
-                                   QString::fromLatin1(managerInterface),
-                                   QDBusConnection::systemBus(),
-                                   this))
-    , m_serviceWatcher(new QDBusServiceWatcher(QString::fromLatin1(managerService),
-                                               QDBusConnection::systemBus(),
-                                               QDBusServiceWatcher::WatchForRegistration
-                                                   | QDBusServiceWatcher::WatchForUnregistration,
-                                               this))
+    , m_busConnectionName(uniqueBusConnectionName())
     , m_uid(static_cast<quint32>(geteuid()))
 {
-    auto bus = QDBusConnection::systemBus();
+    auto bus = QDBusConnection::connectToBus(QDBusConnection::SystemBus, m_busConnectionName);
+    m_manager = new QDBusInterface(QString::fromLatin1(managerService),
+                                   QString::fromLatin1(managerPath),
+                                   QString::fromLatin1(managerInterface),
+                                   bus,
+                                   this);
+    m_serviceWatcher = new QDBusServiceWatcher(
+        QString::fromLatin1(managerService),
+        bus,
+        QDBusServiceWatcher::WatchForRegistration | QDBusServiceWatcher::WatchForUnregistration,
+        this);
     bus.connect(QString::fromLatin1(managerService),
                 QString::fromLatin1(managerPath),
                 QString::fromLatin1(managerInterface),
@@ -104,7 +111,11 @@ FaceAuthKcm::FaceAuthKcm(QObject *parent, const KPluginMetaData &metaData)
     refresh();
 }
 
-FaceAuthKcm::~FaceAuthKcm() = default;
+FaceAuthKcm::~FaceAuthKcm()
+{
+    bestEffortCancel();
+    QDBusConnection::disconnectFromBus(m_busConnectionName);
+}
 
 bool FaceAuthKcm::daemonAvailable() const
 {
@@ -116,9 +127,57 @@ bool FaceAuthKcm::enrolled() const
     return m_enrolled;
 }
 
+bool FaceAuthKcm::loading() const
+{
+    return m_pageState == PageState::Loading;
+}
+
 bool FaceAuthKcm::busy() const
 {
-    return m_starting || !m_operationId.isEmpty();
+    return m_pageState == PageState::Authorizing || m_pageState == PageState::Starting
+        || m_pageState == PageState::Capturing || m_pageState == PageState::Cancelling;
+}
+
+bool FaceAuthKcm::canCancel() const
+{
+    return !m_operationId.isEmpty()
+        && (m_pageState == PageState::Starting || m_pageState == PageState::Capturing);
+}
+
+QString FaceAuthKcm::pageState() const
+{
+    switch (m_pageState) {
+    case PageState::Loading:
+        return QStringLiteral("loading");
+    case PageState::Ready:
+        return QStringLiteral("ready");
+    case PageState::Authorizing:
+        return QStringLiteral("authorizing");
+    case PageState::Starting:
+        return QStringLiteral("starting");
+    case PageState::Capturing:
+        return QStringLiteral("capturing");
+    case PageState::Cancelling:
+        return QStringLiteral("cancelling");
+    case PageState::Terminal:
+        return QStringLiteral("terminal");
+    }
+    Q_UNREACHABLE_RETURN(QStringLiteral("terminal"));
+}
+
+QString FaceAuthKcm::retryAction() const
+{
+    switch (m_retryAction) {
+    case RetryAction::None:
+        return QStringLiteral("none");
+    case RetryAction::Refresh:
+        return QStringLiteral("refresh");
+    case RetryAction::BeginEnrollment:
+        return QStringLiteral("begin-enrollment");
+    case RetryAction::CancelEnrollment:
+        return QStringLiteral("cancel-enrollment");
+    }
+    Q_UNREACHABLE_RETURN(QStringLiteral("none"));
 }
 
 quint16 FaceAuthKcm::schemaVersion() const
@@ -143,8 +202,19 @@ QString FaceAuthKcm::errorCode() const
 
 void FaceAuthKcm::refresh()
 {
+    if (busy()) {
+        return;
+    }
     const auto generation = ++m_generation;
+    m_refreshRepliesPending = 2;
+    m_refreshVersionSucceeded = false;
+    m_refreshEnrollmentSucceeded = false;
+    m_refreshVersionError.clear();
+    m_refreshEnrollmentError.clear();
+    setPageState(PageState::Loading);
+    setRetryAction(RetryAction::None);
     setErrorCode({});
+    setOutcome({});
     refreshVersion(generation);
     refreshEnrollmentState(generation);
 }
@@ -159,16 +229,17 @@ void FaceAuthKcm::refreshVersion(quint64 generation)
             return;
         }
         if (reply.isError()) {
-            setDaemonAvailable(false);
             setSchemaVersion(0);
-            setErrorCode(errorCodeFor(reply.error(), QStringLiteral("request-failed")));
+            finishRefreshReply(
+                true, false, errorCodeFor(reply.error(), QStringLiteral("request-failed")));
             return;
         }
-        setDaemonAvailable(true);
         setSchemaVersion(reply.value());
         if (reply.value() != supportedSchemaVersion) {
-            setErrorCode(QStringLiteral("protocol-mismatch"));
+            finishRefreshReply(true, true, QStringLiteral("protocol-mismatch"));
+            return;
         }
+        finishRefreshReply(true, true);
     });
 }
 
@@ -183,13 +254,45 @@ void FaceAuthKcm::refreshEnrollmentState(quint64 generation)
             return;
         }
         if (reply.isError()) {
-            setDaemonAvailable(false);
-            setErrorCode(errorCodeFor(reply.error(), QStringLiteral("request-failed")));
+            finishRefreshReply(
+                false, false, errorCodeFor(reply.error(), QStringLiteral("request-failed")));
             return;
         }
-        setDaemonAvailable(true);
         setEnrolled(reply.value());
+        finishRefreshReply(false, true);
     });
+}
+
+void FaceAuthKcm::finishRefreshReply(bool versionReply,
+                                     bool succeeded,
+                                     const QString &errorCode)
+{
+    if (versionReply) {
+        m_refreshVersionSucceeded = succeeded;
+        m_refreshVersionError = errorCode;
+    } else {
+        m_refreshEnrollmentSucceeded = succeeded;
+        m_refreshEnrollmentError = errorCode;
+    }
+    if (m_refreshRepliesPending == 0 || --m_refreshRepliesPending != 0) {
+        return;
+    }
+
+    const bool available = m_refreshVersionSucceeded && m_refreshEnrollmentSucceeded;
+    setDaemonAvailable(available);
+    const QString failure = !m_refreshVersionError.isEmpty() ? m_refreshVersionError
+                                                              : m_refreshEnrollmentError;
+    if (available && failure.isEmpty() && m_schemaVersion == supportedSchemaVersion) {
+        setErrorCode({});
+        setRetryAction(RetryAction::None);
+        setPageState(PageState::Ready);
+        return;
+    }
+
+    setErrorCode(failure.isEmpty() ? QStringLiteral("request-failed") : failure);
+    setRetryAction(failure == QLatin1String("protocol-mismatch") ? RetryAction::None
+                                                                  : RetryAction::Refresh);
+    setPageState(PageState::Terminal);
 }
 
 void FaceAuthKcm::beginEnrollment()
@@ -198,8 +301,10 @@ void FaceAuthKcm::beginEnrollment()
         return;
     }
     const auto generation = ++m_generation;
-    setStarting(true);
-    setCue(QStringLiteral("preparing"));
+    setPageState(PageState::Authorizing);
+    setRetryAction(RetryAction::None);
+    setOperationId({});
+    setCue({});
     setOutcome({});
     setErrorCode({});
     auto *watcher = new QDBusPendingCallWatcher(
@@ -210,29 +315,47 @@ void FaceAuthKcm::beginEnrollment()
         if (generation != m_generation) {
             return;
         }
-        setStarting(false);
         if (reply.isError()) {
+            bestEffortCancel();
+            setOperationId({});
             setCue({});
-            setErrorCode(errorCodeFor(reply.error(), QStringLiteral("enrollment-failed")));
+            const QString errorCode =
+                errorCodeFor(reply.error(), QStringLiteral("enrollment-failed"));
+            setErrorCode(errorCode);
+            setRetryAction(errorCode == QLatin1String("daemon-unavailable")
+                               ? RetryAction::Refresh
+                               : RetryAction::BeginEnrollment);
+            setPageState(PageState::Terminal);
             return;
         }
         if (!isCanonicalOperationId(reply.value())
             || (!m_operationId.isEmpty() && m_operationId != reply.value())) {
+            bestEffortCancel();
             setOperationId({});
             setCue({});
             setErrorCode(QStringLiteral("invalid-operation"));
+            setRetryAction(RetryAction::Refresh);
+            setPageState(PageState::Terminal);
             return;
         }
         setOperationId(reply.value());
+        if (m_pageState == PageState::Authorizing) {
+            setCue(QStringLiteral("preparing"));
+            setPageState(PageState::Starting);
+        }
     });
 }
 
 void FaceAuthKcm::cancelEnrollment()
 {
-    if (m_operationId.isEmpty()) {
+    if (!canCancel()) {
         return;
     }
     const auto generation = m_generation;
+    m_stateBeforeCancel = m_pageState;
+    setPageState(PageState::Cancelling);
+    setRetryAction(RetryAction::None);
+    setErrorCode({});
     auto *watcher = new QDBusPendingCallWatcher(
         m_manager->asyncCall(QStringLiteral("CancelEnrollment"),
                              QVariant::fromValue(m_uid),
@@ -245,9 +368,30 @@ void FaceAuthKcm::cancelEnrollment()
             return;
         }
         if (reply.isError()) {
+            setPageState(m_stateBeforeCancel);
             setErrorCode(errorCodeFor(reply.error(), QStringLiteral("cancel-failed")));
+            setRetryAction(RetryAction::CancelEnrollment);
         }
     });
+}
+
+void FaceAuthKcm::retry()
+{
+    const auto action = m_retryAction;
+    setRetryAction(RetryAction::None);
+    switch (action) {
+    case RetryAction::None:
+        return;
+    case RetryAction::Refresh:
+        refresh();
+        return;
+    case RetryAction::BeginEnrollment:
+        beginEnrollment();
+        return;
+    case RetryAction::CancelEnrollment:
+        cancelEnrollment();
+        return;
+    }
 }
 
 void FaceAuthKcm::handleServiceRegistered()
@@ -258,52 +402,73 @@ void FaceAuthKcm::handleServiceRegistered()
 void FaceAuthKcm::handleServiceUnregistered()
 {
     ++m_generation;
+    m_refreshRepliesPending = 0;
     setDaemonAvailable(false);
     setSchemaVersion(0);
-    setStarting(false);
     setOperationId({});
     setCue({});
     setOutcome(QStringLiteral("unavailable"));
     setErrorCode(QStringLiteral("daemon-unavailable"));
+    setRetryAction(RetryAction::Refresh);
+    setPageState(PageState::Terminal);
 }
 
 void FaceAuthKcm::handleEnrollmentProgress(const QString &operationId, const QString &progress)
 {
-    if (!isCanonicalOperationId(operationId) || !isKnownProgress(progress)) {
-        setErrorCode(QStringLiteral("protocol-mismatch"));
+    if (!isCanonicalOperationId(operationId)) {
+        if (busy()) {
+            setErrorCode(QStringLiteral("protocol-mismatch"));
+            setRetryAction(RetryAction::None);
+        }
         return;
     }
-    if (m_operationId.isEmpty() && m_starting) {
+    if (m_operationId.isEmpty() && m_pageState == PageState::Authorizing) {
         setOperationId(operationId);
     }
     if (operationId != m_operationId) {
         return;
     }
+    if (!isKnownProgress(progress)) {
+        setErrorCode(QStringLiteral("protocol-mismatch"));
+        setRetryAction(RetryAction::None);
+        return;
+    }
+    if (m_pageState == PageState::Cancelling) {
+        return;
+    }
     setCue(progress);
+    setPageState(progress == QLatin1String("preparing") ? PageState::Starting
+                                                         : PageState::Capturing);
 }
 
 void FaceAuthKcm::handleEnrollmentCompleted(const QString &operationId, const QString &result)
 {
     if (!isCanonicalOperationId(operationId)) {
-        setErrorCode(QStringLiteral("protocol-mismatch"));
+        if (busy()) {
+            setErrorCode(QStringLiteral("protocol-mismatch"));
+            setRetryAction(RetryAction::None);
+        }
         return;
     }
-    if (m_operationId.isEmpty() && m_starting) {
+    if (m_operationId.isEmpty() && m_pageState == PageState::Authorizing) {
         setOperationId(operationId);
     }
     if (operationId != m_operationId) {
         return;
     }
     ++m_generation;
-    setStarting(false);
+    m_refreshRepliesPending = 0;
     setCue({});
     if (isKnownResult(result)) {
         setOutcome(experienceOutcome(result));
+        setErrorCode({});
     } else {
         setOutcome(QStringLiteral("unavailable"));
         setErrorCode(QStringLiteral("protocol-mismatch"));
     }
     setOperationId({});
+    setRetryAction(RetryAction::None);
+    setPageState(PageState::Terminal);
     if (result == QLatin1String("completed")) {
         setEnrolled(true);
     }
@@ -327,16 +492,30 @@ void FaceAuthKcm::setEnrolled(bool enrolled)
     Q_EMIT enrolledChanged();
 }
 
-void FaceAuthKcm::setStarting(bool starting)
+void FaceAuthKcm::setPageState(PageState state)
 {
-    if (m_starting == starting) {
+    if (m_pageState == state) {
         return;
     }
     const bool wasBusy = busy();
-    m_starting = starting;
+    const bool wasCancellable = canCancel();
+    m_pageState = state;
+    Q_EMIT pageStateChanged();
     if (wasBusy != busy()) {
         Q_EMIT busyChanged();
     }
+    if (wasCancellable != canCancel()) {
+        Q_EMIT canCancelChanged();
+    }
+}
+
+void FaceAuthKcm::setRetryAction(RetryAction action)
+{
+    if (m_retryAction == action) {
+        return;
+    }
+    m_retryAction = action;
+    Q_EMIT retryActionChanged();
 }
 
 void FaceAuthKcm::setSchemaVersion(quint16 version)
@@ -381,10 +560,25 @@ void FaceAuthKcm::setOperationId(const QString &operationId)
         return;
     }
     const bool wasBusy = busy();
+    const bool wasCancellable = canCancel();
     m_operationId = operationId;
     if (wasBusy != busy()) {
         Q_EMIT busyChanged();
     }
+    if (wasCancellable != canCancel()) {
+        Q_EMIT canCancelChanged();
+    }
+}
+
+void FaceAuthKcm::bestEffortCancel()
+{
+    if (m_manager == nullptr || m_operationId.isEmpty() || m_pageState == PageState::Cancelling) {
+        return;
+    }
+    m_manager->call(QDBus::NoBlock,
+                    QStringLiteral("CancelEnrollment"),
+                    QVariant::fromValue(m_uid),
+                    m_operationId);
 }
 
 #include "faceauthkcm.moc"

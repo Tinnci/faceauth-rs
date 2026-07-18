@@ -13,6 +13,26 @@ Kirigami.ScrollablePage {
     id: root
 
     readonly property var backend: kcm
+    readonly property bool cancelling: root.backend.pageState === "cancelling"
+
+    function accessibleStatus() {
+        if (root.backend.loading)
+            return i18n("Checking face authentication status");
+
+        if (root.backend.pageState === "authorizing")
+            return i18n("Waiting for enrollment authorization");
+
+        if (root.backend.busy)
+            return i18n("Face enrollment in progress");
+
+        if (root.backend.outcome === "succeeded")
+            return i18n("Face enrollment completed");
+
+        if (root.backend.outcome === "unavailable")
+            return i18n("Face enrollment unavailable");
+
+        return root.backend.enrolled ? i18n("Face authentication enrolled") : i18n("Face authentication not enrolled");
+    }
 
     function errorText(code) {
         const messages = {
@@ -25,6 +45,33 @@ Kirigami.ScrollablePage {
             "request-failed": i18n("The service did not complete the request.")
         };
         return messages[code] || "";
+    }
+
+    function headlineText() {
+        if (root.backend.loading)
+            return i18n("Checking face authentication…");
+
+        return root.backend.enrolled ? i18n("Your face is enrolled") : i18n("Set up face authentication");
+    }
+
+    function retryText(action) {
+        if (action === "begin-enrollment")
+            return i18n("Try Enrollment Again");
+
+        if (action === "cancel-enrollment")
+            return i18n("Try Cancelling Again");
+
+        return i18n("Reconnect");
+    }
+
+    function statusText() {
+        if (root.backend.loading)
+            return i18n("Reading your enrollment state securely.");
+
+        if (root.backend.enrolled)
+            return i18n("Use the infrared and visible cameras for supported unlock and authorization prompts.");
+
+        return i18n("Register with the infrared and visible cameras. Your password will remain available.");
     }
 
     title: i18n("Face Authentication")
@@ -42,9 +89,10 @@ Kirigami.ScrollablePage {
             text: root.errorText(root.backend.errorCode)
             actions: [
                 Kirigami.Action {
-                    text: i18n("Try Again")
+                    visible: root.backend.retryAction !== "none"
+                    text: root.retryText(root.backend.retryAction)
                     icon.name: "view-refresh"
-                    onTriggered: root.backend.refresh()
+                    onTriggered: root.backend.retry()
                 }
             ]
         }
@@ -55,15 +103,15 @@ Kirigami.ScrollablePage {
 
             FaceStatusRing {
                 Layout.alignment: Qt.AlignHCenter
-                running: root.backend.busy
-                iconName: root.backend.outcome === "succeeded" ? "dialog-ok-apply" : "edit-image-face-recognize"
-                tone: root.backend.outcome === "succeeded" ? "success" : (root.backend.outcome === "unavailable" ? "error" : "neutral")
-                accessibleName: root.backend.enrolled ? i18n("Face authentication enrolled") : i18n("Face authentication not enrolled")
+                running: root.backend.loading || root.backend.busy
+                iconName: root.backend.outcome === "succeeded" ? "dialog-ok-apply" : (root.backend.outcome === "timed-out" ? "chronometer" : (root.backend.outcome === "cancelled" ? "dialog-cancel" : "edit-image-face-recognize"))
+                tone: root.backend.outcome === "succeeded" ? "success" : (root.backend.outcome === "unavailable" ? "error" : (root.backend.outcome === "timed-out" ? "attention" : "neutral"))
+                accessibleName: root.accessibleStatus()
             }
 
             QQC2.Label {
                 Layout.fillWidth: true
-                text: root.backend.enrolled ? i18n("Your face is enrolled") : i18n("Set up face authentication")
+                text: root.headlineText()
                 font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
                 font.bold: true
                 horizontalAlignment: Text.AlignHCenter
@@ -72,7 +120,7 @@ Kirigami.ScrollablePage {
 
             QQC2.Label {
                 Layout.fillWidth: true
-                text: root.backend.enrolled ? i18n("Use the infrared camera for supported unlock and authorization prompts.") : i18n("Register with the infrared and visible cameras. Your password will remain available.")
+                text: root.statusText()
                 color: Kirigami.Theme.textColor
                 opacity: 0.72
                 horizontalAlignment: Text.AlignHCenter
@@ -82,7 +130,7 @@ Kirigami.ScrollablePage {
             GuidancePanel {
                 Layout.fillWidth: true
                 visible: root.backend.busy || root.backend.outcome.length > 0
-                cue: root.backend.cue
+                cue: root.backend.pageState === "authorizing" ? "authorizing" : (root.cancelling ? "cancelling" : root.backend.cue)
                 outcome: root.backend.outcome
                 running: root.backend.busy
                 mode: "enrollment"
@@ -95,14 +143,15 @@ Kirigami.ScrollablePage {
                 QQC2.Button {
                     text: root.backend.enrolled ? i18n("Update Face") : i18n("Set Up")
                     icon.name: "camera-web"
-                    enabled: root.backend.daemonAvailable && root.backend.schemaVersion === 2 && !root.backend.busy
+                    enabled: !root.backend.loading && root.backend.daemonAvailable && root.backend.schemaVersion === 2 && !root.backend.busy
                     onClicked: root.backend.beginEnrollment()
                 }
 
                 QQC2.Button {
-                    visible: root.backend.busy
-                    text: i18n("Cancel")
-                    icon.name: "dialog-cancel"
+                    visible: root.backend.canCancel || root.cancelling
+                    text: root.cancelling ? i18n("Cancelling…") : i18n("Cancel")
+                    icon.name: root.cancelling ? "view-refresh" : "dialog-cancel"
+                    enabled: root.backend.canCancel
                     onClicked: root.backend.cancelEnrollment()
                 }
             }
@@ -144,7 +193,7 @@ Kirigami.ScrollablePage {
 
         QQC2.Label {
             Layout.fillWidth: true
-            text: root.backend.daemonAvailable ? i18n("Service connected · management schema %1", root.backend.schemaVersion) : i18n("Service disconnected")
+            text: root.backend.loading ? i18n("Checking service…") : (root.backend.daemonAvailable ? i18n("Service connected · management schema %1", root.backend.schemaVersion) : i18n("Service disconnected"))
             color: Kirigami.Theme.textColor
             opacity: 0.72
             horizontalAlignment: Text.AlignHCenter

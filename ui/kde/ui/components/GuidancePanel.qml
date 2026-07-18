@@ -41,6 +41,8 @@ ColumnLayout {
 
     function titleForCue(value) {
         const titles = {
+            "authorizing": i18n("Authorize face setup"),
+            "cancelling": i18n("Cancelling enrollment…"),
             "preparing": i18n("Getting the cameras ready…"),
             "position-face": i18n("Center your face"),
             "hold-still": i18n("Hold still"),
@@ -56,6 +58,8 @@ ColumnLayout {
 
     function bodyForCue(value) {
         const bodies = {
+            "authorizing": i18n("Complete or dismiss the administrator authorization prompt."),
+            "cancelling": i18n("Waiting for the service to stop camera and enrollment work."),
             "preparing": i18n("This should only take a moment."),
             "position-face": i18n("Keep your face inside the guide and look at the camera."),
             "hold-still": i18n("Keep your eyes open and maintain a natural expression."),
