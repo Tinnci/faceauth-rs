@@ -53,10 +53,12 @@ prevents configuration from claiming capabilities the binary does not yet compos
 
 Neither `doctor` nor readiness inspection opens cameras, creates TPM keys, binds the authentication
 socket, claims a D-Bus name, installs policy, enables a service, or changes PAM configuration.
-The explicit production authentication builder is separate: it first revalidates trusted model and
+The explicit production biometric builder is separate: it first revalidates trusted model and
 calibration evidence, then resolves and negotiates both configured V4L2 streams, loads all six
-role-bound ONNX sessions, verifies their complete compatibility digests, and only then returns the
-single-worker engine.
+role-bound ONNX sessions, verifies their complete compatibility digests, and only then returns
+authentication and enrollment adapters sharing one camera/model owner. The existing global
+non-queueing arbiter remains mandatory; a second adapter can never wait on or concurrently enter
+the shared observation pipeline.
 Separate explicit builders self-test the TPM-unsealed machine key before returning an encrypted
 template store, and bind the authentication socket without unlinking any existing path before
 returning its exact authorization, framing, and transaction policies. Diagnostic file keys cannot

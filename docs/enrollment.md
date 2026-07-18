@@ -54,10 +54,20 @@ and target population.
 
 ## Worker and commit boundary
 
-The daemon enrollment service is single-capacity and shares the global camera/model arbiter with
-authentication. Submission is non-queueing and bound to the exact Manager1 operation ID, root
-broker authorization, target UID, private cancellation signal, and daemon shutdown token. The
-engine owns capture and inference and may return only a validated derived `TemplateRecord`.
+The daemon enrollment service is single-capacity and shares both the global camera/model arbiter
+and the exact `ProductionObservationPipeline` instance with authentication. That pipeline is the
+unique owner of the configured IR/RGB devices and all six mutable ONNX sessions: detector,
+landmarks, embedding, IR PAD, visible PAD, and named-input fusion PAD. Submission is non-queueing
+and bound to the exact Manager1 operation ID, root broker authorization, target UID, private
+cancellation signal, and daemon shutdown token.
+
+One operation-bound randomized challenge must pass before any enrollment sample is admitted. The
+same paired frames then feed detection, landmarks, quality, aligned embedding, and all three PAD
+paths. Later samples require new IR and visible sequence values and a strictly newer paired
+timestamp; frames closer than the calibrated sample interval are discarded without poisoning the
+enrollment state. Low-quality observations may be retried, while PAD failure, model mismatch,
+identity inconsistency, stale evidence, or exhausted bounded attempts fail closed. The engine may
+return only a validated derived `TemplateRecord`.
 
 The service rechecks the record UID and structure, then commits it through the authenticated atomic
 template sink. Only after storage succeeds does the worker channel emit an empty successful

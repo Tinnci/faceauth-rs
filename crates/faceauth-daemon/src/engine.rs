@@ -1,6 +1,7 @@
 //! Single-capacity authentication engine worker and derived-evidence boundary.
 
 use std::{
+    ops::ControlFlow,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,8 +20,7 @@ use faceauth_inference::{
     InferenceError, InputTensor, OnnxSession, PassiveLivenessScore,
 };
 use faceauth_liveness::{
-    ChallengeAction, ChallengeConfig, ChallengeError, ChallengeObservation, ChallengeProgress,
-    ChallengeSession,
+    ChallengeConfig, ChallengeError, ChallengeObservation, ChallengeProgress, ChallengeSession,
 };
 use faceauth_model::ModelRole;
 use faceauth_protocol::{ProgressCode, TransactionId};
@@ -34,6 +34,11 @@ use thiserror::Error;
 use crate::{
     AuthenticationObservation, AuthenticationWorker, BiometricResourceArbiter,
     BiometricResourceError, BiometricResourceLease, BiometricResourceOwner, ShutdownToken,
+    observation::{
+        DerivedBiometricObservation, ObservationFailure, ObservationProgress,
+        ProductionObservationPipeline, ProductionObservationPipelineError,
+        SharedProductionObservationPipeline,
+    },
 };
 
 const REQUEST_QUEUE_CAPACITY: usize = 1;
@@ -437,23 +442,13 @@ impl DetectionPolicy {
     }
 }
 
-/// Real V4L2/ONNX authentication engine.
+/// Real authentication adapter over the shared V4L2/ONNX observation pipeline.
 ///
-/// Devices and mutable sessions remain owned by the single supervised engine worker. Each
-/// transaction creates short-lived mmap streams on the worker stack, and only
+/// Authentication and enrollment never duplicate or concurrently enter the camera/model owner.
+/// Each operation creates short-lived mmap streams on the owning worker stack, and only
 /// [`DerivedAuthenticationEvidence`] leaves this boundary.
 pub struct ProductionAuthenticationEngine {
-    infrared_device: V4l2CaptureDevice,
-    visible_device: V4l2CaptureDevice,
-    detector: OnnxSession,
-    landmarks: OnnxSession,
-    embedding: OnnxSession,
-    passive_infrared: OnnxSession,
-    passive_visible: OnnxSession,
-    passive_fusion: OnnxSession,
-    pairing: PairingPolicy,
-    detection: DetectionPolicy,
-    quality: QualityConfig,
+    pipeline: SharedProductionObservationPipeline,
     challenge: ChallengeConfig,
 }
 
@@ -479,26 +474,7 @@ impl ProductionAuthenticationEngine {
         quality: QualityConfig,
         challenge: ChallengeConfig,
     ) -> Result<Self, ProductionAuthenticationEngineError> {
-        pairing.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
-        detection.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
-        quality.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
-        challenge.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
-        for (session, expected) in [
-            (&detector, ModelRole::FaceDetector),
-            (&landmarks, ModelRole::FaceLandmarks),
-            (&embedding, ModelRole::FaceEmbedding),
-            (&passive_infrared, ModelRole::PassiveLivenessInfrared),
-            (&passive_visible, ModelRole::PassiveLivenessVisible),
-            (&passive_fusion, ModelRole::PassiveLivenessFusion),
-        ] {
-            if session.role() != expected {
-                return Err(ProductionAuthenticationEngineError::ModelRoleMismatch {
-                    expected,
-                    actual: session.role(),
-                });
-            }
-        }
-        Ok(Self {
+        let pipeline = ProductionObservationPipeline::new(
             infrared_device,
             visible_device,
             detector,
@@ -510,43 +486,30 @@ impl ProductionAuthenticationEngine {
             pairing,
             detection,
             quality,
-            challenge,
-        })
+        )
+        .map_err(Self::map_pipeline_error)?;
+        Self::from_shared(Arc::new(std::sync::Mutex::new(pipeline)), challenge)
     }
 
-    fn process_pair(
-        job: &AuthenticationJob,
-        pair: &PairedFrames,
-        detector: &mut OnnxSession,
-        landmarks_session: &mut OnnxSession,
-        detection: DetectionPolicy,
-    ) -> Result<FacialLandmarks, AuthenticationEngineFailure> {
-        let detector_input =
-            job.preprocess_frame(detector, &pair.visible).map_err(|_| inference_failure(job))?;
-        ensure_active(job)?;
-        let detector_outputs = detector.run(&detector_input).map_err(|_| inference_failure(job))?;
-        ensure_active(job)?;
-        let detections = detector
-            .extract_face_detections(&detector_outputs, detection.minimum_confidence)
-            .and_then(|faces| {
-                faces.suppress_overlaps(detection.maximum_iou, detection.maximum_faces)
-            })
-            .map_err(|_| inference_failure(job))?;
-        let face = detections.require_single_face().map_err(|_| inference_failure(job))?;
-        let region = landmarks_session
-            .derive_face_region(face.bounds())
-            .map_err(|_| inference_failure(job))?;
-        let visible_image =
-            inference_frame_view(&pair.visible).map_err(|_| inference_failure(job))?;
-        let landmark_input = job
-            .preprocess_face_region(landmarks_session, visible_image, &region)
-            .map_err(|_| inference_failure(job))?;
-        ensure_active(job)?;
-        let outputs = landmarks_session.run(&landmark_input).map_err(|_| inference_failure(job))?;
-        ensure_active(job)?;
-        landmarks_session
-            .extract_face_landmarks(&outputs, &region)
-            .map_err(|_| inference_failure(job))
+    pub(crate) fn from_shared(
+        pipeline: SharedProductionObservationPipeline,
+        challenge: ChallengeConfig,
+    ) -> Result<Self, ProductionAuthenticationEngineError> {
+        challenge.validate().map_err(|_| ProductionAuthenticationEngineError::InvalidPolicy)?;
+        Ok(Self { pipeline, challenge })
+    }
+
+    const fn map_pipeline_error(
+        error: ProductionObservationPipelineError,
+    ) -> ProductionAuthenticationEngineError {
+        match error {
+            ProductionObservationPipelineError::InvalidPolicy => {
+                ProductionAuthenticationEngineError::InvalidPolicy
+            }
+            ProductionObservationPipelineError::ModelRoleMismatch { expected, actual } => {
+                ProductionAuthenticationEngineError::ModelRoleMismatch { expected, actual }
+            }
+        }
     }
 }
 
@@ -573,171 +536,65 @@ impl AuthenticationEngine for ProductionAuthenticationEngine {
         job: &AuthenticationJob,
         progress: &mut dyn FnMut(ProgressCode) -> Result<(), AuthenticationEngineFailure>,
     ) -> Result<DerivedAuthenticationEvidence, AuthenticationEngineFailure> {
-        self.pairing.validate().map_err(|_| AuthenticationEngineFailure::Capture)?;
-        self.detection.validate()?;
-        self.quality.validate().map_err(|_| AuthenticationEngineFailure::InvalidEvidence)?;
-        self.challenge.validate().map_err(|_| AuthenticationEngineFailure::Liveness)?;
         ensure_active(job)?;
-
-        let mut infrared = self.infrared_device.stream().map_err(|_| capture_failure(job))?;
-        let mut visible = self.visible_device.stream().map_err(|_| capture_failure(job))?;
-        progress(ProgressCode::PositionFace)?;
-
-        let mut challenge: Option<ChallengeSession> = None;
-        let mut last_public_progress: Option<ProgressCode> = None;
-        loop {
-            let pair = job
-                .capture_pair(&mut infrared, &mut visible, self.pairing)
-                .map_err(|_| capture_failure(job))?;
-            let landmarks = Self::process_pair(
-                job,
-                &pair,
-                &mut self.detector,
-                &mut self.landmarks,
-                self.detection,
-            )?;
-            let timing = pair.timing();
-            let observation_time = timing
-                .visible_timestamp_micros
-                .map_or(timing.infrared_timestamp_micros, |visible| {
-                    timing.infrared_timestamp_micros.max(visible)
-                });
-            let challenge = match challenge.as_mut() {
-                Some(challenge) => challenge,
-                None => challenge.insert(
-                    ChallengeSession::begin(self.challenge, observation_time)
-                        .map_err(|_| AuthenticationEngineFailure::Liveness)?,
-                ),
-            };
-            let challenge_progress = job
-                .observe_landmark_liveness(
-                    challenge,
-                    timing,
-                    pair.infrared.summary().sequence,
-                    pair.visible.summary().sequence,
-                    &landmarks,
-                )
-                .map_err(|_| liveness_failure(job))?;
-            if challenge_progress != ChallengeProgress::Passed {
-                let public = challenge_progress_code(challenge_progress);
-                if last_public_progress != Some(public) {
-                    progress(public)?;
-                    last_public_progress = Some(public);
+        let mut pipeline =
+            self.pipeline.try_lock().map_err(|_| AuthenticationEngineFailure::Internal)?;
+        let mut cancelled = || job.is_cancelled();
+        let mut relay_progress = |update| {
+            progress(authentication_progress(update)).map_err(|_| {
+                if job.is_cancelled() {
+                    ObservationFailure::Cancelled
+                } else {
+                    ObservationFailure::Internal
                 }
-                continue;
-            }
-
-            progress(ProgressCode::Processing)?;
-            let quality = job
-                .assess_landmark_frame_quality(&pair.visible, &landmarks, self.quality)
-                .map_err(|_| invalid_evidence_failure(job))?;
-            let image_landmarks = landmarks.map_to_image().map_err(|_| inference_failure(job))?;
-            let visible_image =
-                inference_frame_view(&pair.visible).map_err(|_| inference_failure(job))?;
-            let embedding_input = job
-                .preprocess_aligned(&self.embedding, visible_image, &image_landmarks)
-                .map_err(|_| inference_failure(job))?;
-            ensure_active(job)?;
-            let embedding_outputs =
-                self.embedding.run(&embedding_input).map_err(|_| inference_failure(job))?;
-            let embedding = self
-                .embedding
-                .extract_embedding(&embedding_outputs)
-                .map_err(|_| inference_failure(job))?;
-
-            let infrared_input = job
-                .preprocess_frame(&self.passive_infrared, &pair.infrared)
-                .map_err(|_| inference_failure(job))?;
-            let visible_input = job
-                .preprocess_frame(&self.passive_visible, &pair.visible)
-                .map_err(|_| inference_failure(job))?;
-            let fusion_infrared = job
-                .preprocess_named_frame(&self.passive_fusion, "infrared", &pair.infrared)
-                .map_err(|_| inference_failure(job))?;
-            let fusion_visible = job
-                .preprocess_named_frame(&self.passive_fusion, "visible", &pair.visible)
-                .map_err(|_| inference_failure(job))?;
-            ensure_active(job)?;
-            let infrared_outputs =
-                self.passive_infrared.run(&infrared_input).map_err(|_| inference_failure(job))?;
-            ensure_active(job)?;
-            let visible_outputs =
-                self.passive_visible.run(&visible_input).map_err(|_| inference_failure(job))?;
-            ensure_active(job)?;
-            let fusion_outputs = self
-                .passive_fusion
-                .run_named(&[("infrared", &fusion_infrared), ("visible", &fusion_visible)])
-                .map_err(|_| inference_failure(job))?;
-            ensure_active(job)?;
-            let passive_liveness = vec![
-                self.passive_infrared
-                    .extract_passive_liveness(&infrared_outputs)
-                    .map_err(|_| inference_failure(job))?,
-                self.passive_visible
-                    .extract_passive_liveness(&visible_outputs)
-                    .map_err(|_| inference_failure(job))?,
-                self.passive_fusion
-                    .extract_passive_liveness(&fusion_outputs)
-                    .map_err(|_| inference_failure(job))?,
-            ];
-            return Ok(DerivedAuthenticationEvidence::new(
+            })
+        };
+        let mut consume = |observation: DerivedBiometricObservation| {
+            Ok(ControlFlow::Break(DerivedAuthenticationEvidence::new(
                 job.transaction_id(),
-                timing,
-                quality.aggregate,
-                embedding,
-                passive_liveness,
+                observation.timing,
+                observation.quality,
+                observation.embedding,
+                observation.passive_liveness,
                 ChallengeProgress::Passed,
-                observation_time,
-            ));
-        }
+                observation.completed_at_micros,
+            )))
+        };
+        pipeline
+            .run_session(self.challenge, &mut cancelled, &mut relay_progress, &mut consume)
+            .map_err(authentication_observation_failure)
     }
 }
 
-const fn challenge_progress_code(progress: ChallengeProgress) -> ProgressCode {
+const fn authentication_progress(progress: ObservationProgress) -> ProgressCode {
     match progress {
-        ChallengeProgress::BaselineRequired => ProgressCode::HoldStill,
-        ChallengeProgress::ActionRequired(ChallengeAction::Blink) => ProgressCode::Blink,
-        ChallengeProgress::ActionRequired(ChallengeAction::TurnLeft) => ProgressCode::TurnLeft,
-        ChallengeProgress::ActionRequired(ChallengeAction::TurnRight) => ProgressCode::TurnRight,
-        ChallengeProgress::RecoveryRequired => ProgressCode::ReturnToCenter,
-        ChallengeProgress::Passed => ProgressCode::Processing,
+        ObservationProgress::PositionFace => ProgressCode::PositionFace,
+        ObservationProgress::HoldStill => ProgressCode::HoldStill,
+        ObservationProgress::Blink => ProgressCode::Blink,
+        ObservationProgress::TurnLeft => ProgressCode::TurnLeft,
+        ObservationProgress::TurnRight => ProgressCode::TurnRight,
+        ObservationProgress::ReturnToCenter => ProgressCode::ReturnToCenter,
+        ObservationProgress::Processing => ProgressCode::Processing,
+    }
+}
+
+const fn authentication_observation_failure(
+    error: ObservationFailure,
+) -> AuthenticationEngineFailure {
+    match error {
+        ObservationFailure::Cancelled => AuthenticationEngineFailure::Cancelled,
+        ObservationFailure::Capture => AuthenticationEngineFailure::Capture,
+        ObservationFailure::Inference => AuthenticationEngineFailure::Inference,
+        ObservationFailure::Liveness => AuthenticationEngineFailure::Liveness,
+        ObservationFailure::InvalidEvidence | ObservationFailure::AttemptLimit => {
+            AuthenticationEngineFailure::InvalidEvidence
+        }
+        ObservationFailure::Internal => AuthenticationEngineFailure::Internal,
     }
 }
 
 fn ensure_active(job: &AuthenticationJob) -> Result<(), AuthenticationEngineFailure> {
     if job.is_cancelled() { Err(AuthenticationEngineFailure::Cancelled) } else { Ok(()) }
-}
-
-fn capture_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
-    if job.is_cancelled() {
-        AuthenticationEngineFailure::Cancelled
-    } else {
-        AuthenticationEngineFailure::Capture
-    }
-}
-
-fn inference_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
-    if job.is_cancelled() {
-        AuthenticationEngineFailure::Cancelled
-    } else {
-        AuthenticationEngineFailure::Inference
-    }
-}
-
-fn liveness_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
-    if job.is_cancelled() {
-        AuthenticationEngineFailure::Cancelled
-    } else {
-        AuthenticationEngineFailure::Liveness
-    }
-}
-
-fn invalid_evidence_failure(job: &AuthenticationJob) -> AuthenticationEngineFailure {
-    if job.is_cancelled() {
-        AuthenticationEngineFailure::Cancelled
-    } else {
-        AuthenticationEngineFailure::InvalidEvidence
-    }
 }
 
 /// One bounded update from the engine worker.
@@ -1069,12 +926,9 @@ mod tests {
                 .validate(),
             Err(AuthenticationEngineFailure::InvalidEvidence)
         ));
+        assert_eq!(authentication_progress(ObservationProgress::Blink), ProgressCode::Blink);
         assert_eq!(
-            challenge_progress_code(ChallengeProgress::ActionRequired(ChallengeAction::Blink)),
-            ProgressCode::Blink
-        );
-        assert_eq!(
-            challenge_progress_code(ChallengeProgress::RecoveryRequired),
+            authentication_progress(ObservationProgress::ReturnToCenter),
             ProgressCode::ReturnToCenter
         );
     }

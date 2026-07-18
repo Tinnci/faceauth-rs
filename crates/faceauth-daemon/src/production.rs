@@ -5,6 +5,7 @@ use std::{
     io::{self, Read},
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -36,8 +37,11 @@ use thiserror::Error;
 use crate::{
     AuthenticationConnectionPolicy, AuthenticationEngineService, BiometricResourceArbiter,
     BoundaryService, DetectionPolicy, PassivePadPolicy, ProductionAuthenticationEngine,
-    ProductionAuthenticationEngineError, ServiceSupervisor, SupervisorError, SupervisorReport,
-    coordinate_authentication_connection, run_supervised_authentication_listener,
+    ProductionAuthenticationEngineError, ProductionEnrollmentEngine,
+    ProductionEnrollmentEngineError, ServiceSupervisor, SupervisorError, SupervisorReport,
+    coordinate_authentication_connection,
+    observation::{ProductionObservationPipeline, ProductionObservationPipelineError},
+    run_supervised_authentication_listener,
     supervision::SupervisorConfig,
 };
 
@@ -558,6 +562,31 @@ impl ProductionConfig {
 pub fn build_production_authentication_engine(
     config: &ProductionConfig,
 ) -> Result<ProductionAuthenticationEngine, ProductionConfigError> {
+    Ok(build_production_biometric_engines(config)?.authentication)
+}
+
+/// Authentication and enrollment adapters sharing one camera/model owner.
+pub struct ProductionBiometricEngines {
+    /// PAM/Polkit/lock-screen authentication adapter.
+    pub authentication: ProductionAuthenticationEngine,
+    /// Manager1 multi-observation enrollment adapter.
+    pub enrollment: ProductionEnrollmentEngine,
+}
+
+/// Construct the real authentication and enrollment engines over one shared observation pipeline.
+///
+/// Exactly one IR device, one visible device, and six mutable ONNX sessions are opened. The
+/// returned adapters must be paired with the same [`BiometricResourceArbiter`] so either service
+/// fails busy instead of waiting for the shared pipeline mutex.
+///
+/// # Errors
+///
+/// Returns [`ProductionConfigError`] for discovery, device negotiation, model loading, role
+/// mismatch, or calibration identity/policy failure.
+#[allow(clippy::too_many_lines)]
+pub fn build_production_biometric_engines(
+    config: &ProductionConfig,
+) -> Result<ProductionBiometricEngines, ProductionConfigError> {
     config.validate()?;
     let model_identities = inspect_models(config).map_err(ProductionConfigError::Invalid)?;
     inspect_calibration(config, Some(&model_identities)).map_err(ProductionConfigError::Invalid)?;
@@ -619,7 +648,7 @@ pub fn build_production_authentication_engine(
         &passive_visible,
         &passive_fusion,
     )?;
-    ProductionAuthenticationEngine::new(
+    let pipeline = ProductionObservationPipeline::new(
         infrared_device,
         visible_device,
         detector,
@@ -631,16 +660,50 @@ pub fn build_production_authentication_engine(
         config.cameras.pairing,
         config.calibration.quality.detection_policy(),
         config.calibration.quality.policy,
-        config.calibration.active_liveness.challenge,
     )
     .map_err(|error| match error {
-        ProductionAuthenticationEngineError::InvalidPolicy
-        | ProductionAuthenticationEngineError::ModelRoleMismatch { .. } => {
-            ProductionConfigError::Invalid(format!(
-                "authentication engine assembly failed: {error}"
-            ))
+        ProductionObservationPipelineError::InvalidPolicy
+        | ProductionObservationPipelineError::ModelRoleMismatch { .. } => {
+            ProductionConfigError::Invalid(format!("observation pipeline assembly failed: {error}"))
         }
-    })
+    })?;
+    let shared = Arc::new(Mutex::new(pipeline));
+    let challenge = config.calibration.active_liveness.challenge;
+    let authentication =
+        ProductionAuthenticationEngine::from_shared(Arc::clone(&shared), challenge).map_err(
+            |error| match error {
+                ProductionAuthenticationEngineError::InvalidPolicy
+                | ProductionAuthenticationEngineError::ModelRoleMismatch { .. } => {
+                    ProductionConfigError::Invalid(format!(
+                        "authentication engine assembly failed: {error}"
+                    ))
+                }
+            },
+        )?;
+    let enrollment = ProductionEnrollmentEngine::from_shared(
+        shared,
+        challenge,
+        passive_pad_policy(&config.calibration.passive_pad),
+    )
+    .map_err(|error| match error {
+        ProductionEnrollmentEngineError::InvalidPolicy => {
+            ProductionConfigError::Invalid(format!("enrollment engine assembly failed: {error}"))
+        }
+    })?;
+    Ok(ProductionBiometricEngines { authentication, enrollment })
+}
+
+fn passive_pad_policy(calibration: &PassivePadCalibration) -> PassivePadPolicy {
+    PassivePadPolicy {
+        infrared_compatibility_sha256: calibration.infrared_compatibility_sha256.clone(),
+        minimum_infrared_probability: calibration.minimum_infrared_probability,
+        visible_compatibility_sha256: calibration.visible_compatibility_sha256.clone(),
+        minimum_visible_probability: calibration.minimum_visible_probability,
+        fusion: Some((
+            calibration.fusion_compatibility_sha256.clone(),
+            calibration.minimum_fusion_probability,
+        )),
+    }
 }
 
 /// Construct and self-test the TPM-backed encrypted template store.
@@ -728,14 +791,7 @@ pub fn run_production_authentication_composition(
         engine_service.run(&shutdown).map_err(|error| error.to_string())
     })?;
 
-    let pad = &config.calibration.passive_pad;
-    let passive_pad = PassivePadPolicy {
-        infrared_compatibility_sha256: pad.infrared_compatibility_sha256.clone(),
-        minimum_infrared_probability: pad.minimum_infrared_probability,
-        visible_compatibility_sha256: pad.visible_compatibility_sha256.clone(),
-        minimum_visible_probability: pad.minimum_visible_probability,
-        fusion: Some((pad.fusion_compatibility_sha256.clone(), pad.minimum_fusion_probability)),
-    };
+    let passive_pad = passive_pad_policy(&config.calibration.passive_pad);
     let authentication = config.calibration.recognition.policy;
     let ProductionAuthenticationBoundary { listener, transport, authorization, sessions } =
         boundary_resources;

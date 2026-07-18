@@ -1,6 +1,7 @@
 //! Single-capacity enrollment worker with shared resource ownership and atomic template commit.
 
 use std::{
+    ops::ControlFlow,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use faceauth_enrollment::{EnrollmentConfig, EnrollmentError, EnrollmentSession};
+use faceauth_enrollment::{
+    EnrollmentConfig, EnrollmentError, EnrollmentObservation, EnrollmentSession,
+};
+use faceauth_liveness::ChallengeConfig;
 use faceauth_management::{
     AuthorizedEnrollment, ManagementError, ManagementProgress, ManagementResult, ManagementUpdate,
     OperationId,
@@ -22,7 +26,11 @@ use thiserror::Error;
 
 use crate::{
     BiometricResourceArbiter, BiometricResourceError, BiometricResourceLease,
-    BiometricResourceOwner, ShutdownToken,
+    BiometricResourceOwner, PassivePadPolicy, ShutdownToken,
+    observation::{
+        DerivedBiometricObservation, ObservationFailure, ObservationProgress,
+        SharedProductionObservationPipeline,
+    },
 };
 
 const REQUEST_QUEUE_CAPACITY: usize = 1;
@@ -123,6 +131,172 @@ pub trait EnrollmentEngine: Send + 'static {
         job: &EnrollmentJob,
         progress: &mut dyn FnMut(ManagementProgress) -> Result<(), EnrollmentEngineFailure>,
     ) -> Result<TemplateRecord, EnrollmentEngineFailure>;
+}
+
+/// Real enrollment adapter over the shared dual-camera, six-model observation pipeline.
+///
+/// Authentication and enrollment hold clones of the same pipeline handle. The daemon-wide
+/// biometric arbiter admits only one operation, and `try_lock` turns any ownership invariant
+/// violation into a fail-closed internal error instead of queueing.
+pub struct ProductionEnrollmentEngine {
+    pipeline: SharedProductionObservationPipeline,
+    challenge: ChallengeConfig,
+    passive_pad: PassivePadPolicy,
+}
+
+impl ProductionEnrollmentEngine {
+    pub(crate) fn from_shared(
+        pipeline: SharedProductionObservationPipeline,
+        challenge: ChallengeConfig,
+        passive_pad: PassivePadPolicy,
+    ) -> Result<Self, ProductionEnrollmentEngineError> {
+        challenge.validate().map_err(|_| ProductionEnrollmentEngineError::InvalidPolicy)?;
+        passive_pad.validate().map_err(|_| ProductionEnrollmentEngineError::InvalidPolicy)?;
+        Ok(Self { pipeline, challenge, passive_pad })
+    }
+}
+
+struct EnrollmentAccumulator<'a> {
+    session: Option<EnrollmentSession>,
+    passive_pad: &'a PassivePadPolicy,
+    minimum_sample_interval_micros: u64,
+    last_accepted_timestamp: Option<u64>,
+}
+
+impl<'a> EnrollmentAccumulator<'a> {
+    const fn new(
+        session: EnrollmentSession,
+        passive_pad: &'a PassivePadPolicy,
+        minimum_sample_interval_micros: u64,
+    ) -> Self {
+        Self {
+            session: Some(session),
+            passive_pad,
+            minimum_sample_interval_micros,
+            last_accepted_timestamp: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        observation: &DerivedBiometricObservation,
+    ) -> Result<ControlFlow<TemplateRecord>, ObservationFailure> {
+        if self.last_accepted_timestamp.is_some_and(|previous| {
+            observation.completed_at_micros.saturating_sub(previous)
+                < self.minimum_sample_interval_micros
+        }) {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let passive_liveness_passed = self
+            .passive_pad
+            .accepts(&observation.passive_liveness)
+            .map_err(|_| ObservationFailure::Inference)?;
+        let active = self.session.as_mut().ok_or(ObservationFailure::Internal)?;
+        match active.observe(EnrollmentObservation {
+            embedding: &observation.embedding,
+            quality: observation.quality,
+            passive_liveness_passed,
+            active_liveness_passed: true,
+            timestamp_micros: observation.completed_at_micros,
+            yaw_degrees: observation.yaw_degrees,
+        }) {
+            Ok(()) => {
+                self.last_accepted_timestamp = Some(observation.completed_at_micros);
+            }
+            Err(EnrollmentError::InsufficientQuality) => {
+                return Ok(ControlFlow::Continue(()));
+            }
+            Err(_) => return Err(ObservationFailure::InvalidEvidence),
+        }
+        if active.ready_to_finish() {
+            let completed = self.session.take().ok_or(ObservationFailure::Internal)?;
+            let record = completed
+                .finish(observation.completed_at_micros)
+                .map_err(|_| ObservationFailure::InvalidEvidence)?;
+            return Ok(ControlFlow::Break(record));
+        }
+        if active.is_full() {
+            return Err(ObservationFailure::AttemptLimit);
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
+impl EnrollmentEngine for ProductionEnrollmentEngine {
+    fn enroll(
+        &mut self,
+        job: &EnrollmentJob,
+        progress: &mut dyn FnMut(ManagementProgress) -> Result<(), EnrollmentEngineFailure>,
+    ) -> Result<TemplateRecord, EnrollmentEngineFailure> {
+        if job.is_cancelled() {
+            return Err(EnrollmentEngineFailure::Cancelled);
+        }
+        progress(ManagementProgress::Preparing)?;
+        let session =
+            job.start_session().map_err(|_| EnrollmentEngineFailure::InsufficientEvidence)?;
+        let mut accumulator = EnrollmentAccumulator::new(
+            session,
+            &self.passive_pad,
+            job.config.minimum_sample_interval_micros,
+        );
+        let mut pipeline =
+            self.pipeline.try_lock().map_err(|_| EnrollmentEngineFailure::Internal)?;
+        let mut cancelled = || job.is_cancelled();
+        let mut relay_progress = |update| {
+            progress(enrollment_progress(update)).map_err(|_| {
+                if job.is_cancelled() {
+                    ObservationFailure::Cancelled
+                } else {
+                    ObservationFailure::Internal
+                }
+            })
+        };
+        let mut consume = |observation: DerivedBiometricObservation| {
+            if job.is_cancelled() {
+                return Err(ObservationFailure::Cancelled);
+            }
+            let result = accumulator.observe(&observation)?;
+            if result.is_break() && job.is_cancelled() {
+                return Err(ObservationFailure::Cancelled);
+            }
+            Ok(result)
+        };
+        pipeline
+            .run_session(self.challenge, &mut cancelled, &mut relay_progress, &mut consume)
+            .map_err(enrollment_observation_failure)
+    }
+}
+
+const fn enrollment_progress(progress: ObservationProgress) -> ManagementProgress {
+    match progress {
+        ObservationProgress::PositionFace => ManagementProgress::PositionFace,
+        ObservationProgress::HoldStill => ManagementProgress::HoldStill,
+        ObservationProgress::Blink => ManagementProgress::Blink,
+        ObservationProgress::TurnLeft => ManagementProgress::TurnLeft,
+        ObservationProgress::TurnRight => ManagementProgress::TurnRight,
+        ObservationProgress::ReturnToCenter => ManagementProgress::ReturnToCenter,
+        ObservationProgress::Processing => ManagementProgress::Processing,
+    }
+}
+
+const fn enrollment_observation_failure(error: ObservationFailure) -> EnrollmentEngineFailure {
+    match error {
+        ObservationFailure::Cancelled => EnrollmentEngineFailure::Cancelled,
+        ObservationFailure::Capture => EnrollmentEngineFailure::Capture,
+        ObservationFailure::Inference => EnrollmentEngineFailure::Inference,
+        ObservationFailure::Liveness
+        | ObservationFailure::InvalidEvidence
+        | ObservationFailure::AttemptLimit => EnrollmentEngineFailure::InsufficientEvidence,
+        ObservationFailure::Internal => EnrollmentEngineFailure::Internal,
+    }
+}
+
+/// Production enrollment adapter construction failure.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ProductionEnrollmentEngineError {
+    /// Active-liveness or passive-PAD calibration is structurally invalid.
+    #[error("production enrollment engine policy is invalid")]
+    InvalidPolicy,
 }
 
 /// Atomic destination for a completed derived enrollment template.
@@ -561,8 +735,11 @@ mod tests {
     use std::{sync::Mutex, thread};
 
     use faceauth_authz::{AuthorizationGrant, ExecutableFingerprint};
+    use faceauth_core::CapturePair;
+    use faceauth_inference::{FaceEmbedding, PassiveLivenessScore};
     use faceauth_management::{ManagementConfig, ManagementCoordinator};
     use faceauth_management_dbus::{AuthorizationBackend, BackendFuture, Manager1, MonotonicClock};
+    use faceauth_model::ModelRole;
     use faceauth_protocol::{AuthenticationPurpose, ServiceName, TransactionId};
     use faceauth_transport::PeerIdentity;
 
@@ -605,6 +782,96 @@ mod tests {
             model_compatibility_sha256: "aa".repeat(32),
             embedding,
         }
+    }
+
+    fn passive_pad_policy() -> PassivePadPolicy {
+        PassivePadPolicy {
+            infrared_compatibility_sha256: "11".repeat(32),
+            minimum_infrared_probability: 0.8,
+            visible_compatibility_sha256: "22".repeat(32),
+            minimum_visible_probability: 0.8,
+            fusion: Some(("33".repeat(32), 0.8)),
+        }
+    }
+
+    fn derived_observation(
+        timestamp_micros: u64,
+        yaw_degrees: f32,
+        quality: f32,
+        fusion_probability: f32,
+    ) -> Result<DerivedBiometricObservation, Box<dyn std::error::Error>> {
+        let mut values = vec![0.0_f32; 32];
+        values[0] = 1.0;
+        Ok(DerivedBiometricObservation {
+            timing: CapturePair {
+                infrared_timestamp_micros: timestamp_micros - 1,
+                visible_timestamp_micros: Some(timestamp_micros),
+            },
+            quality,
+            yaw_degrees,
+            embedding: FaceEmbedding::from_normalized_template(&"aa".repeat(32), &values)?,
+            passive_liveness: vec![
+                PassiveLivenessScore::from_validated_output(
+                    ModelRole::PassiveLivenessInfrared,
+                    &"11".repeat(32),
+                    0.95,
+                )?,
+                PassiveLivenessScore::from_validated_output(
+                    ModelRole::PassiveLivenessVisible,
+                    &"22".repeat(32),
+                    0.95,
+                )?,
+                PassiveLivenessScore::from_validated_output(
+                    ModelRole::PassiveLivenessFusion,
+                    &"33".repeat(32),
+                    fusion_probability,
+                )?,
+            ],
+            completed_at_micros: timestamp_micros,
+        })
+    }
+
+    #[test]
+    fn production_accumulator_skips_low_quality_and_too_close_frames_then_finishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = passive_pad_policy();
+        let session = EnrollmentSession::start(config(), 1000, 1_000_000)?;
+        let mut accumulator =
+            EnrollmentAccumulator::new(session, &policy, config().minimum_sample_interval_micros);
+        assert!(
+            accumulator.observe(&derived_observation(1_500_000, -10.0, 0.2, 0.95)?)?.is_continue()
+        );
+        assert!(
+            accumulator.observe(&derived_observation(2_000_000, -10.0, 0.95, 0.95)?)?.is_continue()
+        );
+        assert!(
+            accumulator.observe(&derived_observation(2_100_000, 10.0, 0.95, 0.95)?)?.is_continue()
+        );
+        assert!(
+            accumulator.observe(&derived_observation(3_000_000, 0.0, 0.95, 0.95)?)?.is_continue()
+        );
+        let ControlFlow::Break(record) =
+            accumulator.observe(&derived_observation(4_000_000, 10.0, 0.95, 0.95)?)?
+        else {
+            return Err("ready enrollment did not finish".into());
+        };
+        assert_eq!(record.uid, 1000);
+        record.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn production_accumulator_fails_closed_when_fusion_pad_rejects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = passive_pad_policy();
+        let session = EnrollmentSession::start(config(), 1000, 1_000_000)?;
+        let mut accumulator =
+            EnrollmentAccumulator::new(session, &policy, config().minimum_sample_interval_micros);
+        assert!(matches!(
+            accumulator.observe(&derived_observation(2_000_000, 0.0, 0.95, 0.1)?),
+            Err(ObservationFailure::InvalidEvidence)
+        ));
+        Ok(())
     }
 
     #[derive(Clone, Default)]

@@ -109,14 +109,16 @@ openness outputs. The adapter validates every confidence and eye value, applies 
 ceilings, derives mean topology confidence and the visible-point fraction, and conservatively uses
 the less-open eye for active challenges. Callers cannot inject placeholder pose or blink values.
 
-The production authentication engine owns both admitted V4L2 devices and all six mutable ONNX
-sessions on the single-capacity worker. For every fresh paired observation it performs visible
-single-face detection, manifest-derived landmark sampling, and the randomized temporal challenge.
-Only after the challenge passes does the same pair produce quality evidence, an aligned embedding,
-IR PAD, visible PAD, and exact named IR/RGB fusion PAD. Cancellation is checked around capture,
+The production observation pipeline uniquely owns both admitted V4L2 devices and all six mutable
+ONNX sessions. Authentication and enrollment adapters share that owner behind the same
+non-queueing biometric arbiter and never load a second model suite or open a second camera pair.
+For every fresh paired observation the pipeline performs visible single-face detection,
+manifest-derived landmark sampling, and the randomized temporal challenge. Only after the
+challenge passes does the same pair produce quality evidence, an aligned embedding, IR PAD,
+visible PAD, and exact named IR/RGB fusion PAD. Cancellation is checked around capture,
 preprocessing, every graph invocation, and final evidence assembly. Frames, tensors, landmarks,
-and model scores remain inside the worker; only derived transaction-bound evidence crosses its
-channel.
+and model scores remain inside the owning worker; only operation-bound derived evidence is handed
+to the authentication or enrollment policy adapter.
 
 The authentication socket coordinator owns the complete per-connection protocol sequence. It
 admits one authorized request, submits the exact transaction-bound job, relays only closed progress

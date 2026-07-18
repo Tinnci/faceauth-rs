@@ -121,6 +121,23 @@ impl EnrollmentSession {
         self.samples.len()
     }
 
+    /// Whether the current derived sample set satisfies count and calibrated pose coverage.
+    ///
+    /// This is a non-consuming readiness check for the production capture loop. Final deadline,
+    /// aggregation, compatibility, and normalization checks remain authoritative in [`Self::finish`].
+    #[must_use]
+    pub fn ready_to_finish(&self) -> bool {
+        !self.terminal_failure
+            && self.samples.len() >= usize::from(self.config.minimum_samples)
+            && self.has_required_pose_coverage()
+    }
+
+    /// Whether no additional accepted sample can be retained.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.samples.len() >= usize::from(self.config.maximum_samples)
+    }
+
     /// Admit one fresh, live, high-quality observation.
     ///
     /// # Errors
@@ -192,11 +209,7 @@ impl EnrollmentSession {
                 required: self.config.minimum_samples,
             });
         }
-        let minimum_yaw = self.sample_yaws.iter().copied().reduce(f32::min);
-        let maximum_yaw = self.sample_yaws.iter().copied().reduce(f32::max);
-        if minimum_yaw.zip(maximum_yaw).is_none_or(|(minimum, maximum)| {
-            maximum - minimum < self.config.minimum_yaw_span_degrees
-        }) {
+        if !self.has_required_pose_coverage() {
             return Err(EnrollmentError::InsufficientPoseCoverage);
         }
         let dimension = self.dimension.ok_or(EnrollmentError::InsufficientSamples {
@@ -229,6 +242,14 @@ impl EnrollmentSession {
         };
         record.validate()?;
         Ok(record)
+    }
+
+    fn has_required_pose_coverage(&self) -> bool {
+        let minimum_yaw = self.sample_yaws.iter().copied().reduce(f32::min);
+        let maximum_yaw = self.sample_yaws.iter().copied().reduce(f32::max);
+        minimum_yaw.zip(maximum_yaw).is_some_and(|(minimum, maximum)| {
+            maximum - minimum >= self.config.minimum_yaw_span_degrees
+        })
     }
 
     fn validate_observation(
@@ -431,6 +452,24 @@ mod tests {
         assert!(
             (record.embedding.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() < 1.0e-3
         );
+        record.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_requires_minimum_samples_and_pose_span_without_consuming_session()
+    -> Result<(), EnrollmentError> {
+        let face = embedding(0xaa, 1.0, 0.0)?;
+        let mut session = EnrollmentSession::start(config(), 1000, 1_000_000)?;
+        assert!(!session.ready_to_finish());
+        assert!(!session.is_full());
+        session.observe(observation(&face, 2_000_000))?;
+        session.observe(observation(&face, 3_000_000))?;
+        assert!(!session.ready_to_finish());
+        session.observe(observation(&face, 4_000_000))?;
+        assert!(session.ready_to_finish());
+        assert!(!session.is_full());
+        let record = session.finish(5_000_000)?;
         record.validate()?;
         Ok(())
     }

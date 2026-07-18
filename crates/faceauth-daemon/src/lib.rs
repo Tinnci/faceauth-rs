@@ -2,6 +2,7 @@
 
 mod engine;
 mod enrollment_engine;
+mod observation;
 mod production;
 mod resource;
 mod supervision;
@@ -17,13 +18,15 @@ pub use enrollment_engine::{
     EnrollmentCancellation, EnrollmentControllerBridge, EnrollmentEngine, EnrollmentEngineClient,
     EnrollmentEngineFailure, EnrollmentEngineHandle, EnrollmentEngineService,
     EnrollmentEngineServiceError, EnrollmentEngineSubmitError, EnrollmentEngineUpdate,
-    EnrollmentJob, EnrollmentTemplateSink,
+    EnrollmentJob, EnrollmentTemplateSink, ProductionEnrollmentEngine,
+    ProductionEnrollmentEngineError,
 };
 pub use production::{
     PRODUCTION_CONFIG_SCHEMA_VERSION, ProductionAuthenticationBoundary,
-    ProductionAuthenticationRunError, ProductionConfig, ProductionConfigError,
-    READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind, ReadinessReport,
-    build_production_authentication_boundary, build_production_authentication_engine,
+    ProductionAuthenticationRunError, ProductionBiometricEngines, ProductionConfig,
+    ProductionConfigError, READINESS_REPORT_SCHEMA_VERSION, ReadinessGate, ReadinessGateKind,
+    ReadinessReport, build_production_authentication_boundary,
+    build_production_authentication_engine, build_production_biometric_engines,
     build_production_template_store, inspect_production_readiness, load_production_config,
     readiness_from_config_path, run_production_authentication_composition,
 };
@@ -208,7 +211,7 @@ impl PassivePadPolicy {
         if valid { Ok(()) } else { Err(AuthenticationPipelineError::InvalidPassivePadPolicy) }
     }
 
-    fn accepts(
+    pub(crate) fn accepts(
         &self,
         scores: &[PassiveLivenessScore],
     ) -> Result<bool, AuthenticationPipelineError> {
