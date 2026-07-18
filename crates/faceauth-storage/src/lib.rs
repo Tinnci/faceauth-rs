@@ -35,6 +35,7 @@ const HEADER_LENGTH: usize = MAGIC.len() + std::mem::size_of::<u16>() + NONCE_LE
 const MAX_CIPHERTEXT_LENGTH: usize = 1024 * 1024;
 const MAX_EMBEDDING_DIMENSION: usize = 4096;
 const KEY_LENGTH: usize = 32;
+const STORED_PAYLOAD_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TrustPolicy {
@@ -202,6 +203,34 @@ pub struct TemplateRecord {
     pub embedding: Vec<f32>,
 }
 
+/// Authenticated template snapshot together with its monotonic storage generation.
+///
+/// Generation zero is reserved for records written by storage versions predating explicit
+/// generation tracking. Every mutation performed by this implementation writes a strictly
+/// positive, monotonically increasing generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersionedTemplateRecord {
+    /// Generation read from the same authenticated payload as the template.
+    pub generation: u64,
+    /// Validated biometric template.
+    pub record: TemplateRecord,
+}
+
+#[derive(Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+enum StoredPayload {
+    Live { schema_version: u16, generation: u64, record: TemplateRecord },
+    Deleted { schema_version: u16, generation: u64, uid: u32 },
+}
+
+impl StoredPayload {
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Live { generation, .. } | Self::Deleted { generation, .. } => *generation,
+        }
+    }
+}
+
 impl TemplateRecord {
     /// Validate record bounds and finite numeric data before encryption.
     ///
@@ -277,30 +306,88 @@ where
 
     /// Save a record using authenticated encryption and atomic replacement.
     ///
+    /// This compatibility entry point performs an unconditional, serialized update. Callers that
+    /// read before writing should use [`Self::replace_if_generation`] so a stale observation cannot
+    /// overwrite a newer template.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] when validation, key loading, encryption, or the atomic write
     /// fails.
     pub fn save(&self, record: &TemplateRecord) -> Result<(), StorageError> {
+        self.save_with_generation(record).map(|_| ())
+    }
+
+    /// Save a record unconditionally and return its new authenticated generation.
+    ///
+    /// Mutations for one UID are serialized with an owner-only, no-follow lock file. Existing
+    /// legacy records begin at generation zero; every successful save increments the generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] for unsafe paths, invalid or corrupt current state, generation
+    /// exhaustion, key/encryption failure, or atomic persistence failure.
+    pub fn save_with_generation(&self, record: &TemplateRecord) -> Result<u64, StorageError> {
         record.validate()?;
-        prepare_directory_storage(&self.directory, self.trust)?;
-        let key = self.key_provider.load_key()?;
-        let plaintext = Zeroizing::new(serde_json::to_vec(record)?);
-        let nonce = random_nonce()?;
-        let aad = associated_data(record.uid);
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
-            .map_err(|_| StorageError::InvalidRecord("invalid encryption key"))?;
-        let nonce = XNonce::try_from(nonce.as_slice())
-            .map_err(|_| StorageError::InvalidRecord("invalid encryption nonce"))?;
-        let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: &plaintext, aad: &aad })
-            .map_err(|_| StorageError::AuthenticationFailed)?;
-        let mut encoded = Vec::with_capacity(HEADER_LENGTH + ciphertext.len());
-        encoded.extend_from_slice(MAGIC);
-        encoded.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        encoded.extend_from_slice(&nonce);
-        encoded.extend_from_slice(&ciphertext);
-        atomic_write(&self.path_for(record.uid), &encoded, &self.directory, self.trust)
+        self.with_exclusive_uid_lock(record.uid, || {
+            let current = self.read_optional_payload(record.uid)?;
+            let generation =
+                next_generation(current.as_ref().map_or(0, StoredPayload::generation))?;
+            let payload = StoredPayload::Live {
+                schema_version: STORED_PAYLOAD_SCHEMA_VERSION,
+                generation,
+                record: record.clone(),
+            };
+            self.write_payload(record.uid, &payload)?;
+            Ok(generation)
+        })
+    }
+
+    /// Replace an existing live template only if its authenticated generation still matches.
+    ///
+    /// This is the explicit compare-and-swap entry point for enrollment replacement. A deleted or
+    /// absent template is not considered replaceable; callers must deliberately create it through
+    /// [`Self::save`] or [`Self::save_with_generation`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::StaleGeneration`] when another mutation won the race,
+    /// [`StorageError::TemplateNotPresent`] for absent/deleted state, or another storage error for
+    /// validation, authentication, key, or atomic-write failure.
+    pub fn replace_if_generation(
+        &self,
+        expected_generation: u64,
+        record: &TemplateRecord,
+    ) -> Result<u64, StorageError> {
+        record.validate()?;
+        self.with_exclusive_uid_lock(record.uid, || {
+            let current = self.read_optional_payload(record.uid)?;
+            let actual_generation = match current {
+                Some(StoredPayload::Live { generation, .. }) => generation,
+                Some(StoredPayload::Deleted { generation, .. }) => {
+                    return Err(StorageError::TemplateNotPresent {
+                        last_generation: Some(generation),
+                    });
+                }
+                None => {
+                    return Err(StorageError::TemplateNotPresent { last_generation: None });
+                }
+            };
+            if actual_generation != expected_generation {
+                return Err(StorageError::StaleGeneration {
+                    expected: expected_generation,
+                    actual: actual_generation,
+                });
+            }
+            let generation = next_generation(actual_generation)?;
+            let payload = StoredPayload::Live {
+                schema_version: STORED_PAYLOAD_SCHEMA_VERSION,
+                generation,
+                record: record.clone(),
+            };
+            self.write_payload(record.uid, &payload)?;
+            Ok(generation)
+        })
     }
 
     /// Load and authenticate a record for one UID.
@@ -310,6 +397,92 @@ where
     /// Returns [`StorageError`] when the file is malformed, authentication fails, the record is
     /// invalid, or the record belongs to another UID.
     pub fn load(&self, uid: u32) -> Result<TemplateRecord, StorageError> {
+        self.load_with_generation(uid).map(|versioned| versioned.record)
+    }
+
+    /// Load and authenticate a template together with the generation used for compare-and-swap.
+    ///
+    /// Legacy template payloads are returned at generation zero. An authenticated deletion
+    /// tombstone is intentionally exposed as `NotFound`, while retaining its generation internally
+    /// to prevent ABA replacement after deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the file is absent/deleted, malformed, unauthenticated,
+    /// untrusted, or belongs to another UID.
+    pub fn load_with_generation(&self, uid: u32) -> Result<VersionedTemplateRecord, StorageError> {
+        match self.read_payload(uid)? {
+            StoredPayload::Live { generation, ref record, .. } => {
+                Ok(VersionedTemplateRecord { generation, record: record.clone() })
+            }
+            StoredPayload::Deleted { .. } => Err(template_not_found(uid)),
+        }
+    }
+
+    /// Atomically delete a live template while retaining only an authenticated generation
+    /// tombstone.
+    ///
+    /// The tombstone contains no embedding. It prevents a generation observed before deletion from
+    /// replacing a later enrollment after the same UID is recreated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::TemplateNotPresent`] if no live template exists, or another storage
+    /// error for unsafe paths, corrupt state, generation exhaustion, key/encryption failure, or
+    /// atomic persistence failure.
+    pub fn delete(&self, uid: u32) -> Result<u64, StorageError> {
+        self.delete_inner(uid, None)
+    }
+
+    /// Atomically delete a live template only if its authenticated generation still matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::StaleGeneration`] when another mutation won the race,
+    /// [`StorageError::TemplateNotPresent`] for absent/deleted state, or another storage error.
+    pub fn delete_if_generation(
+        &self,
+        uid: u32,
+        expected_generation: u64,
+    ) -> Result<u64, StorageError> {
+        self.delete_inner(uid, Some(expected_generation))
+    }
+
+    fn delete_inner(
+        &self,
+        uid: u32,
+        expected_generation: Option<u64>,
+    ) -> Result<u64, StorageError> {
+        self.with_exclusive_uid_lock(uid, || {
+            let current = self.read_optional_payload(uid)?;
+            let actual_generation = match current {
+                Some(StoredPayload::Live { generation, .. }) => generation,
+                Some(StoredPayload::Deleted { generation, .. }) => {
+                    return Err(StorageError::TemplateNotPresent {
+                        last_generation: Some(generation),
+                    });
+                }
+                None => {
+                    return Err(StorageError::TemplateNotPresent { last_generation: None });
+                }
+            };
+            if let Some(expected) = expected_generation
+                && expected != actual_generation
+            {
+                return Err(StorageError::StaleGeneration { expected, actual: actual_generation });
+            }
+            let generation = next_generation(actual_generation)?;
+            let payload = StoredPayload::Deleted {
+                schema_version: STORED_PAYLOAD_SCHEMA_VERSION,
+                generation,
+                uid,
+            };
+            self.write_payload(uid, &payload)?;
+            Ok(generation)
+        })
+    }
+
+    fn read_payload(&self, uid: u32) -> Result<StoredPayload, StorageError> {
         let path = self.path_for(uid);
         verify_directory_storage(&self.directory, self.trust)?;
         verify_replace_target_storage(&path, self.trust)?;
@@ -343,12 +516,67 @@ where
                 .decrypt(&nonce, Payload { msg: &encoded[nonce_end..], aad: &associated_data(uid) })
                 .map_err(|_| StorageError::AuthenticationFailed)?,
         );
+        if let Ok(payload) = serde_json::from_slice::<StoredPayload>(&plaintext) {
+            validate_stored_payload(&payload, uid)?;
+            return Ok(payload);
+        }
         let record: TemplateRecord = serde_json::from_slice(&plaintext)?;
         record.validate()?;
         if record.uid != uid {
             return Err(StorageError::InvalidRecord("template UID does not match its path"));
         }
-        Ok(record)
+        Ok(StoredPayload::Live { schema_version: 0, generation: 0, record })
+    }
+
+    fn read_optional_payload(&self, uid: u32) -> Result<Option<StoredPayload>, StorageError> {
+        match self.read_payload(uid) {
+            Ok(payload) => Ok(Some(payload)),
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write_payload(&self, uid: u32, payload: &StoredPayload) -> Result<(), StorageError> {
+        validate_stored_payload(payload, uid)?;
+        let key = self.key_provider.load_key()?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(payload)?);
+        let nonce = random_nonce()?;
+        let aad = associated_data(uid);
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption key"))?;
+        let nonce = XNonce::try_from(nonce.as_slice())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption nonce"))?;
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: &plaintext, aad: &aad })
+            .map_err(|_| StorageError::AuthenticationFailed)?;
+        let mut encoded = Vec::with_capacity(HEADER_LENGTH + ciphertext.len());
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        atomic_write(&self.path_for(uid), &encoded, &self.directory, self.trust)
+    }
+
+    fn with_exclusive_uid_lock<T>(
+        &self,
+        uid: u32,
+        operation: impl FnOnce() -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        prepare_directory_storage(&self.directory, self.trust)?;
+        let lock_path = self.lock_path_for(uid);
+        verify_replace_target_storage(&lock_path, self.trust)?;
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)?;
+        verify_open_storage_file(&lock_file, &lock_path, self.trust)?;
+        let _guard = ExclusiveFileLock::acquire(&lock_file)?;
+        verify_directory_storage(&self.directory, self.trust)?;
+        verify_replace_target_storage(&lock_path, self.trust)?;
+        operation()
     }
 
     /// Return whether a UID has a fully authenticated, structurally valid encrypted template.
@@ -375,9 +603,68 @@ where
         self.directory.join(format!("{uid}.template"))
     }
 
+    fn lock_path_for(&self, uid: u32) -> PathBuf {
+        self.directory.join(format!(".{uid}.template.lock"))
+    }
+
     #[cfg(test)]
     fn for_test(directory: impl Into<PathBuf>, key_provider: K, owner_uid: u32) -> Self {
         Self { directory: directory.into(), key_provider, trust: TrustPolicy::test(owner_uid) }
+    }
+}
+
+fn validate_stored_payload(payload: &StoredPayload, expected_uid: u32) -> Result<(), StorageError> {
+    match payload {
+        StoredPayload::Live { schema_version, generation, record } => {
+            if *schema_version != STORED_PAYLOAD_SCHEMA_VERSION || *generation == 0 {
+                return Err(StorageError::InvalidRecord(
+                    "stored template generation metadata is invalid",
+                ));
+            }
+            record.validate()?;
+            if record.uid != expected_uid {
+                return Err(StorageError::InvalidRecord("template UID does not match its path"));
+            }
+        }
+        StoredPayload::Deleted { schema_version, generation, uid } => {
+            if *schema_version != STORED_PAYLOAD_SCHEMA_VERSION
+                || *generation == 0
+                || *uid != expected_uid
+            {
+                return Err(StorageError::InvalidRecord(
+                    "stored deletion generation metadata is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn next_generation(current: u64) -> Result<u64, StorageError> {
+    current.checked_add(1).ok_or(StorageError::GenerationExhausted)
+}
+
+fn template_not_found(uid: u32) -> StorageError {
+    StorageError::Io(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("template for UID {uid} is deleted or absent"),
+    ))
+}
+
+struct ExclusiveFileLock<'a> {
+    file: &'a File,
+}
+
+impl<'a> ExclusiveFileLock<'a> {
+    fn acquire(file: &'a File) -> Result<Self, StorageError> {
+        file.lock()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ExclusiveFileLock<'_> {
+    fn drop(&mut self) {
+        let _unlock_result = self.file.unlock();
     }
 }
 
@@ -698,6 +985,23 @@ pub enum StorageError {
     /// Template was produced by a different model contract or embedding dimension.
     #[error("template is incompatible with the active embedding model contract")]
     IncompatibleTemplate,
+    /// A compare-and-swap mutation used an obsolete authenticated generation.
+    #[error("template generation changed from expected {expected} to {actual}")]
+    StaleGeneration {
+        /// Generation observed by the caller.
+        expected: u64,
+        /// Generation authenticated while holding the UID mutation lock.
+        actual: u64,
+    },
+    /// Replacement or deletion requires a currently live template.
+    #[error("template is not present; last authenticated generation is {last_generation:?}")]
+    TemplateNotPresent {
+        /// Last tombstone generation, or `None` when no state exists.
+        last_generation: Option<u64>,
+    },
+    /// No later generation can be represented safely.
+    #[error("template generation is exhausted")]
+    GenerationExhausted,
     /// JSON encoding or decoding failed.
     #[error("template serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -744,8 +1048,14 @@ pub enum StorageError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use super::*;
 
+    #[derive(Clone, Copy)]
     struct TestKeyProvider([u8; KEY_LENGTH]);
 
     impl KeyProvider for TestKeyProvider {
@@ -768,6 +1078,13 @@ mod tests {
         }
     }
 
+    fn alternate_record(uid: u32, axis: usize) -> TemplateRecord {
+        let mut template = record(uid);
+        template.embedding = vec![0.0; 3];
+        template.embedding[axis] = 1.0;
+        template
+    }
+
     fn temporary_directory() -> Result<PathBuf, StorageError> {
         let directory = std::env::temp_dir().join(format!("faceauth-storage-{}", Uuid::new_v4()));
         fs::create_dir(&directory)?;
@@ -781,6 +1098,31 @@ mod tests {
         Ok(EncryptedTemplateStore::for_test(directory, TestKeyProvider([7; KEY_LENGTH]), owner_uid))
     }
 
+    fn write_legacy_record(directory: &Path, record: &TemplateRecord) -> Result<(), StorageError> {
+        let owner_uid = fs::metadata(directory)?.uid();
+        let key = SecretKey::from_slice(&[7; KEY_LENGTH])?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(record)?);
+        let nonce = random_nonce()?;
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_bytes())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption key"))?;
+        let nonce = XNonce::try_from(nonce.as_slice())
+            .map_err(|_| StorageError::InvalidRecord("invalid encryption nonce"))?;
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: &plaintext, aad: &associated_data(record.uid) })
+            .map_err(|_| StorageError::AuthenticationFailed)?;
+        let mut encoded = Vec::with_capacity(HEADER_LENGTH + ciphertext.len());
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        atomic_write(
+            &directory.join(format!("{}.template", record.uid)),
+            &encoded,
+            directory,
+            TrustPolicy::test(owner_uid),
+        )
+    }
+
     #[test]
     fn encrypted_records_round_trip_without_raw_frames() -> Result<(), StorageError> {
         let directory = temporary_directory()?;
@@ -791,9 +1133,157 @@ mod tests {
         let actual = store.load(1000)?;
 
         assert_eq!(actual, expected);
+        assert_eq!(store.load_with_generation(1000)?.generation, 1);
+        assert_eq!(store.save_with_generation(&expected)?, 2);
         assert!(store.has_authenticated_template(1000)?);
         assert!(!store.has_authenticated_template(1001)?);
         assert_eq!(store.key_strength(), KeyStrength::TpmBound);
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_records_load_at_generation_zero_and_upgrade_through_cas() -> Result<(), StorageError>
+    {
+        let directory = temporary_directory()?;
+        let store = test_store(&directory)?;
+        write_legacy_record(&directory, &record(1000))?;
+
+        let legacy = store.load_with_generation(1000)?;
+        assert_eq!(legacy.generation, 0);
+        assert_eq!(legacy.record, record(1000));
+        let replacement = alternate_record(1000, 1);
+        assert_eq!(store.replace_if_generation(0, &replacement)?, 1);
+        let upgraded = store.load_with_generation(1000)?;
+        assert_eq!(upgraded.generation, 1);
+        assert_eq!(upgraded.record, replacement);
+
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_generation_cannot_overwrite_a_newer_template() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store = test_store(&directory)?;
+        assert_eq!(store.save_with_generation(&record(1000))?, 1);
+        let replacement = alternate_record(1000, 1);
+        assert_eq!(store.replace_if_generation(1, &replacement)?, 2);
+
+        let stale = alternate_record(1000, 2);
+        assert!(matches!(
+            store.replace_if_generation(1, &stale),
+            Err(StorageError::StaleGeneration { expected: 1, actual: 2 })
+        ));
+        assert!(matches!(
+            store.delete_if_generation(1000, 1),
+            Err(StorageError::StaleGeneration { expected: 1, actual: 2 })
+        ));
+        let current = store.load_with_generation(1000)?;
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.record, replacement);
+
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_delete_retains_only_a_generation_tombstone_and_prevents_aba()
+    -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store = test_store(&directory)?;
+        assert_eq!(store.save_with_generation(&record(1000))?, 1);
+        assert_eq!(store.delete_if_generation(1000, 1)?, 2);
+        assert!(!store.has_authenticated_template(1000)?);
+        assert!(matches!(
+            store.load(1000),
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            store.read_payload(1000)?,
+            StoredPayload::Deleted { generation: 2, uid: 1000, .. }
+        ));
+        assert!(matches!(
+            store.replace_if_generation(1, &alternate_record(1000, 1)),
+            Err(StorageError::TemplateNotPresent { last_generation: Some(2) })
+        ));
+
+        assert_eq!(store.save_with_generation(&alternate_record(1000, 1))?, 3);
+        assert!(matches!(
+            store.replace_if_generation(1, &alternate_record(1000, 2)),
+            Err(StorageError::StaleGeneration { expected: 1, actual: 3 })
+        ));
+
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_compare_and_swap_has_exactly_one_winner() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store = test_store(&directory)?;
+        assert_eq!(store.save_with_generation(&record(1000))?, 1);
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for axis in [1, 2] {
+            let directory = directory.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                let store = test_store(&directory)?;
+                barrier.wait();
+                store.replace_if_generation(1, &alternate_record(1000, axis))
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().map_err(|_| StorageError::InvalidRecord("CAS test worker panicked"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(results.iter().filter(|result| matches!(result, Ok(2))).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(StorageError::StaleGeneration { expected: 1, actual: 2 })
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(store.load_with_generation(1000)?.generation, 2);
+
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn deletion_rejects_symlink_targets_before_mutation() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store = test_store(&directory)?;
+        store.save(&record(1000))?;
+        let target = directory.join("real.template");
+        fs::rename(directory.join("1000.template"), &target)?;
+        std::os::unix::fs::symlink(&target, directory.join("1000.template"))?;
+
+        assert!(matches!(store.delete(1000), Err(StorageError::Symlink { .. })));
+        assert!(target.exists());
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn uid_lock_symlinks_are_rejected_before_opening() -> Result<(), StorageError> {
+        let directory = temporary_directory()?;
+        let store = test_store(&directory)?;
+        let target = directory.join("attacker-lock-target");
+        fs::write(&target, [])?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        std::os::unix::fs::symlink(&target, directory.join(".1000.template.lock"))?;
+
+        assert!(matches!(store.save(&record(1000)), Err(StorageError::Symlink { .. })));
+        assert_eq!(fs::metadata(target)?.len(), 0);
         let _ = fs::remove_dir_all(directory);
         Ok(())
     }

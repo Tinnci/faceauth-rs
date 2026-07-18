@@ -18,6 +18,12 @@ visible-light frames are not representable in the stored template schema.
 - Secret keys, decrypted JSON, and embedding vectors are zeroized on drop.
 - Record dimensions, finite floating-point values, unit embedding norm, complete
   model-manifest compatibility digests, and file sizes are bounded before use.
+- Every mutation is serialized per UID with an owner-only `O_NOFOLLOW` lock and writes an
+  authenticated monotonic generation. Enrollment replacement and deletion have compare-and-swap
+  APIs, so a stale generation cannot overwrite or remove a newer template.
+- Deletion atomically replaces the live payload with an authenticated tombstone containing only
+  UID and generation. It retains no embedding and prevents ABA reuse of a generation observed
+  before deletion.
 
 Template format version 2 stores a compatibility SHA-256 over the validated
 embedding manifest, not merely the ONNX file hash. This binds the role, model hash,
