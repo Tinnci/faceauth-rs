@@ -50,7 +50,7 @@ udev = "0.9.3"
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
 v4l = "0.14.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
-zbus = "4.4.0"
+zbus = "5.18.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
